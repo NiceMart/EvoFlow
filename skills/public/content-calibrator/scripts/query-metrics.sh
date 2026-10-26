@@ -4,7 +4,11 @@
 # platform 对应 published-track 的平台 ID（wx_mp/xhs/zhihu/bilibili/douyin/kuaishou/toutiao/juejin/twitter/facebook/instagram/tiktok/youtube/pinterest/threads/wxwork_moments）
 set -euo pipefail
 
-WORKSPACE="${EVOFLOW_MEDIA_WS:-$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )/../../.." &> /dev/null && pwd )}"
+if [ -z "${EVOFLOW_MEDIA_WS:-}" ]; then
+  echo "ERROR: EVOFLOW_MEDIA_WS is not set (e.g. export EVOFLOW_MEDIA_WS=E:/xiaobei-data/workspace-main)" >&2
+  exit 1
+fi
+WORKSPACE="$EVOFLOW_MEDIA_WS"
 DB="$WORKSPACE/db/published_track.db"
 
 PLATFORM=""

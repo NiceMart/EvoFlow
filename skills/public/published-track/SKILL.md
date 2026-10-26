@@ -12,13 +12,13 @@ description: 发布记录与指标数据库管理，负责记录入库、指标�
 ## 环境前置（EvoFlow）
 
 - Python：`python3` 可用，且 `PYTHONUTF8=1`
-- 平台数据根：`EVOFLOW_MEDIA_WS`（published-track 库、平台 cookie 等相对路径的基准目录；未设置时回落到技能目录上方三级，即沿用 xiaobei 布局）
+- 平台数据根：`EVOFLOW_MEDIA_WS`（published-track 库、平台 cookie 等相对路径的基准目录；未设置时脚本报错退出（fail-fast），须先 export EVOFLOW_MEDIA_WS）
 
 ---
 
 ## 数据库位置与调用约定
 
-`$EVOFLOW_MEDIA_WS/db/published_track.db`（未设置 `EVOFLOW_MEDIA_WS` 时回落到技能目录上方三级，即原 xiaobei 工作区根）。初始化（幂等）：
+`$EVOFLOW_MEDIA_WS/db/published_track.db`（未设置 `EVOFLOW_MEDIA_WS` 时脚本报错退出（fail-fast），须先 export EVOFLOW_MEDIA_WS）。初始化（幂等）：
 
 ```bash
 published-track init-db

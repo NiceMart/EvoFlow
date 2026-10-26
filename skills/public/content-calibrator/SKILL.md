@@ -9,7 +9,7 @@ description: DNA 表现评估引擎——消费 published-track 的发布与互�
 
 - `sqlite3`：`command -v sqlite3` 应可用（query-metrics 直接调 sqlite3 CLI）
 - Python：`python3` 可用，且 `PYTHONUTF8=1`
-- 平台数据根：`EVOFLOW_MEDIA_WS`（published-track 库、平台校准目录等相对路径的基准目录；未设置时回落到调用目录/技能目录上方三级的 xiaobei 布局）
+- 平台数据根：`EVOFLOW_MEDIA_WS`（published-track 库、平台校准目录等相对路径的基准目录；未设置时脚本报错退出（fail-fast），须先 export EVOFLOW_MEDIA_WS）
 
 ---
 

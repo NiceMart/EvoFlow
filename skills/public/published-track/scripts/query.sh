@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="${EVOFLOW_MEDIA_WS:-$(cd "$(dirname "$0")/../../.." && pwd)}"
+if [ -z "${EVOFLOW_MEDIA_WS:-}" ]; then
+  echo "ERROR: EVOFLOW_MEDIA_WS is not set (e.g. export EVOFLOW_MEDIA_WS=E:/xiaobei-data/workspace-main)" >&2
+  exit 1
+fi
+ROOT="$EVOFLOW_MEDIA_WS"
 DB="$ROOT/db/published_track.db"
 
 # Self-heal stale schema: if a platform table is missing, run idempotent init-db.sh

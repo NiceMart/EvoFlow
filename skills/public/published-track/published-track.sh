@@ -4,7 +4,7 @@
 # 每个子命令 exec 转发到 scripts/ 下对应脚本，不改语义。
 set -euo pipefail
 SELF="${BASH_SOURCE[0]}"
-# 只解析 ~/.openclaw/bin 软链一层（bin/<skill> -> <workspace>/skills/<skill>/<skill>.sh），
+# 只解析 ~/.evoflow/bin 软链一层（bin/<skill> -> <workspace>/skills/<skill>/<skill>.sh），
 # 不 readlink -f 继续展开 workspace 内 skills/<skill> 指向仓库模板的软链。
 # 子脚本用 dirname $0/../../.. 推导 workspace 根（ROOT/db/…），readlink -f 会把
 # workspace 折叠成仓库模板路径，导致 ROOT 解析到模板目录（无 db → 空结果）。

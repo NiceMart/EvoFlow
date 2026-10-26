@@ -5,7 +5,11 @@
 # 幂等：已存在的文件跳过。
 set -euo pipefail
 
-WORKSPACE="${EVOFLOW_MEDIA_WS:-$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )/../../.." &> /dev/null && pwd )}"
+if [ -z "${EVOFLOW_MEDIA_WS:-}" ]; then
+  echo "ERROR: EVOFLOW_MEDIA_WS is not set (e.g. export EVOFLOW_MEDIA_WS=E:/xiaobei-data/workspace-main)" >&2
+  exit 1
+fi
+WORKSPACE="$EVOFLOW_MEDIA_WS"
 
 PLATFORM=""
 

@@ -26,7 +26,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--platform', required=True, choices=['douyin', 'xhs', 'wx_channel', 'wx_mp', 'tiktok', 'kuaishou', 'twitter', 'weibo'])
     args = parser.parse_args()
-    workspace = Path(os.environ.get("EVOFLOW_MEDIA_WS") or os.path.abspath(Path(__file__).parent / '../../..'))
+    ws_env = os.environ.get("EVOFLOW_MEDIA_WS")
+    if not ws_env:
+        raise SystemExit("ERROR: EVOFLOW_MEDIA_WS is not set (e.g. export EVOFLOW_MEDIA_WS=E:/xiaobei-data/workspace-main)")
+    workspace = Path(ws_env)
     result = platform_status(workspace, args.platform)
     print(json.dumps(result, ensure_ascii=False))
     return 0 if result['ok'] else 1

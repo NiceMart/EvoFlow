@@ -6,7 +6,11 @@
 #   cal_* 列保留做历史兼容，停止写入。幂等可重复执行。
 set -euo pipefail
 
-ROOT="${EVOFLOW_MEDIA_WS:-$(cd "$(dirname "$0")/../../.." && pwd)}"
+if [ -z "${EVOFLOW_MEDIA_WS:-}" ]; then
+  echo "ERROR: EVOFLOW_MEDIA_WS is not set (e.g. export EVOFLOW_MEDIA_WS=E:/xiaobei-data/workspace-main)" >&2
+  exit 1
+fi
+ROOT="$EVOFLOW_MEDIA_WS"
 DB="$ROOT/db/published_track.db"
 
 if [ ! -f "$DB" ]; then

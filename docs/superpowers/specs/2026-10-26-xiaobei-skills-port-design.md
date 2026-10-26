@@ -80,6 +80,8 @@ xiaobei 技能本就是 SKILL.md + 脚本的标准 Agent Skills 结构，与 Evo
 - 环境发现：本地 sqlite3 3.54.1 落 `.tools/`（已 gitignore）；published_track DB 全新建 17 表；网关启动需 `UV_NO_SYNC=1` + `EVOFLOW_SKIP_CONFIG_UPGRADE=1` 规避。
 - 补充：viral-chaser 转写依赖的 ASR 三件库补拷入顶层 `_shared`（15c5d0ac）。
 - 残留修正：platform-runtime SKILL.md 残留的 `metadata.openclaw` frontmatter 块已在验收时移除（ed373663）。
+- 终审修复：EVOFLOW_MEDIA_WS 未设时改 fail-fast（原 3 级回落在 EvoFlow 布局指向 skills/ 源码树，有污染风险）。
+- 决策记录：platform-runtime/_shared 中 ~/.openclaw 登录态默认值本阶段保留——本机与 xiaobei 共享平台登录态是「零迁移复用」意图；产品化阶段统一 re-home 到 ~/.evoflow。
 
 ## 5. 薄适配层
 
