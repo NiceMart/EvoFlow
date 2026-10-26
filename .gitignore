@@ -571,6 +571,10 @@ evopanel/src-tauri/gen/
 # platform-runtime 本地依赖（install-runtime.mjs 重建）
 skills/public/platform-runtime/node_modules/
 
+# rss-reader（expert-osbi）依赖清单：npm ci 重建依据，必须入库（覆盖全局 package*.json 忽略）
+!skills/public/expert-osbi/tools/rss-reader/package.json
+!skills/public/expert-osbi/tools/rss-reader/package-lock.json
+
 # local dev tools (sqlite3 CLI)
 .tools/
 

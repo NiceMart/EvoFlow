@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# init-db.sh — Initialize info_record.db with intel_items table
+
+set -euo pipefail
+
+if [ -z "${EVOFLOW_MEDIA_WS:-}" ]; then
+  echo "ERROR: EVOFLOW_MEDIA_WS is not set (e.g. export EVOFLOW_MEDIA_WS=E:/xiaobei-data/workspace-main)" >&2
+  exit 1
+fi
+DB_DIR="$EVOFLOW_MEDIA_WS/db"
+DB_FILE="$DB_DIR/info_record.db"
+
+mkdir -p "$DB_DIR"
+
+sqlite3 "$DB_FILE" <<'SQL'
+CREATE TABLE IF NOT EXISTS intel_items (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  source        TEXT NOT NULL,
+  source_type   TEXT NOT NULL,
+  title         TEXT,
+  author        TEXT,
+  publish_date  TEXT,
+  content       TEXT NOT NULL,
+  created_at    TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now','localtime'))
+);
+SQL
+
+echo '{"ok": true, "message": "info_record.db initialized"}'
