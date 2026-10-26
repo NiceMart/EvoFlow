@@ -56,7 +56,7 @@ xiaobei 技能本就是 SKILL.md + 脚本的标准 Agent Skills 结构，与 Evo
 | 13 | 信源情报 | `smart-search` + 各 `*-hunter` + `expert-osbi` | cookie 登录态免 key |
 | 14 | 四声分析 | `council` | 四方视角结构化辩论 |
 | 15 | deck/IR | `pitch-deck` + `expert-ir` | |
-| 16 | 网站/ICP | `icp-filing`、`icp-exemption`、`seo` | ⚠️ 网站设计与制作无独立技能，xiaobei 靠 awada 建站插件 + expert-design 承载，待确认是否引入 awada |
+| 16 | ~~网站/ICP~~ | ~~`icp-filing`、`icp-exemption`、`seo`~~ | **已取消（2026-10-27，随批次 4 取消）**——原注：网站设计与制作无独立技能，xiaobei 靠 awada 建站插件 + expert-design 承载 |
 | 17 | 采集层 | `douyin/xhs/tiktok/kuaishou-hunter`、`wx-mp-hunter` | |
 
 另有 `talking-head-cut`、`video-edit`、`platform-runtime`、`_shared`（共享 Python 库）随批移植。合计约 **33 个技能 + 2 个共享库**。
@@ -71,7 +71,7 @@ xiaobei 技能本就是 SKILL.md + 脚本的标准 Agent Skills 结构，与 Evo
 | 1·纯方法论 | `council`、`viral-chaser`、`expert-design`、`pitch-deck`、`talking-head-cut`、`video-edit`、`content-calibrator` | agent 各调用一次完成真实小任务（如出一版 deck） | 已完成（2026-10-26，交互实测延后至用户会话） |
 | 2·平台运营 | 7 个 `expert-*` + 7 个 `*-hunter` + `weibo/zhihu-publish` + `expert-video` + `wxwork-moments` | 每技能先跑只读命令（采集一条/读 DNA 模板），选 1–2 个做真实发布冒烟 | 已完成（2026-10-26，实落 22 技能含 video-review/bgm-library/awk-img-gen/aigc-video-gen 四助手；零成本只读冒烟已做，真实发布冒烟延后至用户会话） |
 | 3·商业闭环 | `expert-bd`、`expert-osbi`、`expert-ir`、`sales-cs` 五件套 + 每日复盘定时任务 | 客服链路 dry-run；复盘任务按期触发一次 |
-| 4·it-engineer | `icp-filing`、`icp-exemption`、`seo`、`tccli`、`alicloud-find-skills`、`camoufox-guard` | icp-filing 走一遍材料生成流程 | |
+| ~~4·it-engineer~~ | ~~`icp-filing`、`icp-exemption`、`seo`、`tccli`、`alicloud-find-skills`、`camoufox-guard`~~ | **已取消（2026-10-27，需求方裁定暂不需要）**——映射表 #16（网站设计与制作、ICP 备案材料）随之取消；`camoufox-guard` 巡检能力一并取消，进程巡检改由人工/按需处理 |
 
 ### 4.1 批次 0+1 实测记录（2026-10-26）
 
