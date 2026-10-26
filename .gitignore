@@ -567,3 +567,6 @@ evopanel/src-tauri/gen/
 /docs/contribute/v4-streaming-alignment-logbook.md
 /backend/tests/FINAL_SUMMARY_*.md
 /backend/tests/IMPROVEMENTS_*.md
+
+# platform-runtime 本地依赖（install-runtime.mjs 重建）
+skills/public/platform-runtime/node_modules/
