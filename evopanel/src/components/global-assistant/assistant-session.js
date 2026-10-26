@@ -47,6 +47,52 @@ let _voiceFrameTookOver = false
 /** 工具日志去重 */
 /** @type {Set<string>} */
 let _voiceLoggedTools = new Set()
+/** 语音发问近义去重：Frame turn_end 与 continuous 迟到句常差几个字 */
+let _lastVoiceSendNorm = ''
+let _lastVoiceSendAtMs = 0
+const VOICE_SEND_DEDUPE_MS = 2800
+
+/** @param {string} text */
+function _normalizeVoiceSendText(text) {
+  return String(text || '')
+    .replace(/[\s\u3000]+/g, '')
+    .replace(/[，。！？、,.!?;；：:"""''（）()【】\[\]…—\-]/g, '')
+    .toLowerCase()
+}
+
+/**
+ * 两句是否同属一轮 ASR 变体（包含关系或短编辑距离）。
+ * @param {string} a
+ * @param {string} b
+ */
+function _isNearDuplicateVoiceText(a, b) {
+  const x = _normalizeVoiceSendText(a)
+  const y = _normalizeVoiceSendText(b)
+  if (!x || !y) return false
+  if (x === y) return true
+  if (x.includes(y) || y.includes(x)) return true
+  // 短句：允许差 1～2 字（「发送两次」vs「发送了两次」）
+  const longer = x.length >= y.length ? x : y
+  const shorter = x.length >= y.length ? y : x
+  if (longer.length <= 4) return false
+  let i = 0
+  let j = 0
+  let miss = 0
+  while (i < longer.length && j < shorter.length) {
+    if (longer[i] === shorter[j]) {
+      i++
+      j++
+      continue
+    }
+    miss++
+    if (miss > 2) return false
+    // 优先跳过长串多出来的字
+    if (longer.length - i > shorter.length - j) i++
+    else j++
+  }
+  miss += longer.length - i + (shorter.length - j)
+  return miss <= 2
+}
 
 /** 对话/工具进度写入「语音播报」前端日志（方便对照发问→接口→回复） */
 function _voiceChatLog(stage, message, detailOrOpts) {
@@ -608,6 +654,12 @@ function syncXiaomiLiveFromAgui() {
   last.runId = _activeRunId || last.runId
   patchState({ messages: [...messages], streaming: true })
   if (openText) syncXiaomiVoiceSpeech(openText)
+  // 语音全屏无 V4 时间线：platform 结果在此旁路拉开右栏（文件/进度/浏览器）
+  if (Array.isArray(last.tools) && last.tools.length) {
+    void import('../../lib/xiaomi-voice/platform-auto-open.js')
+      .then((m) => m.maybeAutoOpenXiaomiPlatformTools?.(last.tools))
+      .catch(() => {})
+  }
 }
 
 /**
@@ -650,6 +702,11 @@ function patchXiaomiLiveProcess(patch) {
   last.pending = false
   last.streaming = true
   patchState({ messages: [...messages], streaming: true })
+  if (Array.isArray(last.tools) && last.tools.length) {
+    void import('../../lib/xiaomi-voice/platform-auto-open.js')
+      .then((m) => m.maybeAutoOpenXiaomiPlatformTools?.(last.tools))
+      .catch(() => {})
+  }
 }
 
 /** Append one assistant text piece (classic delta or AG-UI TEXT_MESSAGE_CONTENT). */
@@ -1083,8 +1140,32 @@ export async function syncXiaomiPageContext(override = {}) {
 export async function sendXiaomiChat(text, ctx = {}) {
   const raw = String(text || '').trim()
   if (!raw) return
+  // 语音近义去重：Frame 已发「看一下…发送两次」，continuous 再塞「…发送了两次」不应打断重发。
+  // 戳必须在任何 await 前落下，否则两路并发会一起穿过。
+  if (ctx.voiceInitiated) {
+    const now = Date.now()
+    if (
+      _lastVoiceSendNorm &&
+      now - _lastVoiceSendAtMs < VOICE_SEND_DEDUPE_MS &&
+      _isNearDuplicateVoiceText(raw, _lastVoiceSendNorm)
+    ) {
+      try {
+        const { voiceFeLog } = await import('../../lib/xiaomi-voice/voice-file-log.js')
+        voiceFeLog(
+          '对话',
+          `语音近义去重 → 丢弃重复发问：「${raw.slice(0, 80)}」（距上次 ${now - _lastVoiceSendAtMs}ms）`,
+        )
+      } catch {
+        /* ignore */
+      }
+      return
+    }
+    _lastVoiceSendNorm = _normalizeVoiceSendText(raw)
+    _lastVoiceSendAtMs = now
+  }
   // 语音多轮：对齐 Pipecat barge → 新 turn——上一轮还在生成时先 abort，再发本轮。
   // 文本路径仍拒绝并发，避免误触双发。
+  // 近义句上面已丢掉；这里只对「明显新一句」做打断重发。
   if (getState().streaming) {
     if (ctx.voiceInitiated) {
       try {
@@ -1100,43 +1181,54 @@ export async function sendXiaomiChat(text, ctx = {}) {
     }
   }
 
+  const t0 = Date.now()
+  const voiceHot = !!ctx.voiceInitiated
+  const mark = (step) => {
+    if (!voiceHot) return
+    try {
+      _voiceChatLog('时效', `sendXiaomiChat ${step} +${Date.now() - t0}ms`)
+    } catch {
+      /* ignore */
+    }
+  }
+
   // 已有会话则不要先 chatHistory：否则每条消息都多一轮往返，且会冲掉乐观气泡。
   const hadSession = !!String(getState().sessionKey || readStoredSessionKey() || '').trim()
   const key = await ensureXiaomiSession({ reloadHistory: !hadSession })
+  mark(`ensureSession had=${hadSession ? 1 : 0}`)
   bindXiaomiStreamListener()
   _sealedRunId = ''
   _activeRunId = ''
 
-  {
-    const speak = await xiaomiShouldSpeak()
-    void import('../../lib/xiaomi-voice-defaults.js').then(({ xiaomiVoiceLog }) =>
-      xiaomiVoiceLog(
-        'sendXiaomiChat',
-        { voiceInitiated: !!ctx.voiceInitiated, speak, textLen: raw.length },
-        JSON.stringify(raw.slice(0, 40)),
-      ),
-    )
-    try {
-      const { noteVoicePanelSend } = await import('../../lib/xiaomi-voice/voice-file-log.js')
-      noteVoicePanelSend(raw, {
-        source: ctx.voiceInitiated ? '语音发问' : '文本发问',
-        detail: `voice=${!!ctx.voiceInitiated} len=${raw.length}`,
-      })
-    } catch {
-      /* ignore */
-    }
-    if (speak) {
-      await armXiaomiVoiceReply({ voiceInitiated: !!ctx.voiceInitiated })
-    } else {
-      clearXiaomiVoiceReply()
-    }
+  const speak = await xiaomiShouldSpeak()
+  void import('../../lib/xiaomi-voice-defaults.js').then(({ xiaomiVoiceLog }) =>
+    xiaomiVoiceLog(
+      'sendXiaomiChat',
+      { voiceInitiated: voiceHot, speak, textLen: raw.length },
+      JSON.stringify(raw.slice(0, 40)),
+    ),
+  )
+  try {
+    const { noteVoicePanelSend } = await import('../../lib/xiaomi-voice/voice-file-log.js')
+    noteVoicePanelSend(raw, {
+      source: voiceHot ? '语音发问' : '文本发问',
+      detail: `voice=${voiceHot} len=${raw.length}`,
+    })
+  } catch {
+    /* ignore */
+  }
+  if (speak) {
+    await armXiaomiVoiceReply({ voiceInitiated: voiceHot })
+    mark('armVoice')
+  } else {
+    clearXiaomiVoiceReply()
   }
 
   const live = extractPageContext()
   /** @type {Record<string, string>} */
   const merged = { ...live }
   for (const [k, v] of Object.entries(ctx)) {
-    if (k === 'voiceInitiated') continue
+    if (k === 'voiceInitiated' || k === 'onSubmitted') continue
     const s = v == null ? '' : String(v).trim()
     if (s) merged[k] = s
   }
@@ -1150,18 +1242,26 @@ export async function sendXiaomiChat(text, ctx = {}) {
   }
   const pageChanged = !prevFp || fp !== prevFp
 
-  try {
-    await api.chatUpdateContext(key, {
-      agent_name: XIAOMI_AGENT,
-      agent_id: XIAOMI_AGENT,
-      xiaomi_global_assistant: true,
-      ...XIAOMI_THINKING_OFF,
-      // 变化才带快照；未变则清空，避免 runContext 重复注入砸缓存
-      xiaomi_page_context: pageChanged ? pageSnap : null,
-      xiaomi_page_context_fp: fp || null,
+  // 语音热路径：页面上下文同步不可挡 chatSend（日志曾卡 chatUpdateContext ~6s）
+  const ctxPayload = {
+    agent_name: XIAOMI_AGENT,
+    agent_id: XIAOMI_AGENT,
+    xiaomi_global_assistant: true,
+    ...XIAOMI_THINKING_OFF,
+    xiaomi_page_context: pageChanged ? pageSnap : null,
+    xiaomi_page_context_fp: fp || null,
+  }
+  if (voiceHot) {
+    void api.chatUpdateContext(key, ctxPayload).catch((e) => {
+      console.warn('[xiaomi] page context sync failed (bg)', e)
     })
-  } catch (e) {
-    console.warn('[xiaomi] page context sync failed', e)
+    mark(`contextSync bg pageChanged=${pageChanged ? 1 : 0}`)
+  } else {
+    try {
+      await api.chatUpdateContext(key, ctxPayload)
+    } catch (e) {
+      console.warn('[xiaomi] page context sync failed', e)
+    }
   }
 
   const userMsgId = `user-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
@@ -1187,18 +1287,27 @@ export async function sendXiaomiChat(text, ctx = {}) {
   patchState({ messages, streaming: true, draft: '', activeView: 'chat' }, { persistUi: true })
   _voiceChatLog(
     '对话',
-    `chatSend 准备 session=${key.slice(0, 12)}… agent=${XIAOMI_AGENT} voice=${!!ctx.voiceInitiated}`,
+    `chatSend 准备 session=${key.slice(0, 12)}… agent=${XIAOMI_AGENT} voice=${voiceHot} prep=+${Date.now() - t0}ms`,
     raw.slice(0, 80),
   )
+  // 语音：prep 完即可释放 Frame `_sending`，勿等整轮 stream 结束（曾卡 13s+）
+  try {
+    if (typeof ctx.onSubmitted === 'function') ctx.onSubmitted({ messageId: userMsgId })
+  } catch {
+    /* ignore */
+  }
 
   try {
-    const voiceReply = await xiaomiShouldSpeak()
+    const voiceReply = speak
     await wsClient.chatSend(key, raw, [], [], {
       messageId: userMsgId,
-      ...(ctx.voiceInitiated ? { voiceInitiated: true } : {}),
+      ...(voiceHot ? { voiceInitiated: true } : {}),
       ...(voiceReply ? { voiceReply: true } : {}),
     })
-    _voiceChatLog('对话', `chatSend 已提交 messageId=${userMsgId} voiceReply=${!!voiceReply}`)
+    _voiceChatLog(
+      '对话',
+      `chatSend 已提交 messageId=${userMsgId} voiceReply=${!!voiceReply} total=+${Date.now() - t0}ms`,
+    )
     // chatSend 后 thread 通常已落库：立刻 resolve + warm，缩短 V4 空白窗
     void bindXiaomiV4Thread(key)
   } catch (e) {

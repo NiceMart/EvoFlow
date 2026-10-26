@@ -40,6 +40,9 @@
   --accent: #635bff;
   --accent-hover: #534bef;
   --accent-muted: rgba(99, 91, 255, 0.08);
+  /* 缺失 token：聊天底部 mode 菜单（含「完全访问」）active 项引用 --accent-soft，
+     此前未定义只能用 fallback（不随主题）；指向 --accent-muted 随浅/深自动变化 */
+  --accent-soft: var(--accent-muted);
   --accent-secondary: #635bff;
 
   --brand-blue: var(--accent);
@@ -424,9 +427,9 @@
 }
 
 :root[data-theme="light"] .form-input {
-  background: #ffffff !important;
-  color: #202124 !important;
-  border-color: #e6e8ec !important;
+  background: var(--bg-input, var(--bg-primary, #ffffff)) !important;
+  color: var(--text-primary, #202124) !important;
+  border-color: var(--border-primary, #e6e8ec) !important;
 }
 
 :root[data-theme="light"] .form-hint {
@@ -439,8 +442,8 @@
 
 /* 通用模态框 */
 :root[data-theme="light"] .modal {
-  background: #f4f6f8 !important;
-  border-color: #e6e8ec !important;
+  background: var(--bg-elevated, #f4f6f8) !important;
+  border-color: var(--border-primary, #e6e8ec) !important;
 }
 
 :root[data-theme="light"] .modal .modal-title {
