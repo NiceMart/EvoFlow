@@ -69,7 +69,7 @@ xiaobei 技能本就是 SKILL.md + 脚本的标准 Agent Skills 结构，与 Evo
 |------|------|------|------|
 | 0·地基 | `_shared`、`platform-runtime`、`published-track`、`smart-search` + 薄适配层（§5） | `published-track init-db` 成功；smart-search 真实搜索一次，验证 camoufox 链路与 cookie 复用 | 已完成（2026-10-26，smart-search 真搜延后至用户会话） |
 | 1·纯方法论 | `council`、`viral-chaser`、`expert-design`、`pitch-deck`、`talking-head-cut`、`video-edit`、`content-calibrator` | agent 各调用一次完成真实小任务（如出一版 deck） | 已完成（2026-10-26，交互实测延后至用户会话） |
-| 2·平台运营 | 7 个 `expert-*` + 7 个 `*-hunter` + `weibo/zhihu-publish` + `expert-video` + `wxwork-moments` | 每技能先跑只读命令（采集一条/读 DNA 模板），选 1–2 个做真实发布冒烟 |
+| 2·平台运营 | 7 个 `expert-*` + 7 个 `*-hunter` + `weibo/zhihu-publish` + `expert-video` + `wxwork-moments` | 每技能先跑只读命令（采集一条/读 DNA 模板），选 1–2 个做真实发布冒烟 | 已完成（2026-10-26，实落 22 技能含 video-review/bgm-library/awk-img-gen/aigc-video-gen 四助手；零成本只读冒烟已做，真实发布冒烟延后至用户会话） |
 | 3·商业闭环 | `expert-bd`、`expert-osbi`、`expert-ir`、`sales-cs` 五件套 + 每日复盘定时任务 | 客服链路 dry-run；复盘任务按期触发一次 |
 | 4·it-engineer | `icp-filing`、`icp-exemption`、`seo`、`tccli`、`alicloud-find-skills`、`camoufox-guard` | icp-filing 走一遍材料生成流程 | |
 
@@ -82,6 +82,20 @@ xiaobei 技能本就是 SKILL.md + 脚本的标准 Agent Skills 结构，与 Evo
 - 残留修正：platform-runtime SKILL.md 残留的 `metadata.openclaw` frontmatter 块已在验收时移除（ed373663）。
 - 终审修复：EVOFLOW_MEDIA_WS 未设时改 fail-fast（原 3 级回落在 EvoFlow 布局指向 skills/ 源码树，有污染风险）。
 - 决策记录：platform-runtime/_shared 中 ~/.openclaw 登录态默认值本阶段保留——本机与 xiaobei 共享平台登录态是「零迁移复用」意图；产品化阶段统一 re-home 到 ~/.evoflow。
+
+### 4.2 批次 2 实测记录（2026-10-26）
+
+- 验收：网关 `GET /api/skills` 22/22 技能名命中（video-review/bgm-library/awk-img-gen/aigc-video-gen/tiktok-hunter/kuaishou-hunter/x-hunter/weibo-hunter/weibo-publish/douyin-hunter/xhs-hunter/wx-mp-hunter/zhihu-publish/wxwork-moments/expert-kuaishou/expert-tiktok/expert-twitter/expert-douyin/expert-wx-channel/expert-wx-mp/expert-xhs/expert-video）；`DECLARED_SKILLS` 残留 ALL-CLEAN；22 个 SKILL.md 无 openclaw metadata 残留。
+- 只读冒烟范围：按裁定仅零成本命令（--help/--check/live `--access read`），未做真实发布/生成/登录；真实采集/发布冒烟延后至用户会话（与批次 0/1 同口径）。
+- 受限能力清单（`.env.xiaobei-keys` 现仅 `AWK_API_KEY` 一项存量；以下缺配解锁后即自动可用）：
+  - `OFB_KEY` 缺失 → expert-wx-mp 发布（relay）、wxwork-moments、expert-xhs 发布签名、expert-douyin fetch-retro-data 受限；采集层 douyin-hunter（login 及依赖会话子命令）、xhs-hunter（全部平台请求类子命令，签名走 relay）同受波及。
+  - `WX_BIZ_*` 缺失 → wx-mp-hunter 不可用。
+  - `WXWORK_CORP_ID`/`WXWORK_SECRET` 缺失 → wxwork-moments 双密钥缺口（叠加 OFB_KEY）。
+  - ASR/生图现状：`AWK_API_KEY` 已桥接可用（awk-img-gen plan 模式、aigc-video-gen 百炼 agent plan 兜底，Task 2 验证）；`DASHSCOPE_API_KEY`（业务空间模式）、`MINIMAX_API_KEY`（bgm-library 定制音乐/aigc-video-gen music 与 minimax 视频路线）、`VOLC_SEEDANCE_API_KEY`（火山路线）缺失，相关子能力受限属预期非移植缺陷。
+- 计划外编辑汇总：fcntl shim 扩展（Task 8 expert-douyin ×2、Task 11 expert-xhs ×3）；`_shared/bailian_media.py` 补拷（Task 12，批次 0 漏项）；batch-i2v 解析本地路径优先（Task 12）；各 wrapper/SKILL.md 注释清洗超纲项。
+- 验收门发现并修复：`.env.xiaobei-keys` 与 `start-dev.bat` 原为 LF-only 行尾——cmd `for /f "usebackq ..."` 实测从 LF-only 文件读 0 行（CRLF 对照组正常读 1 行），真实重启时密钥桥会静默失效；且 `start-dev.bat` 含 `goto wait_vite` 标签循环，LF-only bat 有解析风险。两文件已转 CRLF 并隔离 cmd 复测 for /f 注入 `AWK_API_KEY` 成功。两文件均不入库（bat 未跟踪、keys 已 gitignore），无提交内容变化。
+- 重启验证按裁定保留运行中栈：网关 19:53 启动早于 bat 最后编辑（21:29），未杀进程；真实重启验证由用户下次 `start-dev.bat` 启动自然覆盖（CRLF 修复后注入链路已隔离验证）。
+- 未移植项：`native-ui-card` 不在规格映射内，未移植——是否补移待用户决策。
 
 ## 5. 薄适配层
 
