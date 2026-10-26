@@ -65,13 +65,21 @@ xiaobei 技能本就是 SKILL.md + 脚本的标准 Agent Skills 结构，与 Evo
 
 ## 4. 分批计划（按依赖顺序）
 
-| 批次 | 内容 | 验收 |
-|------|------|------|
-| 0·地基 | `_shared`、`platform-runtime`、`published-track`、`smart-search` + 薄适配层（§5） | `published-track init-db` 成功；smart-search 真实搜索一次，验证 camoufox 链路与 cookie 复用 |
-| 1·纯方法论 | `council`、`viral-chaser`、`expert-design`、`pitch-deck`、`talking-head-cut`、`video-edit`、`content-calibrator` | agent 各调用一次完成真实小任务（如出一版 deck） |
+| 批次 | 内容 | 验收 | 状态 |
+|------|------|------|------|
+| 0·地基 | `_shared`、`platform-runtime`、`published-track`、`smart-search` + 薄适配层（§5） | `published-track init-db` 成功；smart-search 真实搜索一次，验证 camoufox 链路与 cookie 复用 | 已完成（2026-10-26，smart-search 真搜延后至用户会话） |
+| 1·纯方法论 | `council`、`viral-chaser`、`expert-design`、`pitch-deck`、`talking-head-cut`、`video-edit`、`content-calibrator` | agent 各调用一次完成真实小任务（如出一版 deck） | 已完成（2026-10-26，交互实测延后至用户会话） |
 | 2·平台运营 | 7 个 `expert-*` + 7 个 `*-hunter` + `weibo/zhihu-publish` + `expert-video` + `wxwork-moments` | 每技能先跑只读命令（采集一条/读 DNA 模板），选 1–2 个做真实发布冒烟 |
 | 3·商业闭环 | `expert-bd`、`expert-osbi`、`expert-ir`、`sales-cs` 五件套 + 每日复盘定时任务 | 客服链路 dry-run；复盘任务按期触发一次 |
-| 4·it-engineer | `icp-filing`、`icp-exemption`、`seo`、`tccli`、`alicloud-find-skills`、`camoufox-guard` | icp-filing 走一遍材料生成流程 |
+| 4·it-engineer | `icp-filing`、`icp-exemption`、`seo`、`tccli`、`alicloud-find-skills`、`camoufox-guard` | icp-filing 走一遍材料生成流程 | |
+
+### 4.1 批次 0+1 实测记录（2026-10-26）
+
+- 验收：网关 `GET /api/skills` 7/7 技能名命中（council/viral-chaser/pitch-deck/talking-head-cut/video-edit/expert-design/content-calibrator）；`DECLARED_SKILLS` 残留 ALL-CLEAN；各 SKILL.md 无 openclaw metadata 残留。
+- 延后项（需用户 EvoFlow 会话交互实测）：council 辩论、video-edit 抽段、pitch-deck 出稿、smart-search 真搜、content-calibrator 真数据评估。
+- 环境发现：本地 sqlite3 3.54.1 落 `.tools/`（已 gitignore）；published_track DB 全新建 17 表；网关启动需 `UV_NO_SYNC=1` + `EVOFLOW_SKIP_CONFIG_UPGRADE=1` 规避。
+- 补充：viral-chaser 转写依赖的 ASR 三件库补拷入顶层 `_shared`（15c5d0ac）。
+- 残留修正：platform-runtime SKILL.md 残留的 `metadata.openclaw` frontmatter 块已在验收时移除（ed373663）。
 
 ## 5. 薄适配层
 
