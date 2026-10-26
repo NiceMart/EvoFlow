@@ -22,6 +22,8 @@ description: TikTok账号运营、起号定位、视频/图文内容 DNA、制�
 | 已有作品修改与再制作 | [Editing](workflows/editing.md) |
 | 本人作品指标与复盘 | [Review](workflows/review.md) |
 
+> ⚠️ native-ui-card 尚未在 EvoFlow 可用（待移植裁决）。可用前本流程不可执行；需要卡片图时改走 content-production.md 的图文路线。
+
 工具：`tiktok-publish` 发布，`tiktok-engagement` 本人取数回填，`tiktok-style-profiler` 定性 DNA。读取本包 tools 下对应说明，通过 wrapper 调用，不拼工作区技能路径。内容搜索、账号与作品/评论读取、通知和媒体下载使用一级 `tiktok-hunter`。私信、评论、点赞、收藏、关注及直播互动走 expert-bd；公开直播读取走 tiktok-hunter live，调研分析走 expert-osbi；未实现的动作明确说明缺口。
 
 登录使用 `tiktok-hunter login/export`，会话由共享运行库管理。写会话准备与 `--require-write` 导出按 hunter 说明执行。视频样本先 hunter 下载，再运行 viral-chaser；文字和图文由本包回读正文与有序图组。读取与写入均需真实账号验收。用户搜索未实现；user get 仅给 secUid 时不能取得完整资料。notice list/count、收藏夹、合集、推荐与关注流可读。本人已发作品指标通过专家 engagement 获取。写操作需要同次 ticket-guard 材料。

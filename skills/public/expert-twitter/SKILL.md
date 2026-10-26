@@ -22,6 +22,8 @@ description: X/Twitter账号运营、起号定位、视频/图文内容 DNA、�
 | 已有作品修改与再制作 | [Editing](workflows/editing.md) |
 | 本人作品指标与复盘 | [Review](workflows/review.md) |
 
+> ⚠️ native-ui-card 尚未在 EvoFlow 可用（待移植裁决）。可用前本流程不可执行；需要卡片图时改走 content-production.md 的图文路线。
+
 工具：`twitter-post` 发布，`twitter-engagement` 本人取数回填，`twitter-style-profiler` 定性 DNA。读取本包 tools 下对应说明，通过 wrapper 调用，不拼工作区技能路径。内容搜索、账号与作品/评论读取和媒体下载使用一级 `x-hunter`。私信查询、评论、点赞、收藏与关注统一走 expert-bd；通知与直播未实现。
 
 未订阅或未确认 X Premium 长推权限时，每条正文保持在280权重内（纯中文约140字，还需计入标点、链接等）。发布前检查 twitter-post 预览中的逐条权重和 warnings；超限先精简，不直接提交。帖串每条分别检查，不能自动拆帖；登录校验成功不等于有长推权限。

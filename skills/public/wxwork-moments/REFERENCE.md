@@ -1,7 +1,7 @@
 # 企业微信 corp_id / corp_secret 获取指引
 
-> 本文件供 Agent 在用户缺少凭据时读取，据以下步骤指导用户获取企业 ID + corp_secret，并写入 `daemon.env`。
-> 同一份凭据同时被 `wxwork-moments`（朋友圈）和 `wxwork-drive`（微盘）使用。
+> 本文件供 Agent 在用户缺少凭据时读取，据以下步骤指导用户获取企业 ID + corp_secret，并写入 `.env.xiaobei-keys`。
+> 同一份凭据同时被 `wxwork-moments`（朋友圈）和 `wxwork-drive`（微盘，尚未在 EvoFlow 可用）使用。
 
 ## 前置
 
@@ -28,19 +28,19 @@
 - **微盘**：后台 → 左侧「协作」→ 微盘 → 右侧上部「API」图标（图标很小，仔细看）→ 点开 → 「可调用接口的应用」里添加上一步创建的应用
 - **客户联系**（朋友圈用）：后台 → 左侧「客户与上下游」→ 客户联系 → 右侧上部「API」图标 → 点开 → 「可调用接口的应用」里添加同一个应用
 
-## 写入 daemon.env + 重启
+## 写入 .env.xiaobei-keys + 重启
 
-Agent 收到 corp_id + corp_secret 后，**不要自己直接改 daemon.env**。两条路：
+Agent 收到 corp_id + corp_secret 后，把它们写入 `E:/EvoFlow/.env.xiaobei-keys`（git-ignored；文件不存在时创建即可），每行一个 `KEY=VALUE`：
 
-- **推荐**：把 corp_id / corp_secret 交给 **IT engineer**，由 IT engineer 写入 `daemon.env` 的 `WXWORK_CORP_ID` / `WXWORK_CORP_SECRET`，再用 `gateway` MCP 工具应用配置 + 重启 Gateway。
-- **用户自助**：编辑 `daemon.env`，填入：
-  ```
-  WXWORK_CORP_ID=<企业ID>
-  WXWORK_CORP_SECRET=<应用 Secret>
-  ```
-  然后重启实例（具体重启方式见部署文档 / 问 IT engineer）。
+```
+WXWORK_CORP_ID=<企业ID>
+WXWORK_CORP_SECRET=<应用 Secret>
+OFB_KEY=<relay 服务方签发的会员凭证，向服务方索取>
+```
 
-> ⚠️ 写入 daemon.env 后**必须重启实例**才生效。
+写入后重启 start-dev.bat，环境变量注入生效。
+
+> ⚠️ 写入 .env.xiaobei-keys 后**必须重启 start-dev.bat** 才生效。
 
 ## 安全
 

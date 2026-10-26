@@ -52,7 +52,9 @@ description: 小红书账号运营专家。承接定位起号、内容 DNA（图
 
 跨领域通用技能：`viral-chaser`（小红书视频笔记拆解，视频下载委托 `xhs-hunter`）、`xhs-hunter`（站内内容搜索、图文与视频笔记采集，expert-bd 互动与蒲公英/千帆工具复用其 PC 会话）、`content-calibrator`（DNA 表现评估）、`published-track`（发布记录与指标库）。小红书登录由 `xhs-hunter` 和 `xhs-publish` 分别管理，与 `login-manager` 无关。内容调研只使用 `xhs-hunter` 的有界站内请求和已保存的材料；按下方限频规则串行执行。
 
-原生界面卡片出图使用 EvoFlow 共享技能 `native-ui-card`，具体选题、审核、发布与记录按 `workflows/native-ui-cards.md`。
+原生界面卡片出图使用 EvoFlow 共享技能 `native-ui-card`（尚未在 EvoFlow 可用，见下方守卫说明），具体选题、审核、发布与记录按 `workflows/native-ui-cards.md`。
+
+> ⚠️ native-ui-card 尚未在 EvoFlow 可用（待移植裁决）。可用前本流程不可执行；需要卡片图时改走 content-production.md 的图文路线。
 
 ## 风格与 DNA
 

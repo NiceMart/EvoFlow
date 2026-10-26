@@ -4,6 +4,8 @@
 
 用户指定群聊误发式或问答式连续讨论流卡片时，切到 `native-ui-cards.md` 完成抖音图文制作、发布与记录；本流程处理其他图文和视频。
 
+> ⚠️ native-ui-card 尚未在 EvoFlow 可用（待移植裁决）。可用前涉及 native-ui-card 的卡片图环节不可执行；需要卡片图时改走本文件的图文路线。
+
 **视频作品分工硬边界**：EvoFlow agent 负责选题策划、按 DNA 出 **Brief**、拟定标题与简介、准备素材（用户素材预处理 / `ui-demo` 录屏 / 从 `campaign_assets/` 挑选，绝对路径写进 Brief）、监督并推动作为 subagent 的 `content-producer`、成片后的发布与运营；也直接做图文内容与**已有视频素材的简单加工**（`video-edit` / `talking-head-cut`）。视频全案的成片制作一律委托 `content-producer`。本 workflow 的价值在于：用 DNA 锁定选题、包装、内容创意、视频形态与制作规格，编排输入分支与确认节点，衔接制作并把关发布记录。
 
 ## Step 0 - 入口判断

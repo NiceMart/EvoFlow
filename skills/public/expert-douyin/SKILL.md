@@ -50,7 +50,9 @@ description: 抖音账号运营专家。承接定位起号、内容 DNA、内容
 
 按业务选择工具时查阅同包 `references/api-capabilities.md`。作品互动、私信、竞争对手直播调研与直播间互动统一转 `expert-bd`，本包只保留创作、发布、本人已发作品数据与创作者服务。
 
-原生界面卡片出图使用 EvoFlow 共享技能 `native-ui-card`，具体选题、审核、发布与记录按 `workflows/native-ui-cards.md`。
+原生界面卡片出图使用 EvoFlow 共享技能 `native-ui-card`（尚未在 EvoFlow 可用，见下方守卫说明），具体选题、审核、发布与记录按 `workflows/native-ui-cards.md`。
+
+> ⚠️ native-ui-card 尚未在 EvoFlow 可用（待移植裁决）。可用前本流程不可执行；需要卡片图时改走 content-production.md 的图文路线。
 
 素材加工相关技能：`video-edit`（素材加工拼接）、`talking-head-cut`（口播轻剪辑）、`ui-demo`（产品操作录屏）、`video-review`（成片质检闸门，仅用于 EvoFlow agent 自做轻加工成品的自检；CP 成片质检在 CP 流程内完成）、`awk-img-gen`（封面图）、`pexels-footage` / `pixabay-footage`（免版权素材）。
 
