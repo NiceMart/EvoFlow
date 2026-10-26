@@ -1,0 +1,61 @@
+---
+name: expert-bd
+description: 商务拓展与联络专家。承接潜客探索筛选、评论回复、私信、邮件、点赞收藏关注、直播间互动、客户触达与联络记录。商业情报、竞对监控、直播调研及市场研究走 expert-osbi；公开资料按平台使用文中列出的采集技能或公共 smart-search，融资推进走 expert-ir。
+---
+
+# 商务拓展与联络（BD）
+
+## 环境前置（EvoFlow）
+
+- Node：`node` 可用（tiktok/twitter 的 im/interact/live 薄壳 wrapper 直穿 `../../../platform-runtime/scripts/cli.mjs`）；Python 3：`python3` 可用且 `PYTHONUTF8=1`（douyin-im/interact 脚本、douyin-live/xhs-live 直穿 `../../../_shared/`）
+- OFB Relay：douyin-im 的封包扩展请求、douyin-interact 的写操作（Relay v2 `web.request`）依赖 Relay（`OFB_KEY`）；凭据缺失时相应子命令 fail-fast 引导
+- 共享会话（路径原样保留，与 xiaobei 共享）：IM 会话存 `~/.openclaw/douyin-im/`；douyin-interact 用独立 API 会话 `~/.openclaw/douyin-api/session.json`。浏览器层 `camoufox-cli` 由各采集技能（douyin-hunter/xhs-hunter 等）依赖，本包不直呼
+- bd_record 库：`$EVOFLOW_MEDIA_WS/db/bd_record.db`（`EVOFLOW_MEDIA_WS` 未设置时 bd-record 脚本报错退出（fail-fast），须先 export `EVOFLOW_MEDIA_WS`）
+
+
+## Workflow 路由
+
+| 场景 | Workflow |
+|---|---|
+| 找客户、发布者画像匹配与评论区潜客筛选 | [Lead Hunting](workflows/lead-hunting.md) |
+| 评论、私信、邮件与线索联络 | [Interaction](workflows/interaction.md) |
+| 在指定公开直播间提问、答疑或拓展合作 | [Live Interaction](workflows/live-interaction.md) |
+
+找客户和筛选潜客按本包 Lead Hunting 执行；已有目标时直接核对语境、授权和实际能力。商业情报、竞对调研和市场研究转 `expert-osbi`，研究结论用于本包后续拓展与联络。
+
+## 工具清单
+
+先读 [互动能力表](references/interaction-capabilities.md) 与目标工具说明，以已实现接口为准。
+
+| 工具 | 用途 |
+|---|---|
+| `email-ops`（公共技能） | 邮件起草、回复/跟进、会前会后沟通、合作提案与发送；先读取该技能 SKILL.md |
+| [bd-record](tools/bd-record/SKILL.md) | 线索与联络记录、帖子互动去重 |
+| [douyin-interact](tools/douyin-interact/SKILL.md) | 抖音作品点赞、收藏、评论/回复及已支持的收藏夹操作 |
+| [douyin-im](tools/douyin-im/SKILL.md) | 抖音文本、媒体和分享卡片私信及收信 |
+| [douyin-live](tools/douyin-live/SKILL.md) | 抖音直播弹幕与点赞 |
+| [xhs-im](tools/xhs-im/SKILL.md) | 小红书会话/历史、单聊文本、已读、撤回与删除 |
+| [xhs-live](tools/xhs-live/SKILL.md) | 小红书直播文字评论与文字帧发送 |
+| [twitter-interact](tools/twitter-interact/SKILL.md) | X 评论回复、点赞、转发、收藏与关注 |
+| [twitter-im](tools/twitter-im/SKILL.md) | X 首页会话与加密占位历史查询；不支持发送 |
+| [tiktok-interact](tools/tiktok-interact/SKILL.md) | TikTok 已支持的作品、评论、关注和收藏夹操作 |
+| [tiktok-im](tools/tiktok-im/SKILL.md) | TikTok 已有会话文本私信、历史和监听 |
+| [tiktok-live](tools/tiktok-live/SKILL.md) | TikTok 直播文字与点赞 |
+
+`email-ops` 保持公共技能位置，按其 SKILL.md 规定的流程与脚本调用，不复制进本包。包内工具通过已列出的 wrapper 调用；包内资源按 SKILL.md 的位置定位，不拼 Workspace 技能路径。
+
+> ⚠️ `email-ops` 尚未移植到 EvoFlow（待移植裁决）。可用前邮件联络流程不可执行：需要邮件触达时改为输出草稿交用户手动发送；其余评论/私信/直播互动流程不受影响。
+
+## 获取互动语境
+
+公开作品、评论、账号、提醒与媒体按平台使用：抖音 `douyin-hunter`、小红书 `xhs-hunter`、TikTok `tiktok-hunter`、快手 `kuaishou-hunter`、X `x-hunter`、微博 `weibo-hunter`、微信公众号 `wx-mp-hunter`。其他网页用 `smart-search` / `browser-guide`。公开直播资料与事件使用 `douyin-hunter live` / `xhs-hunter live` / `tiktok-hunter live` / `kuaishou-hunter live`。私信会话、历史及私信未读仍由本包 IM 工具读取，它们服务于会话联络。
+
+抖音互动使用 `douyin-login` 独立 API 会话；小红书复用 `xhs-hunter` PC 会话，不混用 Creator 登录。TikTok 写入材料按 `tiktok-hunter` 登录说明核验。快手普通互动、私信与直播写操作未实现；微博互动写操作未实现。不要以浏览器操作补造未实现能力。
+
+## 数据与边界
+
+- 潜客画像、线索与帖子互动记录保留在 `$EVOFLOW_MEDIA_WS/db/bd_record.db`，通过本包 `bd-record` 初始化和去重；未联系的记录不能标为已联系。
+- 联络草稿、结果与中间产物存 Workspace `bd/`；直播互动日志存 `bd/live/`。情报条目、研究报告与监控配置由 OSBI 管理。
+- 每次写操作核对真实目标和既有授权；预览后仅执行已授权动作。接口提交、实际送达与对方回应分别记录；结果不明时先核实，不自动重发或换通道补发。
+- 公开直播调研转 `expert-osbi`。本包不提供赠礼支付、主播后台开关播、禁言/踢人和商品管理。
+- 内容创作、发布和本人作品数据转平台专家包；投资人关系、融资材料和项目申报转 `expert-ir`。
