@@ -52,9 +52,15 @@ POST_LIST_URL = os.environ.get(
     "https://channels.weixin.qq.com/platform/post/list",
 )
 
-PUBLISHED_TRACK_ROOT = Path(
-    os.environ.get("PUBLISHED_TRACK_ROOT") or os.environ.get("EVOFLOW_MEDIA_WS") or "."
-).expanduser()
+# PUBLISHED_TRACK_ROOT 显式指定时即 db 目录本身；EVOFLOW_MEDIA_WS 是 workspace 根，
+# 库规范路径为 $EVOFLOW_MEDIA_WS/db/published_track.db（同 update-metrics.sh/record.sh），补 /db 段
+if os.environ.get("PUBLISHED_TRACK_ROOT"):
+    PUBLISHED_TRACK_ROOT = Path(os.environ["PUBLISHED_TRACK_ROOT"])
+elif os.environ.get("EVOFLOW_MEDIA_WS"):
+    PUBLISHED_TRACK_ROOT = Path(os.environ["EVOFLOW_MEDIA_WS"]) / "db"
+else:
+    PUBLISHED_TRACK_ROOT = Path("./db")
+PUBLISHED_TRACK_ROOT = PUBLISHED_TRACK_ROOT.expanduser()
 PUBLISHED_TRACK_DB = PUBLISHED_TRACK_ROOT / "published_track.db"
 PUBLISHED_TRACK_SCRIPTS = Path(
     os.environ.get(
