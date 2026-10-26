@@ -70,7 +70,7 @@ xiaobei 技能本就是 SKILL.md + 脚本的标准 Agent Skills 结构，与 Evo
 | 0·地基 | `_shared`、`platform-runtime`、`published-track`、`smart-search` + 薄适配层（§5） | `published-track init-db` 成功；smart-search 真实搜索一次，验证 camoufox 链路与 cookie 复用 | 已完成（2026-10-26，smart-search 真搜延后至用户会话） |
 | 1·纯方法论 | `council`、`viral-chaser`、`expert-design`、`pitch-deck`、`talking-head-cut`、`video-edit`、`content-calibrator` | agent 各调用一次完成真实小任务（如出一版 deck） | 已完成（2026-10-26，交互实测延后至用户会话） |
 | 2·平台运营 | 7 个 `expert-*` + 7 个 `*-hunter` + `weibo/zhihu-publish` + `expert-video` + `wxwork-moments` | 每技能先跑只读命令（采集一条/读 DNA 模板），选 1–2 个做真实发布冒烟 | 已完成（2026-10-26，实落 22 技能含 video-review/bgm-library/awk-img-gen/aigc-video-gen 四助手；零成本只读冒烟已做，真实发布冒烟延后至用户会话） |
-| 3·商业闭环 | `expert-bd`、`expert-osbi`、`expert-ir`、`sales-cs` 五件套 + 每日复盘定时任务 | 客服链路 dry-run；复盘任务按期触发一次 |
+| 3·商业闭环 | `expert-bd`、`expert-osbi`、`expert-ir`、`sales-cs` 五件套 + 每日复盘定时任务 | 客服链路 dry-run；复盘任务按期触发一次 | 已完成（2026-10-27，复盘任务已落地见 §4.3；客服 dry-run 与复盘首跑延后至用户会话） |
 | ~~4·it-engineer~~ | ~~`icp-filing`、`icp-exemption`、`seo`、`tccli`、`alicloud-find-skills`、`camoufox-guard`~~ | **已取消（2026-10-27，需求方裁定暂不需要）**——映射表 #16（网站设计与制作、ICP 备案材料）随之取消；`camoufox-guard` 巡检能力一并取消，进程巡检改由人工/按需处理 |
 
 ### 4.1 批次 0+1 实测记录（2026-10-26）
@@ -96,6 +96,24 @@ xiaobei 技能本就是 SKILL.md + 脚本的标准 Agent Skills 结构，与 Evo
 - 验收门发现并修复：`.env.xiaobei-keys` 与 `start-dev.bat` 原为 LF-only 行尾——cmd `for /f "usebackq ..."` 实测从 LF-only 文件读 0 行（CRLF 对照组正常读 1 行），真实重启时密钥桥会静默失效；且 `start-dev.bat` 含 `goto wait_vite` 标签循环，LF-only bat 有解析风险。两文件已转 CRLF 并隔离 cmd 复测 for /f 注入 `AWK_API_KEY` 成功。两文件均不入库（bat 未跟踪、keys 已 gitignore），无提交内容变化。
 - 重启验证按裁定保留运行中栈：网关 19:53 启动早于 bat 最后编辑（21:29），未杀进程；真实重启验证由用户下次 `start-dev.bat` 启动自然覆盖（CRLF 修复后注入链路已隔离验证）。
 - 未移植项：`native-ui-card` 不在规格映射内，未移植——是否补移待用户决策。
+
+### 4.3 每日复盘定时任务落地记录（2026-10-27）
+
+- 任务：`POST /api/automation/tasks` 创建「每日内容复盘」，task id **`a3205e71`**，cron **`0 9 * * *`**（schedule_type `recurring`，status `active`，max_duration_minutes 30；存储 rrule `FREQ=DAILY;INTERVAL=1;BYHOUR=9`）。prompt 按 §5.3 编排：published-track 指标刷新与查询 → content-calibrator DNA 评估 → 结构化复盘报告（数据不足时输出补数建议）。
+- 实际接受的请求体（其余字段可选；`schedule` 兼作 cron 字段名）：
+
+```json
+{
+  "name": "每日内容复盘",
+  "prompt": "执行每日内容复盘：1) 运行 published-track 的指标刷新与查询（published-track 技能，库在 $EVOFLOW_MEDIA_WS/db/published_track.db）；2) 用 content-calibrator 技能对近期发布内容做 DNA 表现评估；3) 输出结构化复盘报告（表现摘要/异常项/明日建议），若数据不足则输出数据不足说明与补数建议。",
+  "schedule_type": "recurring",
+  "cron_expr": "0 9 * * *",
+  "max_duration_minutes": 30
+}
+```
+
+- 持久化方式（实测修正）：当前网关落 **SQLite**（`~/.evoflow/data/app/evoflow.db` 的 `evoflow_automations` 表，经 `automation_repositories.save_automation`），并非设计时预期的 `~/.evoflow/tasks/automations/` TOML——该 TOML 目录现为 legacy 导入源（`_maybe_import_legacy_toml_automations`），本机不存在。API `GET /api/automation/tasks` 列表已含该任务，验收通过。
+- 首次执行按裁定不手动触发：用户在网页「定时任务」页点「运行」观察；后续调整（改 cron/停启用）同在该页操作。
 
 ## 5. 薄适配层
 
