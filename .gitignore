@@ -570,3 +570,6 @@ evopanel/src-tauri/gen/
 
 # platform-runtime 本地依赖（install-runtime.mjs 重建）
 skills/public/platform-runtime/node_modules/
+
+# local dev tools (sqlite3 CLI)
+.tools/
