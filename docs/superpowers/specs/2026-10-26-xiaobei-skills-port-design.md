@@ -70,7 +70,7 @@ xiaobei 技能本就是 SKILL.md + 脚本的标准 Agent Skills 结构，与 Evo
 | 0·地基 | `_shared`、`platform-runtime`、`published-track`、`smart-search` + 薄适配层（§5） | `published-track init-db` 成功；smart-search 真实搜索一次，验证 camoufox 链路与 cookie 复用 | 已完成（2026-10-26，smart-search 真搜延后至用户会话） |
 | 1·纯方法论 | `council`、`viral-chaser`、`expert-design`、`pitch-deck`、`talking-head-cut`、`video-edit`、`content-calibrator` | agent 各调用一次完成真实小任务（如出一版 deck） | 已完成（2026-10-26，交互实测延后至用户会话） |
 | 2·平台运营 | 7 个 `expert-*` + 7 个 `*-hunter` + `weibo/zhihu-publish` + `expert-video` + `wxwork-moments` | 每技能先跑只读命令（采集一条/读 DNA 模板），选 1–2 个做真实发布冒烟 | 已完成（2026-10-26，实落 22 技能含 video-review/bgm-library/awk-img-gen/aigc-video-gen 四助手；零成本只读冒烟已做，真实发布冒烟延后至用户会话） |
-| 3·商业闭环 | `expert-bd`、`expert-osbi`、`expert-ir`、`sales-cs` 五件套 + 每日复盘定时任务 | 客服链路 dry-run；复盘任务按期触发一次 | 已完成（2026-10-27，复盘任务已落地见 §4.3；客服 dry-run 与复盘首跑延后至用户会话） |
+| 3·商业闭环 | `expert-bd`、`expert-osbi`、`expert-ir`、`sales-cs` 五件套 + 每日复盘定时任务 | 客服链路 dry-run；复盘任务按期触发一次 | 已完成（2026-10-27，8 技能验收通过见 §4.4；复盘任务已落地见 §4.3；客服 dry-run 与复盘首跑延后至用户会话） |
 | ~~4·it-engineer~~ | ~~`icp-filing`、`icp-exemption`、`seo`、`tccli`、`alicloud-find-skills`、`camoufox-guard`~~ | **已取消（2026-10-27，需求方裁定暂不需要）**——映射表 #16（网站设计与制作、ICP 备案材料）随之取消；`camoufox-guard` 巡检能力一并取消，进程巡检改由人工/按需处理 |
 
 ### 4.1 批次 0+1 实测记录（2026-10-26）
@@ -115,6 +115,16 @@ xiaobei 技能本就是 SKILL.md + 脚本的标准 Agent Skills 结构，与 Evo
 - 持久化方式（实测修正）：当前网关落 **SQLite**（`~/.evoflow/data/app/evoflow.db` 的 `evoflow_automations` 表，经 `automation_repositories.save_automation`），并非设计时预期的 `~/.evoflow/tasks/automations/` TOML——该 TOML 目录现为 legacy 导入源（`_maybe_import_legacy_toml_automations`），本机不存在。API `GET /api/automation/tasks` 列表已含该任务，验收通过。
 - 首次执行按裁定不手动触发：用户在网页「定时任务」页点「运行」观察；后续调整（改 cron/停启用）同在该页操作。
 
+### 4.4 批次 3 验收记录与受限能力清单（2026-10-27）
+
+- 验收：网关 `GET /api/skills` 8/8 技能名命中（expert-bd/expert-osbi/expert-ir/customer-db/demo-send/exp-invite/proactive-send/sales-cs-manager）；`DECLARED_SKILLS` 残留 ALL-CLEAN；8 个 SKILL.md 无 openclaw metadata 残留。
+- 受限能力清单（`.env.xiaobei-keys` 补配 + 重启后即自动解锁）：
+  - `AWADA_KEY`/`AWADA_LANE` 未配置 → exp-invite 邀请发送、proactive-send 主动触达不可用。
+  - relay `OFB_KEY` 未配置 → expert-bd 的 douyin-im/interact 请求类子命令受限（同批次 2 口径）。
+  - demo-send 附件发送能力需 EvoFlow 侧等价工具（产品化项）。
+  - customer-db 的 peer 标识由用户在对话中供给（渠道自动映射为产品化项）。
+  - 每日复盘任务 `a3205e71` 已登记、未手动首跑（用户在定时任务页点「运行」观察，见 §4.3）。
+
 ## 5. 薄适配层
 
 ### 5.1 环境变量（有默认回落，不硬编码）
@@ -157,3 +167,7 @@ xiaobei 技能本就是 SKILL.md + 脚本的标准 Agent Skills 结构，与 Evo
 | `_shared` Python 依赖版本漂移 | xiaobei `requirements.txt` 随批次 0 一起记录并核对 |
 | openclaw 概念残留误导 agent | 批次清洗规则 + 验收时抽查 SKILL.md |
 | EvoFlow 与 openclaw 同时跑 camoufox 进程冲突 | `camoufox-guard`（批次 4）可提前移植到批次 0 作为巡检工具 |
+
+---
+
+**移植工程完成（2026-10-27）**：批次 0/1/2/3 全部完成（见 §4 各批次实测记录），批次 4 已取消（2026-10-27，需求方裁定，见 §4 批次表）；批次 4 对应的 `camoufox-guard` 巡检与 ICP/SEO 类技能不移植。各批次延后的交互实测项待用户 EvoFlow 会话覆盖。
