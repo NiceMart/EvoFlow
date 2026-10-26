@@ -573,3 +573,6 @@ skills/public/platform-runtime/node_modules/
 
 # local dev tools (sqlite3 CLI)
 .tools/
+
+# xiaobei 技能密钥本地桥
+.env.xiaobei-keys
