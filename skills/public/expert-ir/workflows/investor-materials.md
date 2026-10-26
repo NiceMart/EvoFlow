@@ -108,5 +108,7 @@
 |------|---------|
 | 商业模式复盘后更新材料 | `council`（复盘结论驱动材料迭代） |
 | 投资人触达需要发送材料 | `email-ops` 发邮件，Investor Outreach Workflow 写话术 |
+
+> ⚠️ `email-ops` 尚未在 EvoFlow 可用（待移植裁决）。需要邮件动作时改为输出草稿交用户手动发送。
 | 搜索竞品/市场数据支撑材料 | `expert-osbi` 的 Market Research workflow |
 | 记录材料发送状态 | `ir-record update-status` 更新投资人状态为 `bp_sent` |

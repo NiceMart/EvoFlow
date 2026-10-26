@@ -66,6 +66,8 @@ ir-record record-investor \
 
 按 Investor Outreach Workflow 写个性化触达文案，经用户确认后用 `email-ops` 发出。邮件发出后 → 状态 `new → contacted`：
 
+> ⚠️ `email-ops` 尚未在 EvoFlow 可用（待移植裁决）。需要邮件动作时改为输出草稿交用户手动发送。
+
 ```bash
 ir-record update-status --id <rowid> --status contacted
 ```

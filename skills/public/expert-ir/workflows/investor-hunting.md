@@ -4,6 +4,8 @@
 
 **依赖**：`smart-search`（构造搜索 URL）、`browser-guide`（浏览器操作）、Investor Outreach Workflow（触达话术）、`email-ops`（邮件）、`ir-record`（去重记录）。
 
+> ⚠️ `email-ops` 尚未在 EvoFlow 可用（待移植裁决）。需要邮件动作时改为输出草稿交用户手动发送。
+
 ---
 
 ## 前置条件
@@ -87,6 +89,8 @@
 3. 按配置的反馈形式执行：
    - **列表报告**：仅汇总报告，不触达
    - **Email 联系**：对 high 匹配度的投资人，按 Investor Outreach Workflow 生成话术，经用户确认后用 `email-ops` 发送
+
+     > ⚠️ `email-ops` 尚未在 EvoFlow 可用（待移植裁决）。需要邮件动作时改为输出草稿交用户手动发送。
    - **社交平台触达**：对 high 匹配度的投资人，通过社交平台私信触达（需用户确认）
 
 4. 将汇总报告在对话中直接交付给用户

@@ -44,6 +44,8 @@ description: 投资人关系（IR）专家。承接投资人发掘、融资沟�
 
 跨领域通用技能：`smart-search`（构造搜索 URL）、`browser-guide`（浏览器操作）、`email-ops`（邮件发送）、`expert-osbi` 的 Market Research workflow（基金/竞品尽调）、`pitch-deck`（HTML 路演材料）、`council`（商业模式多视角复盘）。
 
+> ⚠️ `email-ops` 尚未在 EvoFlow 可用（待移植裁决）。需要邮件动作时改为输出草稿交用户手动发送。
+
 ## 数据与记录
 
 - IR 数据层只有一个库：`$EVOFLOW_MEDIA_WS/db/ir_record.db`（投资人档案 / 接触记录 / 项目申报三张表），使用前如果数据库文件不存在，先调对应工具 `ir-record init-db`（幂等）完成初始化。
@@ -61,6 +63,6 @@ description: 投资人关系（IR）专家。承接投资人发掘、融资沟�
 
 ## 红线
 
-- 不直接发材料/邮件：先出文案，用户确认后再走 `email-ops`。
+- 不直接发材料/邮件：先出文案，用户确认后再走 `email-ops`（尚未可用，改输出草稿交用户）。
 - 不承诺融资成功率：只保证流程齐整、状态准确、跟进及时。
 - 不接触明显不匹配的投资人（match_score 阶段过滤）。

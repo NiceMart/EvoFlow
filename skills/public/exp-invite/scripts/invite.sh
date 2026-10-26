@@ -88,15 +88,10 @@ if [ "$existing_status" != "free" ] && [ -z "$FORCE" ]; then
   exit 10
 fi
 
-# Only update business_status to exp_invited if current status is free or empty
-# For exp_invited/subs/club users with --force, don't change business_status
-if [ "$existing_status" = "free" ] || [ -z "$existing_status" ]; then
-  sqlite3 "$DB_FILE" "UPDATE cs_record SET business_status = 'exp_invited' WHERE peer = '$(sql_quote "$PEER")'"
-fi
-
 # Send invite control message via relay outbound.
 # xiaobei 原形是把控制消息 printf 到 stdout、由 awada-channel 钩子转成拉群动作；
 # EvoFlow 无渠道钩子，改为直接 POST relay outbound（同 proactive-send 的 transport）。
+# 写库（标 exp_invited）放在 POST 成功之后：POST 失败时库保持原状态，重试不误判 ALREADY_INVITED。
 json_escape() {
   printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
 }
@@ -119,6 +114,12 @@ RESP_BODY="$(printf '%s' "$RESP" | sed '$d')"
 if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
   echo "❌ outbound POST failed: HTTP $HTTP_CODE: $RESP_BODY" >&2
   exit 1
+fi
+
+# Only update business_status to exp_invited if current status is free or empty
+# For exp_invited/subs/club users with --force, don't change business_status
+if [ "$existing_status" = "free" ] || [ -z "$existing_status" ]; then
+  sqlite3 "$DB_FILE" "UPDATE cs_record SET business_status = 'exp_invited' WHERE peer = '$(sql_quote "$PEER")'"
 fi
 
 STREAM_ID="$(printf '%s' "$RESP_BODY" | sed -n 's/.*"streamId"[: ]*"\([^"]*\)".*/\1/p')"

@@ -14,7 +14,7 @@ sales-cs-enablement check-channel
 
 退出码：`0` -> 已配置 awada 渠道；`1` / `2` -> 未配置或配置文件不存在。
 
-> ⚠️ 渠道绑定当前经 `.env.xiaobei-keys` 的 `AWADA_*` 配置 + relay，awada 渠道未配置时本检查不可用（配置文件不存在，退出码 `2`）。此时不要进入后续启用步骤，向用户说明需先配置 `AWADA_*`。
+> ⚠️ `check-channel` 在 EvoFlow 下预期恒返回 exit 2（其读取的 `~/.openclaw/openclaw.json` 在本架构不存在），仅作源机制参考；渠道可用性的实际判据是 `.env.xiaobei-keys` 中 `AWADA_KEY` 是否配置（配置后 exp-invite/proactive-send 即可用）。
 
 ---
 
@@ -29,5 +29,5 @@ sales-cs-enablement check-channel
 
 | 情况 | 处理 |
 |------|------|
-| `check-channel` 退出码 `2`（配置文件不存在） | 向用户说明 awada 渠道未配置，需先在 `.env.xiaobei-keys` 配置 `AWADA_*`；不进入任何后续步骤 |
+| `check-channel` 退出码 `2`（配置文件不存在） | 预期行为：其读取的 `~/.openclaw/openclaw.json` 在 EvoFlow 架构下不存在，恒 exit 2，不代表渠道未配置；实际判据是 `.env.xiaobei-keys` 中 `AWADA_KEY` 是否配置（配置后 exp-invite/proactive-send 即可用），不进入任何后续步骤 |
 | `check-channel` 退出码 `1`（未配置或解析失败） | 输出 JSON 给用户核对；不修改任何配置文件 |

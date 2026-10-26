@@ -45,4 +45,4 @@ proactive-send \
 - 本技能仅提供消息发送能力，**何时使用、发给谁、发什么内容**由调用场景决定
 - 请勿在正常对话流程中调用——会破坏对话自然性
 - 消息内容应简短、自然、克制
-- 走 HTTP `POST /api/v1/awada/outbound?lane=` + `X-Awada-Key` header，不直连 Redis（契约见 `docs/AWADA-CLIENT-TRANSPORT.md` §3）
+- 走 relay 网关 HTTP 传输：`POST {RELAY_BASE_URL%/}/api/v1/awada/outbound?lane=<lane>`，header 带 `X-Awada-Key: $AWADA_KEY` 与 `Content-Type: application/json`，body 为 `{"payload":[{"type":"text","text":"<消息>"}],"meta":{"channel_id":"0","user_id_external":"<用户>","tenant_id":"0"}}`，不直连 Redis

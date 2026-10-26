@@ -7,7 +7,7 @@
  *     --user-id-external "黄子奇ᐪᒻ" \
  *     --text "您好，昨天咱们聊过专业版的事，不知道今天方便看看吗？"
  *
- * 走 relay 网关 POST /api/v1/awada/outbound?lane=<lane>（契约见 docs/AWADA-CLIENT-TRANSPORT.md §3）。
+ * 走 relay 网关 POST /api/v1/awada/outbound?lane=<lane>，X-Awada-Key header，payload [{type:"text",text:...}]+meta。
  * 配置从环境变量读取（xiaobei 原读渠道配置文件的等价迁移）：
  *   AWADA_KEY        relay 出站凭据（X-Awada-Key header），未设置时 fail-fast exit 1
  *   AWADA_LANE       relay lane 参数（可选，未设置沿用服务器默认 lane）

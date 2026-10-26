@@ -68,7 +68,7 @@ skills/public/exp-invite/scripts/invite.sh \
 - 成功：打印 relay outbound stream ID（如 `1234-0`），exit 0
 - 已邀请过且未指定 `--force`：输出 `ALREADY_INVITED`，并以非 0 状态退出（exit 10）
 - 路径/凭据缺失：ERROR 提示缺什么、写哪里（`.env.xiaobei-keys`），exit 1
-- relay 请求失败：错误描述打印到 stderr，exit 1
+- relay 请求失败：错误描述打印到 stderr，库状态保持不变（不标 `exp_invited`），exit 1
 
 ## 当前体验群名称
 - `风暴眼（wiseflow情报小站）`
