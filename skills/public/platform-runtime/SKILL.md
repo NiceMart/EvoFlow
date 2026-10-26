@@ -3,11 +3,6 @@ name: platform-runtime
 description: TikTok、快手、X 和微博平台工具的内部运行库，统一管理登录和会话，由各 hunter、发布、engagement 与 BD wrapper 调用。
 user-invocable: false
 disable-model-invocation: true
-metadata:
-  openclaw:
-    requires:
-      bins:
-        - node
 ---
 
 平台任务调用对应技能的 wrapper。本目录提供共用传输、能力检查和登录会话管理，不作为业务入口。浏览器登录与导出经 `x-hunter` / `tiktok-hunter` / `weibo-hunter` 的 `login`、`login-status`、`export`（别名 `login-confirm`）执行，专属 session 分别为 `twitter` / `tiktok` / `weibo`；禁止改用通用浏览器会话登录。快手经 `kuaishou-hunter login/login-confirm` 执行 QR/SMS 流程。登录与 TikTok 写材料准备规则见 [登录说明](references/login.md)。
