@@ -2,7 +2,18 @@
 
 from __future__ import annotations
 import base64
-import fcntl
+try:
+    import fcntl
+except ImportError:  # Windows：无 fcntl；单实例假设下文件锁退化为 no-op
+    class _FcntlShim:
+        LOCK_EX = 0
+        LOCK_UN = 0
+
+        @staticmethod
+        def flock(fd, flags):
+            return None
+
+    fcntl = _FcntlShim()
 import json
 import os
 import tempfile
@@ -75,7 +86,7 @@ def write_private(path, value):
 def session_lock(path=DEFAULT_SESSION):
     path = Path(path)
     path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-    fd = os.open(str(path) + ".lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    fd = os.open(str(path) + ".lock", os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
     with os.fdopen(fd, "w") as stream:
         fcntl.flock(stream, fcntl.LOCK_EX)
         yield

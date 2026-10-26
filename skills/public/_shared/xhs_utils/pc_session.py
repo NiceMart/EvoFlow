@@ -4,7 +4,18 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime, timezone
-import fcntl
+try:
+    import fcntl
+except ImportError:  # Windows：无 fcntl；单实例假设下文件锁退化为 no-op
+    class _FcntlShim:
+        LOCK_EX = 0
+        LOCK_UN = 0
+
+        @staticmethod
+        def flock(fd, flags):
+            return None
+
+    fcntl = _FcntlShim()
 import json
 import os
 from pathlib import Path
