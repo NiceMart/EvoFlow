@@ -60,7 +60,15 @@ if [ -z "$CONFIG" ]; then
 fi
 
 # Use inline Python to do migrations + recursive merge with PyYAML
-cd "$REPO_ROOT/backend" && "$UV_BIN" run python3 -c "
+# Windows Python can't open git-bash style /e/... paths; convert to E:/... form.
+if command -v cygpath >/dev/null 2>&1; then
+    CONFIG="$(cygpath -m "$CONFIG")"
+    EXAMPLE="$(cygpath -m "$EXAMPLE")"
+fi
+
+# Windows venvs ship python.exe only (no python3.exe); plain "python" resolves on all platforms.
+# Windows console defaults to GBK; force UTF-8 so the script's ✓/✗ output doesn't crash.
+cd "$REPO_ROOT/backend" && PYTHONUTF8=1 "$UV_BIN" run python -c "
 import sys, shutil, copy, re
 from pathlib import Path
 
