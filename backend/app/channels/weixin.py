@@ -775,7 +775,7 @@ class WeixinChannel(Channel):
         for path in paths:
             self._temp_media_paths.discard(path)
             try:
-                os.unlink(path)
+                os.unlink(path)  # async-block-ok: 单个临时文件 unlink，微秒级
             except OSError as exc:
                 logger.debug("[Weixin] failed to remove temp media %s: %s", path, exc)
 
@@ -969,7 +969,8 @@ class WeixinChannel(Channel):
             return False
 
         try:
-            plaintext = attachment.actual_path.read_bytes()
+            # 媒体文件整读不下事件循环
+            plaintext = await asyncio.to_thread(attachment.actual_path.read_bytes)
             mime = attachment.mime_type
 
             # Determine media type

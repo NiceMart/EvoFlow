@@ -60,6 +60,15 @@ _SUBSCRIBER_BUFFER_MAX_BYTES = 1024 * 1024
 _FLUSH_WINDOW_MS = {"continuous": 30, "replayable": 150}
 _DEFAULT_PROFILE = "continuous"
 
+# 快照尾部窗口：对齐 shared/zcode-protocol-v4/core.ts
+# PROTOCOL_V4_LIMITS.snapshotTailWindowRows（前端 loadOlder 游标补拉更早行，
+# rowsWindowSchema 的 window/totalCount/firstRowId 均按截断语义设计）。
+_SNAPSHOT_TAIL_ROWS = max(20, int(os.getenv("EVOFLOW_V4_SNAPSHOT_TAIL_ROWS", "60") or "60"))
+# 快照帧字节预算：rows 序列化超限则对半收缩窗口——防单行超大 display（长工具
+# 输出 / structuredPatch）在 60 行窗口内仍爆帧。下限保证至少 20 行可上屏。
+_SNAPSHOT_MIN_TAIL_ROWS = 20
+_SNAPSHOT_MAX_BYTES = max(64 * 1024, int(os.getenv("EVOFLOW_V4_SNAPSHOT_MAX_KB", "256") or "256") * 1024)
+
 
 def _resolve_profile(client_mode: str | None) -> str:
     mode = str(client_mode or "").strip()
@@ -516,10 +525,14 @@ class V4ConversationHub:
         """把一批协议 delta 写入权威日志并广播到订阅者缓冲（每条 delta 一个 seq）。"""
         if not deltas:
             return
+        # JSON 尺寸编码在锁外完成：持锁逐条 json.dumps 是流式 worker 长时间
+        # 占住 _write_lock 的主要来源，会让 loop 线程上的 rows_range /
+        # poll_frames 无界等待。
+        sizes = [len(json.dumps(d, ensure_ascii=False)) for d in deltas]
         with self._write_lock:
             sess = self._get_or_create_session(session_id)
             subs = [s for s in self._subscriptions.values() if s.session_id == sess.session_id]
-            for delta in deltas:
+            for delta, encoded in zip(deltas, sizes):
                 sess.seq += 1
                 sess.delta_log.append((sess.seq, delta))
                 if len(sess.delta_log) > _DELTA_RETENTION_MAX:
@@ -528,7 +541,6 @@ class V4ConversationHub:
                     sess.delta_log_floor = max(sess.delta_log_floor, floor)
                 if not subs:
                     continue
-                encoded = len(json.dumps(delta, ensure_ascii=False))
                 for sub in subs:
                     if sub.overflowed:
                         continue
@@ -663,6 +675,7 @@ class V4ConversationHub:
 
     def _build_snapshot(self, sess: _SessionState) -> dict[str, Any]:
         rows = sorted(sess.rows.values(), key=lambda r: r["rowId"])
+        window = self._snapshot_tail_window(rows)
         return {
             "protocolVersion": 1,
             "sessionId": sess.session_id,
@@ -686,11 +699,40 @@ class V4ConversationHub:
             "goal": None,
             "plan": None,
             "rows": {
-                "window": rows,
+                # 尾部窗口；更早行走 rows/range 游标补拉（rowsWindowSchema 截断语义）。
+                "window": window,
                 "totalCount": len(rows),
                 "firstRowId": rows[0]["rowId"] if rows else None,
             },
         }
+
+    @staticmethod
+    def _snapshot_tail_window(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """快照 rows.window 截断：尾部 _SNAPSHOT_TAIL_ROWS 行，字节超限再对半收缩。
+
+        字节只量 rows（快照壳为固定 KB 级）；预算收缩到下限后即使仍超限也照发——
+        客户端 hasOlderRows/滚动补拉不依赖帧大小，单行爆帧只在日志暴露。
+        """
+        if len(rows) <= _SNAPSHOT_TAIL_ROWS:
+            return rows
+        take = _SNAPSHOT_TAIL_ROWS
+        while True:
+            window = rows[-take:]
+            try:
+                window_bytes = len(
+                    json.dumps(window, ensure_ascii=False, separators=(",", ":"))
+                )
+            except (TypeError, ValueError):  # pragma: no cover - 行数据不可序列化
+                return window
+            if window_bytes <= _SNAPSHOT_MAX_BYTES or take <= _SNAPSHOT_MIN_TAIL_ROWS:
+                if take < _SNAPSHOT_TAIL_ROWS:
+                    logger.info(
+                        "[v4.snapshot] byte-budget shrink window=%d rows=%.1fKB",
+                        take,
+                        window_bytes / 1024.0,
+                    )
+                return window
+            take = max(_SNAPSHOT_MIN_TAIL_ROWS, take // 2)
 
     def _enqueue_snapshot_locked(
         self,

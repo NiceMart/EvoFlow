@@ -1040,7 +1040,7 @@ class WecomChannel(Channel):
         for path in paths:
             self._temp_media_paths.discard(path)
             try:
-                os.unlink(path)
+                os.unlink(path)  # async-block-ok: 单个临时文件 unlink，微秒级
             except OSError as exc:
                 logger.debug("[Wecom] failed to remove temp media %s: %s", path, exc)
 
@@ -1406,7 +1406,8 @@ class WecomChannel(Channel):
         if not local_path.exists() or not local_path.is_file():
             raise FileNotFoundError(f"Media file not found: {local_path}")
 
-        data = local_path.read_bytes()
+        # 媒体文件可达数十 MB，整读不下事件循环
+        data = await asyncio.to_thread(local_path.read_bytes)
         resolved_name = file_name or local_path.name
         content_type = self._normalize_content_type("", resolved_name)
         return data, content_type, resolved_name

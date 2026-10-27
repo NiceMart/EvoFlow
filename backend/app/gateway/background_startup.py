@@ -20,6 +20,11 @@ logger = logging.getLogger(__name__)
 
 StLogFn = Callable[[str], None]
 
+# Belt-and-braces ceiling for the post-ready langgraph_ready_event wait. The
+# failure path now also sets the event; the timeout only guards against a
+# future code path that never sets it (otherwise every runner hangs forever).
+_LANGGRAPH_READY_WAIT_TIMEOUT_S = float(os.environ.get("EVOFLOW_LG_READY_WAIT_TIMEOUT_S", "180"))
+
 
 def init_startup_state(app: FastAPI) -> None:
     """Initialize lifespan state once per FastAPI app instance.
@@ -755,6 +760,13 @@ async def run_background_startup(app: FastAPI, st_log: StLogFn, _st: Any) -> Non
         except Exception:
             logger.exception("Failed to initialize LangGraph lifespan components")
             print("[LG-LIFESPAN] FAILED — graph execution will likely hang!", file=sys.stderr, flush=True)
+            # Release post-ready waiters even on failure: channel service / event
+            # queue / all runner schedulers hang forever behind
+            # langgraph_ready_event.wait() otherwise. Degraded (runs will fail)
+            # beats a silently dead gateway.
+            _ready_event = getattr(app.state, "langgraph_ready_event", None)
+            if _ready_event is not None:
+                _ready_event.set()
 
         try:
             from langgraph_api import graph as _lg_graph
@@ -987,8 +999,15 @@ async def run_post_ready_warmups(app: FastAPI, st_log: StLogFn, _st: Any) -> Non
             langgraph_ready_event = getattr(app.state, "langgraph_ready_event", None)
             if langgraph_ready_event is not None:
                 logger.info("[Gateway] post-ready: waiting on langgraph_ready_event before starting channels")
-                await langgraph_ready_event.wait()
-                logger.info("[Gateway] post-ready: langgraph_ready_event released, starting channels")
+                try:
+                    await asyncio.wait_for(langgraph_ready_event.wait(), timeout=_LANGGRAPH_READY_WAIT_TIMEOUT_S)
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "[Gateway] post-ready: langgraph_ready_event not set within %ss — starting channels anyway (degraded)",
+                        _LANGGRAPH_READY_WAIT_TIMEOUT_S,
+                    )
+                else:
+                    logger.info("[Gateway] post-ready: langgraph_ready_event released, starting channels")
             else:
                 logger.warning("[Gateway] post-ready: langgraph not ready and no ready_event — skipping channel start this pass")
                 return
@@ -999,6 +1018,21 @@ async def run_post_ready_warmups(app: FastAPI, st_log: StLogFn, _st: Any) -> Non
         logger.info("Channel service started (post-ready): %s", channel_service.get_status())
     except Exception:
         logger.exception("Channel service failed to start (non-fatal)")
+
+    try:
+        # 技能冷加载实测 ~4s/335 项（扫描全部 SKILL.md），不预热则每次网关重启后
+        # 用户首次打开技能相关页面都要吃这一刀。后台线程预热，失败无碍。
+        import asyncio as _asyncio
+
+        def _preheat_skills() -> None:
+            from evoflow.skills.loader import load_skills
+
+            skills = load_skills()
+            logger.info("Skills cache preheated (post-ready): %d skills", len(skills))
+
+        _asyncio.get_running_loop().run_in_executor(None, _preheat_skills)
+    except Exception:
+        logger.exception("Skills cache preheat failed to schedule (non-fatal)")
 
     try:
         from app.gateway.events import event_queue, register_event_handlers

@@ -135,11 +135,67 @@ async def api_list(
     return {"items": items, "count": len(items)}
 
 
+_market_catalog_cache: dict[str, Any] | None = None
+"""上次成功拉取的市场目录。外网 GitHub 不可达时兜底返回（stale-while-error），
+避免资源中心/插件市场每次打开都干等外网超时。"""
+
+_market_catalog_failed_until: float = 0.0
+"""负缓存：外网连续不可达时，5 分钟内直接返回空目录，不再每次干等超时。"""
+
+_MARKET_CATALOG_TIMEOUT_S = 8
+_MARKET_CATALOG_FAILURE_TTL_S = 300
+
+
+def _market_cache_path():
+    from evoflow.config.data_paths import resolve_data_base_dir
+
+    base = resolve_data_base_dir()
+    cache_dir = base / "cache"
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return None
+    return cache_dir / "market-catalog.json"
+
+
+def _load_market_cache_from_disk() -> dict[str, Any] | None:
+    """跨进程/重启的市场目录缓存：外网不可达的机器首次打开也能秒回。"""
+    global _market_catalog_cache
+    if _market_catalog_cache:
+        return _market_catalog_cache
+    path = _market_cache_path()
+    if not path or not path.is_file():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("packs"), list):
+            _market_catalog_cache = data
+            return data
+    except Exception:
+        logger.debug("market catalog disk cache unreadable", exc_info=True)
+    return None
+
+
+def _save_market_cache_to_disk(data: dict[str, Any]) -> None:
+    path = _market_cache_path()
+    if not path:
+        return
+    try:
+        tmp = path.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        tmp.replace(path)
+    except Exception:
+        logger.debug("market catalog disk cache write failed", exc_info=True)
+
+
 @router.get("/market/catalog")
 async def api_market_catalog() -> dict[str, Any]:
     """Return GitHub catalog.json (default public market; optional non-empty URL override)."""
     import asyncio
     import json
+    import time
     import urllib.request
 
     from evoflow.organizations.fetch import market_catalog_url
@@ -156,8 +212,21 @@ async def api_market_catalog() -> dict[str, Any]:
     if not url:
         return empty
 
+    # 两个模块级缓存都在本函数读写；global 声明必须先于首次使用
+    # （负缓存分支在下方 try 之前就读 _market_catalog_cache）。
+    global _market_catalog_cache, _market_catalog_failed_until
+    now = time.monotonic()
+    if now < _market_catalog_failed_until:
+        # 外网刚失败过：立即返回（优先上次成功目录，否则空目录），不等超时
+        cached = _market_catalog_cache or _load_market_cache_from_disk()
+        if cached:
+            stale = dict(cached)
+            stale["stale"] = True
+            return stale
+        return empty
+
     def _fetch_catalog() -> dict[str, Any]:
-        with urllib.request.urlopen(url, timeout=15) as resp:  # noqa: S310 — operator-configured URL
+        with urllib.request.urlopen(url, timeout=_MARKET_CATALOG_TIMEOUT_S) as resp:  # noqa: S310 — operator-configured URL
             raw = resp.read().decode("utf-8", errors="replace")
         data = json.loads(raw)
         if not isinstance(data, dict):
@@ -170,8 +239,19 @@ async def api_market_catalog() -> dict[str, Any]:
         return data
 
     try:
-        return await asyncio.to_thread(_fetch_catalog)
+        data = await asyncio.to_thread(_fetch_catalog)
+        _market_catalog_cache = data
+        _market_catalog_failed_until = 0.0
+        _save_market_cache_to_disk(data)
+        return data
     except Exception as e:
+        _market_catalog_failed_until = time.monotonic() + _MARKET_CATALOG_FAILURE_TTL_S
+        # 外网超时/失败：立即回退最近一次成功目录（内存 → 磁盘），页面照常打开
+        cached = _market_catalog_cache or _load_market_cache_from_disk()
+        if cached:
+            stale = dict(cached)
+            stale["stale"] = True
+            return stale
         raise HTTPException(
             status_code=502,
             detail=f"Failed to fetch market catalog: {e}",
