@@ -28,6 +28,8 @@ DOMAIN_ENTITY_ZH: dict[str, str] = {
     "diagnostics": "诊断",
     "sessions": "会话",
     "appearance": "界面外观",
+    "media": "生图生视频",
+    "ui": "右侧面板",
 }
 
 DOMAIN_ICON: dict[str, str] = {
@@ -50,6 +52,8 @@ DOMAIN_ICON: dict[str, str] = {
     "memory": "memory",
     "verification": "verification",
     "appearance": "settings",
+    "media": "media",
+    "ui": "ui",
 }
 
 
@@ -193,6 +197,11 @@ def _build_title(action: str, domain: str, verb: str, label: str, args: dict[str
         "employees.hire": f"已添加智能体员工「{name}」",
         "employees.create": f"已创建智能体员工「{name}」",
         "employees.update": f"已更新员工「{name}」配置",
+        "employees.get": f"员工「{name}」",
+        "employees.brief": f"员工「{name}」近况",
+        "employees.list": "员工列表",
+        "employees.org_status": "员工名册",
+        "employees.board_overview": "员工看板",
         "employees.pause": f"已暂停员工「{name}」值班",
         "employees.resume": f"已恢复员工「{name}」值班",
         "employees.stop": f"已停止员工「{name}」当前轮次",
@@ -265,7 +274,11 @@ def _build_title(action: str, domain: str, verb: str, label: str, args: dict[str
         "verification.conclude": f"验证轮次「{name}」已结束",
         "verification.delete": f"已删除验证轮次「{name}」",
         "appearance.patch": "界面外观已更新",
+        "diagnostics.status": "系统运行状态",
+        "sessions.status": "当前对话状态",
     }
+    if action == "sessions.compact":
+        return "上下文已压缩" if result.get("changed") else "上下文无需压缩"
     if action in overrides:
         return overrides[action]
 
@@ -348,6 +361,38 @@ def _build_subtitle(domain: str, action: str, result: dict[str, Any]) -> str:
         return "可在工具/MCP 页查看"
     if action.startswith("automation."):
         return "可在自动化页查看"
+    if action == "diagnostics.status":
+        overall = _first_str(result.get("overall"), _as_dict(result.get("service")).get("status"))
+        ports = _as_dict(result.get("ports"))
+        backend = ports.get("backend") or ports.get("gateway")
+        frontend = ports.get("frontend")
+        bits: list[str] = []
+        if overall:
+            bits.append(f"总览 {overall}")
+        if backend is not None:
+            bits.append(f"后端 {backend}")
+        if frontend is not None:
+            bits.append(f"前端 {frontend}")
+        return " · ".join(bits) if bits else "当前服务运行快照"
+    if action == "sessions.status":
+        usage = _as_dict(result.get("context_usage"))
+        pct = usage.get("pct")
+        run_status = _first_str(result.get("run_status")) or "idle"
+        msg_n = result.get("message_count")
+        bits = [f"运行 {run_status}"]
+        if msg_n is not None:
+            bits.append(f"{msg_n} 条消息")
+        if pct is not None:
+            bits.append(f"上下文 {pct}%")
+        return " · ".join(bits)
+    if action == "sessions.compact":
+        if result.get("changed"):
+            before_t = result.get("before_gate_tokens")
+            after_t = result.get("after_gate_tokens")
+            if before_t is not None and after_t is not None:
+                return f"Token {before_t} → {after_t}"
+            return "已写入压缩摘要"
+        return _first_str(result.get("hint")) or "占用未减少"
     return base
 
 
@@ -374,6 +419,77 @@ def _bindings_subtitle(result: dict[str, Any]) -> str:
 
 def _build_details(args: dict[str, Any], result: dict[str, Any]) -> list[dict[str, str]]:
     details: list[dict[str, str]] = []
+    action_name = _first_str(result.get("action"), args.get("action"))
+    if action_name == "diagnostics.status":
+        ports = _as_dict(result.get("ports"))
+        paths = _as_dict(result.get("paths"))
+        install = _as_dict(result.get("install"))
+        service = _as_dict(result.get("service"))
+        overall = _first_str(result.get("overall"), service.get("status"))
+        if overall:
+            details.append({"label": "状态", "value": overall})
+        backend = ports.get("backend") or ports.get("gateway")
+        frontend = ports.get("frontend")
+        if backend is not None:
+            details.append({"label": "后端端口", "value": str(backend)})
+        if frontend is not None:
+            details.append({"label": "前端端口", "value": str(frontend)})
+        system_ports = ports.get("system")
+        if isinstance(system_ports, list) and system_ports:
+            bits = [f"{row.get('role')}:{row.get('port')}" for row in system_ports if isinstance(row, dict) and row.get("port") is not None]
+            if bits:
+                details.append({"label": "系统端口", "value": " · ".join(bits)})
+        data_dir = _first_str(paths.get("data_dir"))
+        if data_dir:
+            details.append({"label": "数据目录", "value": data_dir})
+        install_dir = _first_str(install.get("path"))
+        if install_dir:
+            details.append({"label": "安装目录", "value": install_dir})
+        return details[:6]
+
+    if action_name == "sessions.status":
+        run_status = _first_str(result.get("run_status")) or "idle"
+        details.append({"label": "运行", "value": run_status})
+        if result.get("message_count") is not None:
+            details.append({"label": "消息", "value": str(result.get("message_count"))})
+        usage = _as_dict(result.get("context_usage"))
+        if usage.get("pct") is not None:
+            used = usage.get("used_tokens")
+            window = usage.get("window_tokens")
+            details.append(
+                {
+                    "label": "上下文",
+                    "value": f"{usage.get('pct')}%"
+                    + (f"（{used}/{window}）" if used is not None and window else ""),
+                }
+            )
+        compact = _as_dict(result.get("compaction"))
+        if compact:
+            details.append(
+                {
+                    "label": "压缩",
+                    "value": "已有摘要" if compact.get("has_summary") else "无摘要",
+                }
+            )
+        sk = _first_str(result.get("session_key"))
+        if sk:
+            details.append({"label": "会话", "value": sk[:40]})
+        return details[:6]
+
+    if action_name == "sessions.compact":
+        details.append({"label": "结果", "value": "已压缩" if result.get("changed") else "未变化"})
+        before_t = result.get("before_gate_tokens")
+        after_t = result.get("after_gate_tokens")
+        if before_t is not None and after_t is not None:
+            details.append({"label": "Token", "value": f"{before_t} → {after_t}"})
+        before_m = result.get("before_message_count")
+        after_m = result.get("after_message_count")
+        if before_m is not None and after_m is not None:
+            details.append({"label": "消息", "value": f"{before_m} → {after_m}"})
+        if result.get("running_during_compact"):
+            details.append({"label": "提示", "value": "对后续轮次生效"})
+        return details[:6]
+
     item = _as_dict(result.get("item"))
     due = _first_str(item.get("due_at"), args.get("due_at"), args.get("due"))
     if due:
@@ -413,14 +529,27 @@ def _employee_process_cta(
     task_id: str,
     agent_code: str,
     round_id: str = "",
+    role_name: str = "",
     auto_open: bool = False,
 ) -> dict[str, Any]:
     data: dict[str, Any] = {"taskId": task_id, "agentCode": agent_code, "busy": True}
     if round_id:
         data["roundId"] = round_id
+    nice = str(role_name or "").strip()
+    if nice:
+        data["roleName"] = nice
+        data["title"] = nice
+        data["entityLabel"] = nice
+    # 标签用员工名，避免显示「执行过程」或 path
+    stage: dict[str, Any] = {
+        "kind": "employeeProcess",
+        "title": nice or str(agent_code or "").strip() or "执行过程",
+        "layout": "wide",
+        "data": data,
+    }
     out: dict[str, Any] = {
         "label": "查看进度",
-        "openStage": {"kind": "employeeProcess", "data": data},
+        "openStage": stage,
     }
     if auto_open:
         out["autoOpen"] = True
@@ -471,6 +600,14 @@ def _progress_open_stage_action(
         task.get("source_ref"),
         args.get("round_id"),
     )
+    role_name = _first_str(
+        result.get("role_name"),
+        result.get("roleName"),
+        task.get("role_name"),
+        args.get("role_name"),
+        _as_dict(result.get("role")).get("role_name"),
+        _pick_label(action, args, result) if domain == "employees" else "",
+    )
 
     # 叫醒/恢复值班：有 taskId+agentCode → 员工执行过程（派活后立刻开侧栏）
     if domain == "employees" and action in {
@@ -487,6 +624,7 @@ def _progress_open_stage_action(
                 task_id=tid,
                 agent_code=assigned,
                 round_id=round_id,
+                role_name=role_name,
                 auto_open=auto,
             )
         # dispatch 常无 task_id：有 agent 也给过程 CTA（侧栏跟值班轮）
@@ -495,6 +633,7 @@ def _progress_open_stage_action(
                 task_id=tid or "",
                 agent_code=assigned,
                 round_id=round_id,
+                role_name=role_name,
                 auto_open=True,
             )
         return None
@@ -506,6 +645,7 @@ def _progress_open_stage_action(
                 task_id=tid,
                 agent_code=assigned,
                 round_id=round_id,
+                role_name=role_name,
                 auto_open=True,
             )
         return None
@@ -517,6 +657,7 @@ def _progress_open_stage_action(
                 task_id=tid,
                 agent_code=assigned,
                 round_id=round_id,
+                role_name=role_name,
                 auto_open=True,
             )
         return {
@@ -558,17 +699,31 @@ def _shell_page_cta(
 ) -> dict[str, Any]:
     """右栏挂载壳页面（与菜单同一 path）；保留 route 供旧客户端 / 挂载失败回落。"""
     p = str(path or "").strip()
+    # 标签用实体名（员工/任务名）；绝不用 path，避免右栏 tab 显示成链接
+    nice = str(title or "").strip()
+    if not nice or nice.startswith("/") or nice.startswith("#/"):
+        mid = str(mount_id or "")
+        if mid.startswith("employees"):
+            nice = "员工"
+        elif mid.startswith("tasks"):
+            nice = "任务"
+        elif mid.startswith("apps") or mid.startswith("workflow"):
+            nice = "工作流"
+        else:
+            nice = str(label or "页面").strip() or "页面"
     out: dict[str, Any] = {
         "label": label,
         "route": p,
         "openStage": {
             "kind": "shell-page",
-            "title": (title or label or p).strip() or label,
+            "title": nice,
             "layout": "wide",
             "data": {
                 "path": p,
                 "route": p,
                 "mountId": str(mount_id or "").strip(),
+                "title": nice,
+                "entityLabel": nice,
             },
         },
     }
@@ -602,12 +757,28 @@ def _build_actions(
 
     if domain == "items" and entity_id:
         actions.append({"label": "查看事项", "route": f"/tasks?tab=items&focus={entity_id}"})
+    elif domain == "employees" and action in {
+        "employees.list",
+        "employees.org_status",
+        "employees.board_overview",
+    }:
+        # 列表 / 名册 / 看板 → 员工墙；详情走 /proactive/:code
+        actions.append(
+            _shell_page_cta(
+                label="打开员工",
+                path="/proactive",
+                mount_id="employees.board",
+                title="员工",
+                auto_open=not has_progress_stage,
+            )
+        )
     elif domain == "tasks" and entity_id:
         # 无进度 CTA 时写成功可自动挂任务详情；有进度则只挂可点 shell-page
         auto = (not has_progress_stage) and action in {
             "tasks.create",
             "tasks.update",
             "tasks.set_state",
+            "tasks.get",
         }
         actions.append(
             _shell_page_cta(
@@ -619,11 +790,13 @@ def _build_actions(
             )
         )
     elif domain == "employees" and entity_id:
-        # create / hire / update：无执行进度时自动挂员工详情
+        # create / hire / update / get / brief：无执行进度时自动挂员工详情
         auto = (not has_progress_stage) and action in {
             "employees.create",
             "employees.hire",
             "employees.update",
+            "employees.get",
+            "employees.brief",
         }
         actions.append(
             _shell_page_cta(
@@ -678,27 +851,92 @@ def _build_actions(
     return actions
 
 
+# 只读但应自动打开壳页面（右栏 shell-page）的 action：详情 / 列表 / 近况 / 名册
+_SHELL_PAGE_READ_ACTIONS = frozenset({
+    "employees.get",
+    "employees.brief",
+    "employees.list",
+    "employees.org_status",
+    "employees.board_overview",
+    "tasks.get",
+})
+
+# 只读但要出反馈卡细节（不开壳页）的 action
+_STATUS_CARD_READ_ACTIONS = frozenset({
+    "diagnostics.status",
+    "sessions.status",
+})
+
+_MEDIA_PREVIEW_ACTIONS = frozenset({
+    "media.generate_image",
+    "media.generate_video",
+    "media.task_wait",
+})
+
+
+def _media_preview_items(result: dict[str, Any]) -> list[dict[str, Any]]:
+    """Inline image/video preview payloads for V4 platform tool card."""
+    items: list[dict[str, Any]] = []
+    preview = _as_dict(result.get("preview"))
+    kind = _first_str(preview.get("kind"), result.get("media_kind"), "image").lower()
+    if kind not in {"image", "video"}:
+        kind = "image"
+    src = _first_str(
+        preview.get("src"),
+        preview.get("absolute_path"),
+        result.get("absolute_path"),
+        result.get("local_path"),
+        result.get("url"),
+    )
+    if not src and isinstance(result.get("urls"), list) and result["urls"]:
+        src = _first_str(result["urls"][0])
+    if not src:
+        return items
+    mime = _first_str(preview.get("mimeType"), preview.get("mime_type"))
+    if not mime:
+        mime = "video/mp4" if kind == "video" else "image/png"
+    items.append(
+        {
+            "kind": kind,
+            "mimeType": mime,
+            "artifactUri": src,
+            "absolutePath": _first_str(result.get("absolute_path"), result.get("local_path")) or None,
+            "url": _first_str(result.get("url")) or None,
+        }
+    )
+    return items
+
+
 def build_platform_ui_feedback(
     entry: PlatformAction,
     args: dict[str, Any],
     result: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """Return structured UI payload for successful write/destructive platform actions."""
+    """Return structured UI payload for successful write/destructive（及指定只读详情）platform actions."""
     if not result.get("ok"):
         return None
     if result.get("pending_confirm"):
         return None
-    if entry.risk not in {"write", "destructive"}:
+    action = str(result.get("action") or entry.name).strip()
+    if (
+        entry.risk not in {"write", "destructive"}
+        and action not in _SHELL_PAGE_READ_ACTIONS
+        and action not in _STATUS_CARD_READ_ACTIONS
+        and action not in _MEDIA_PREVIEW_ACTIONS
+    ):
         return None
 
-    action = str(result.get("action") or entry.name).strip()
     domain = str(entry.domain or "").strip()
     verb = _action_verb(action)
     label = _pick_label(action, args, result)
     entity_id = _pick_entity_id(action, args, result)
     title = _build_title(action, domain, verb, label, args, result)
     subtitle = _build_subtitle(domain, action, result)
-    details = _build_details(args, result)
+    # 只读壳页：少塞细节，避免「最新通知」太吵；状态卡保留 KPI 细节
+    if action in _SHELL_PAGE_READ_ACTIONS:
+        details = []
+    else:
+        details = _build_details(args, result)
     actions = _build_actions(action, domain, entity_id, args, result)
 
     kind = "warning" if entry.risk == "destructive" else "success"
@@ -734,6 +972,16 @@ def build_platform_ui_feedback(
     elif action == "employees.bind_channel_apply":
         ui["bindStatus"] = "bound"
         ui["channel"] = _first_str(result.get("channel"), args.get("channel")) or "feishu"
+    elif action in _MEDIA_PREVIEW_ACTIONS:
+        media_items = _media_preview_items(result)
+        if media_items:
+            ui["media"] = media_items
+        status = _first_str(result.get("status"))
+        if status:
+            ui["mediaStatus"] = status
+        task_id = _first_str(result.get("task_id"), result.get("taskId"))
+        if task_id:
+            ui["taskId"] = task_id
     return ui
 
 
