@@ -205,6 +205,8 @@ def _build_title(action: str, domain: str, verb: str, label: str, args: dict[str
         "employees.pause": f"已暂停员工「{name}」值班",
         "employees.resume": f"已恢复员工「{name}」值班",
         "employees.stop": f"已停止员工「{name}」当前轮次",
+        "employees.chat_send": f"已向「{name}」发送消息",
+        "employees.messages": f"员工「{name}」近况消息",
         "employees.bind_channel_begin": f"已为「{name}」生成绑定二维码",
         "employees.bind_channel_apply": f"已绑定本岗 AI 员工「{name}」",
         "agents.create": f"已创建智能体「{name}」",
@@ -530,11 +532,19 @@ def _employee_process_cta(
     agent_code: str,
     round_id: str = "",
     role_name: str = "",
+    session_key: str = "",
+    label: str = "查看进度",
     auto_open: bool = False,
 ) -> dict[str, Any]:
-    data: dict[str, Any] = {"taskId": task_id, "agentCode": agent_code, "busy": True}
+    code = str(agent_code or "").strip()
+    # 无 task 时用 live:{code} 占位，保证前端能挂右栏进度（V4 面板按 agentCode 跟会话）
+    tid = str(task_id or "").strip() or (f"live:{code}" if code else "")
+    data: dict[str, Any] = {"taskId": tid, "agentCode": code, "busy": True}
     if round_id:
         data["roundId"] = round_id
+    sk = str(session_key or "").strip()
+    if sk:
+        data["sessionKey"] = sk
     nice = str(role_name or "").strip()
     if nice:
         data["roleName"] = nice
@@ -543,12 +553,12 @@ def _employee_process_cta(
     # 标签用员工名，避免显示「执行过程」或 path
     stage: dict[str, Any] = {
         "kind": "employeeProcess",
-        "title": nice or str(agent_code or "").strip() or "执行过程",
+        "title": nice or code or "执行过程",
         "layout": "wide",
         "data": data,
     }
     out: dict[str, Any] = {
-        "label": "查看进度",
+        "label": str(label or "查看进度").strip() or "查看进度",
         "openStage": stage,
     }
     if auto_open:
@@ -575,10 +585,14 @@ def _progress_open_stage_action(
         task.get("id"),
         result.get("task_id"),
         result.get("taskId"),
+        result.get("related_task_id"),
+        result.get("relatedTaskId"),
         run.get("task_id"),
         run.get("taskId"),
         args.get("task_id"),
         args.get("taskId"),
+        args.get("related_task_id"),
+        args.get("relatedTaskId"),
         entity_id if domain == "tasks" else "",
     )
     assigned = _first_str(
@@ -609,34 +623,36 @@ def _progress_open_stage_action(
         _pick_label(action, args, result) if domain == "employees" else "",
     )
 
-    # 叫醒/恢复值班：有 taskId+agentCode → 员工执行过程（派活后立刻开侧栏）
+    # 叫醒 / 派活 / 恢复：有 agent 就开员工实时进度（对话面板）；有 task 更佳
     if domain == "employees" and action in {
         "employees.wake",
         "employees.dispatch",
         "employees.resume",
         "employees.create",
         "employees.hire",
+        "employees.chat_send",
     }:
-        if assigned and tid:
-            # wake/dispatch/resume 即开始执行；create/hire 仅在已带 task 时同样 autoOpen
-            auto = action in {"employees.wake", "employees.dispatch", "employees.resume"} or bool(tid)
-            return _employee_process_cta(
-                task_id=tid,
-                agent_code=assigned,
-                round_id=round_id,
-                role_name=role_name,
-                auto_open=auto,
-            )
-        # dispatch 常无 task_id：有 agent 也给过程 CTA（侧栏跟值班轮）
-        if action == "employees.dispatch" and assigned:
-            return _employee_process_cta(
-                task_id=tid or "",
-                agent_code=assigned,
-                round_id=round_id,
-                role_name=role_name,
-                auto_open=True,
-            )
-        return None
+        if not assigned:
+            return None
+        # wake/dispatch/resume/chat_send：立刻 autoOpen；create/hire 仅在已带 task 时同样
+        auto = action in {
+            "employees.wake",
+            "employees.dispatch",
+            "employees.resume",
+            "employees.chat_send",
+        } or bool(tid)
+        if not auto:
+            return None
+        sk = _first_str(result.get("session_key"), result.get("sessionKey"), args.get("session_key"))
+        return _employee_process_cta(
+            task_id=tid if tid and not str(tid).startswith("live:") else _first_str(result.get("task_id"), args.get("task_id")),
+            agent_code=assigned,
+            round_id=round_id,
+            role_name=role_name,
+            session_key=sk,
+            label="打开对话" if action == "employees.chat_send" else "查看进度",
+            auto_open=True,
+        )
 
     # 事项派发给员工并派生 Task → 员工过程（默认 wake_now，可立刻看执行）
     if domain == "items" and action == "items.dispatch":
@@ -858,6 +874,7 @@ _SHELL_PAGE_READ_ACTIONS = frozenset({
     "employees.list",
     "employees.org_status",
     "employees.board_overview",
+    "employees.messages",
     "tasks.get",
 })
 

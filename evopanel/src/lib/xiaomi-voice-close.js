@@ -4,7 +4,7 @@
  * 口令「停止 / 关闭 / 退出」与按钮「退出」：
  * 1. 若本轮仍在生成 → stopXiaomiChat（chatAbort / stopExecution）
  * 2. 停本地/Frame 播报
- * 3. 口令退出时播固定缓存退下语（不调语音模型）
+ * 3. 口令退出时播固定缓存「好的，我们下次再聊」（IndexedDB，不调语音模型）
  * 4. 退全屏 + 停 continuous / Frame
  */
 
@@ -18,18 +18,53 @@ const EXIT_PHRASES = [
   '关掉',
   '关了',
   '退出',
+  '退出吧',
+  '退出停止',
+  '停止退出',
   '退出语音',
   '退出小V',
   '结束',
   '结束对话',
   '先这样',
   '没事了',
+  '没事儿了',
+  '什么好了', // ASR 常把「没事了」听成这个
+  '没啥事了',
   '够了',
   '闭嘴',
   '你可以歇了',
   '别说了',
   '不要再说了',
+  '取消',
+  '取消任务',
+  'stop',
+  'exit',
+  'cancel',
+  'quit',
 ]
+
+/** 夹在回声长句中间的强意图片段（日志：模型播报粘连 +「退出吧/退出停止」仍被送模型） */
+const EXIT_EMBEDDED_FRAGMENTS = [
+  '退出停止',
+  '停止退出',
+  '退出吧',
+  '停止吧',
+  '退出啦',
+  '停止啦',
+  '退出啊',
+  '请退出',
+  '请停止',
+  '退出语音',
+  '退出小v',
+  '结束对话',
+]
+
+/** 允许作为「长句尾巴」命中的短口令（ASR 回声 + 用户说停止） */
+const EXIT_TRAILING_OK = new Set(
+  ['停止', '停下', '退出', '关闭', '关掉', '关了', '闭嘴', '够了', '取消', '没事了', '没事儿了', '什么好了', '没啥事了', '先这样', '结束', 'stop', 'exit', 'cancel', 'quit'].map(
+    (p) => p.replace(/[\s\u3000，,。.！!？?、·\-_/\\'"`~]+/g, '').toLowerCase(),
+  ),
+)
 
 function normalizeZh(text) {
   return String(text || '')
@@ -37,9 +72,17 @@ function normalizeZh(text) {
     .toLowerCase()
 }
 
+function _matchesExitPhrase(n, p) {
+  if (!p) return false
+  return n === p || n === `请${p}` || n === `${p}吧` || n === `${p}啊` || n === `${p}啦`
+}
+
 /**
  * 口令是否表示「关掉语音客户端」（全屏退出），而非仅停播报。
  * 「停止播报」等仍走 TTS-only，不进这里。
+ *
+ * 短句精确匹配；长句仅当尾巴是短退出口令（播报回声 +「停止」），
+ * 且尾巴前不是「不要/别」否定。
  * @param {string} text
  * @returns {boolean}
  */
@@ -47,16 +90,118 @@ export function isXiaomiVoiceExitCommand(text) {
   if (isStopTtsOnlyCommand(text)) return false
   const n = normalizeZh(text)
   if (!n) return false
-  // 避免长任务句里夹「停止」被误伤
-  if (n.length > 12) return false
+
+  // 1) 短句精确
+  if (n.length <= 16) {
+    for (const phrase of EXIT_PHRASES) {
+      if (_matchesExitPhrase(n, normalizeZh(phrase))) return true
+    }
+  }
+
+  // 2) 长句尾巴：……停止 / ……。停止（安装包日志：回声正文 + 用户说停止仍被送进模型）
   for (const phrase of EXIT_PHRASES) {
     const p = normalizeZh(phrase)
-    if (!p) continue
-    if (n === p || n === `请${p}` || n === `${p}吧` || n === `${p}啊` || n === `${p}啦`) {
-      return true
+    if (!p || !EXIT_TRAILING_OK.has(p)) continue
+    if (!n.endsWith(p) && !n.endsWith(`请${p}`)) continue
+    const head = n.endsWith(`请${p}`) ? n.slice(0, -p.length - 1) : n.slice(0, -p.length)
+    if (!head) return true
+    // 「不要停止 / 别停止 / 先别停」不当退出
+    if (/(不要|别再|别|先别|不用|别给我)$/.test(head)) continue
+    // 尾巴必须是短口令本身（防止「停止下载」类任务句）
+    return true
+  }
+
+  // 3) 分句扫描：播报回声粘连时「退出吧」是中间一段，尾巴已是别的字
+  const segs = String(text || '')
+    .split(/[，。！？、,.!?;；\n]+/)
+    .map((s) => normalizeZh(s))
+    .filter(Boolean)
+  for (const seg of segs) {
+    if (seg.length > 18) continue
+    for (const phrase of EXIT_PHRASES) {
+      if (_matchesExitPhrase(seg, normalizeZh(phrase))) return true
+    }
+  }
+
+  // 4) 全文嵌入口令（「…退出停止…」「…退出吧…」），排除「不要/别」紧挨前面
+  for (const frag of EXIT_EMBEDDED_FRAGMENTS) {
+    const f = normalizeZh(frag)
+    if (!f) continue
+    let from = 0
+    while (from < n.length) {
+      const at = n.indexOf(f, from)
+      if (at < 0) break
+      const before = n.slice(Math.max(0, at - 4), at)
+      if (!/(不要|别再|别|先别|不用)$/.test(before)) return true
+      from = at + f.length
     }
   }
   return false
+}
+
+/**
+ * Frame / continuous 共用：本地口令闸（不经模型）。
+ * - 退出/停止类 → 中断任务 + 停播 + 关语音舞台
+ * - 仅停播报 → 停 TTS，继续听
+ * @param {string} text
+ * @param {{ source?: string }} [opts]
+ * @returns {Promise<'exited' | 'tts_stopped' | 'none'>}
+ */
+export async function tryHandleXiaomiVoiceLocalCommand(text, opts = {}) {
+  const cleaned = String(text || '').trim()
+  if (!cleaned) return 'none'
+  const source = String(opts.source || 'local-command')
+
+  if (isXiaomiVoiceExitCommand(cleaned)) {
+    try {
+      const { voiceFeLog } = await import('./xiaomi-voice/voice-file-log.js')
+      voiceFeLog(
+        '打断',
+        `本地口令退出（不经模型）source=${source}：「${cleaned.slice(0, 40)}」`,
+      )
+    } catch {
+      /* ignore */
+    }
+    await closeXiaomiVoice({ reason: 'voice' })
+    try {
+      const { toast } = await import('../components/toast.js')
+      toast('已退出语音', 'info')
+    } catch {
+      /* ignore */
+    }
+    return 'exited'
+  }
+
+  if (isStopTtsOnlyCommand(cleaned)) {
+    try {
+      const { voiceFeLog } = await import('./xiaomi-voice/voice-file-log.js')
+      voiceFeLog('打断', `本地口令停播报 source=${source}：「${cleaned.slice(0, 40)}」`)
+    } catch {
+      /* ignore */
+    }
+    try {
+      const { stopAllAssistantSpeech } = await import('./speech-client.js')
+      stopAllAssistantSpeech({ reason: 'user-stop-tts', forceFrame: true })
+    } catch {
+      /* ignore */
+    }
+    try {
+      const { stopXiaomiFrameLocalPlayback } = await import('./xiaomi-voice/index.js')
+      stopXiaomiFrameLocalPlayback?.({ reason: 'user-stop-tts' })
+    } catch {
+      /* ignore */
+    }
+    await _playStoppedAck()
+    try {
+      const { toast } = await import('../components/toast.js')
+      toast('已停止播报', 'info')
+    } catch {
+      /* ignore */
+    }
+    return 'tts_stopped'
+  }
+
+  return 'none'
 }
 
 /**
@@ -111,16 +256,17 @@ async function _stopActiveXiaomiTask() {
 }
 
 /**
- * 播固定缓存退下语（IndexedDB；不走 Frame / 语音模型）。
+ * 播固定缓存「好的，我们下次再聊」（IndexedDB；不走 Frame / 语音模型）。
+ * 口令停止 / 退出后友好确认；首播合成一次，之后本地复用。
  */
-async function _playExitFarewell() {
+async function _playStoppedAck() {
   try {
-    const { playFixedVoiceSfx, VOICE_FAREWELL_LINE } = await import('./voice-fixed-sfx.js')
+    const { playFixedVoiceSfx, VOICE_STOPPED_LINE } = await import('./voice-fixed-sfx.js')
     const { voiceFeLog } = await import('./xiaomi-voice/voice-file-log.js')
-    voiceFeLog('退出', `播固定退下语「${VOICE_FAREWELL_LINE}」`)
-    await playFixedVoiceSfx(VOICE_FAREWELL_LINE)
+    voiceFeLog('退出', `播固定停止确认「${VOICE_STOPPED_LINE}」`)
+    await playFixedVoiceSfx(VOICE_STOPPED_LINE)
   } catch (e) {
-    console.warn('[xiaomi-voice-close] farewell sfx failed', e?.message || e)
+    console.warn('[xiaomi-voice-close] stopped ack sfx failed', e?.message || e)
   }
 }
 
@@ -130,12 +276,13 @@ async function _playExitFarewell() {
  *   reason?: 'voice' | 'button' | 'esc' | 'program',
  *   farewell?: boolean,
  * }} [opts]
- *   farewell: 默认口令退出播退下语；按钮/Esc 默认不播（可显式 true）
+ *   farewell: 兼容旧参数；口令退出默认播「好的，已停止」；按钮/Esc 默认不播（可显式 true）
  * @returns {Promise<'closed' | 'noop'>}
  */
 export async function closeXiaomiVoice(opts = {}) {
   const reason = String(opts.reason || 'program')
-  const playFarewell = opts.farewell != null ? !!opts.farewell : reason === 'voice'
+  // 口令「停止/退出」→ 播「好的，我们下次再聊」；按钮关面板默认静默
+  const playStoppedAck = opts.farewell != null ? !!opts.farewell : reason === 'voice'
 
   // 关面板 = 退出整套语音；闸门日志固定「关闭退出」→ 收尾「已经退出」
   try {
@@ -143,9 +290,9 @@ export async function closeXiaomiVoice(opts = {}) {
     noteVoiceModeGate('closing', {
       source: 'closeXiaomiVoice',
       reason,
-      message: `farewell=${playFarewell}`,
+      message: `stoppedAck=${playStoppedAck}`,
     })
-    voiceFeLog('退出', `closeXiaomiVoice reason=${reason} farewell=${playFarewell}`)
+    voiceFeLog('退出', `closeXiaomiVoice reason=${reason} stoppedAck=${playStoppedAck}`)
   } catch {
     /* ignore */
   }
@@ -159,7 +306,7 @@ export async function closeXiaomiVoice(opts = {}) {
     /* ignore */
   }
 
-  // 先停常听，避免退下语被 ASR/barge 打断；UI 稍后再关，好播完固定句
+  // 先停常听，避免确认句被 ASR/barge 打断；UI 稍后再关，好播完固定句
   try {
     const { pauseConversationListening } = await import('./background-voice.js')
     await pauseConversationListening({ reason: 'exit-xw-voice', silent: true })
@@ -167,9 +314,9 @@ export async function closeXiaomiVoice(opts = {}) {
     /* ignore */
   }
 
-  // 2) 固定话术退下（缓存音效，不调语音模型）
-  if (playFarewell) {
-    await _playExitFarewell()
+  // 2) 固定话术确认已停止（缓存音效，不调语音模型）
+  if (playStoppedAck) {
+    await _playStoppedAck()
   }
 
   // 3) 退全屏 / 再兜底停 runtime

@@ -50,7 +50,8 @@ let _voiceLoggedTools = new Set()
 /** 语音发问近义去重：Frame turn_end 与 continuous 迟到句常差几个字 */
 let _lastVoiceSendNorm = ''
 let _lastVoiceSendAtMs = 0
-const VOICE_SEND_DEDUPE_MS = 2800
+/** 放宽到 12s：ASR 越听越长的同轮延长句不应打断正在生成的回复 */
+const VOICE_SEND_DEDUPE_MS = 12000
 
 /** @param {string} text */
 function _normalizeVoiceSendText(text) {
@@ -61,7 +62,7 @@ function _normalizeVoiceSendText(text) {
 }
 
 /**
- * 两句是否同属一轮 ASR 变体（包含关系或短编辑距离）。
+ * 两句是否同属一轮 ASR 变体（包含 / 前缀延长 / 短编辑距离）。
  * @param {string} a
  * @param {string} b
  */
@@ -71,9 +72,14 @@ function _isNearDuplicateVoiceText(a, b) {
   if (!x || !y) return false
   if (x === y) return true
   if (x.includes(y) || y.includes(x)) return true
+  const shorter = x.length <= y.length ? x : y
+  const longer = x.length <= y.length ? y : x
+  // 「在吗？大概…」→「大概…聊天界面」类前缀延长
+  if (shorter.length >= 4 && longer.startsWith(shorter)) return true
+  let shared = 0
+  while (shared < shorter.length && shorter[shared] === longer[shared]) shared += 1
+  if (shared >= 8 && shared >= Math.floor(shorter.length * 0.55)) return true
   // 短句：允许差 1～2 字（「发送两次」vs「发送了两次」）
-  const longer = x.length >= y.length ? x : y
-  const shorter = x.length >= y.length ? y : x
   if (longer.length <= 4) return false
   let i = 0
   let j = 0
@@ -219,11 +225,15 @@ async function armXiaomiVoiceReply(opts = {}) {
 
     if (await _preferXiaomiFrameTts()) {
       try {
-        const { resetXiaomiFrameAssistantFeed, stashXiaomiFrameAssistantPending } = await import(
-          '../../lib/xiaomi-voice/index.js',
-        )
+        const {
+          resetXiaomiFrameAssistantFeed,
+          stashXiaomiFrameAssistantPending,
+          flushXiaomiFrameAssistantStash,
+        } = await import('../../lib/xiaomi-voice/index.js')
         resetXiaomiFrameAssistantFeed()
         stashXiaomiFrameAssistantPending('', { final: false })
+        // 若 arm 前已有迟到 stash，连上后立刻冲（避免首轮静音）
+        flushXiaomiFrameAssistantStash?.()
       } catch {
         /* ignore */
       }
@@ -301,6 +311,30 @@ function syncXiaomiVoiceSpeech(fullText, { final = false } = {}) {
           await connectXiaomiFrameSession()
         } catch {
           /* ignore */
+        }
+        // 关键：connecting 期间 final 已 stash 时，连上后若不冲刷 → 有字无声（台账也空）
+        if (isXiaomiFrameSessionActive()) {
+          if (!_voiceFrameTookOver) {
+            _voiceFrameTookOver = true
+            void _stopLegacyVoicePlayback()
+          }
+          try {
+            const { flushXiaomiFrameAssistantStash } = await import(
+              '../../lib/xiaomi-voice/index.js',
+            )
+            flushXiaomiFrameAssistantStash?.()
+          } catch {
+            feedXiaomiFrameAssistant(body, { final })
+          }
+        } else {
+          void import('../../lib/xiaomi-voice-defaults.js')
+            .then(({ xiaomiVoiceLog }) =>
+              xiaomiVoiceLog(
+                'sync: Frame 仍不可用 — 正文已暂存但无法播报（检查 gateway /speech/session）',
+                { len: body.length, final: !!final },
+              ),
+            )
+            .catch(() => {})
         }
         if (final) clearXiaomiVoiceReply()
       },
@@ -930,6 +964,17 @@ export function bindXiaomiStreamListener() {
         return
       }
       syncXiaomiLiveFromAgui()
+      // 同轮多段正文：一段正文结束 / 下一轮工具开始 → 立刻冲刷上一段去 TTS，
+      // 不要等整轮 RUN_FINISHED（否则工具后的第二段常被「非前缀」丢掉，只听到第一段）
+      if (_voiceReplyPending && (t === 'TEXT_MESSAGE_END' || t === 'TOOL_CALL_START')) {
+        void import('../../lib/xiaomi-voice/index.js')
+          .then((m) => {
+            m.flushXiaomiFrameAssistantSegment?.(
+              t === 'TEXT_MESSAGE_END' ? 'text-end' : 'tool-start',
+            )
+          })
+          .catch(() => {})
+      }
       return
     }
 
@@ -1163,9 +1208,8 @@ export async function sendXiaomiChat(text, ctx = {}) {
     _lastVoiceSendNorm = _normalizeVoiceSendText(raw)
     _lastVoiceSendAtMs = now
   }
-  // 语音多轮：对齐 Pipecat barge → 新 turn——上一轮还在生成时先 abort，再发本轮。
-  // 文本路径仍拒绝并发，避免误触双发。
-  // 近义句上面已丢掉；这里只对「明显新一句」做打断重发。
+  // 语音多轮：近义/延长句上面已丢；只有「明显新一句」才 barge abort。
+  // 文本路径仍拒绝并发。
   if (getState().streaming) {
     if (ctx.voiceInitiated) {
       try {

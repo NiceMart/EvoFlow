@@ -66,6 +66,8 @@ class SpeechSession:
         self._vad = None
         self._closing = False
         self._tts_open_seqs: set[int] = set()
+        # seq → accumulated mp3 bytes（台账异步落盘）
+        self._tts_audio_buf: dict[int, bytearray] = {}
         self._default_speaker: str | None = None
         self._asr_provider = "volcengine"
         self._tts_provider = "volcengine"
@@ -203,21 +205,35 @@ class SpeechSession:
                     phase = str(data.get("phase") or "").strip().lower()
                     if self._bridge and hasattr(self._bridge, "set_client_phase"):
                         self._bridge.set_client_phase(phase)
+                elif op == "playback":
+                    # FE 本地播报状态：playing | played（台账旁路，不挡主路径）
+                    self._adopt_trace_from(data)
+                    await self._on_playback_ack(data)
                 elif op == "client_listening":
                     # FE 本地播完（队列空）→ 释放 STT unmute hold，下一轮才能识别
-                    # 相位门控：仅 listening（或 idle）可 unmute；thinking/speaking 挡住误放麦
+                    # 相位门控：listening/idle 正常放麦；speaking 一律挡；
+                    # thinking 仅允许 purpose=exit_listen（否则确认句后思考期喊「退出」进不了 ASR）
                     phase = ""
                     if self._bridge and hasattr(self._bridge, "client_phase"):
                         phase = str(getattr(self._bridge, "client_phase", "") or "")
-                    if phase in ("thinking", "speaking"):
-                        from app.gateway.speech.voice_file_log import voice_log
-
+                    purpose = str(data.get("purpose") or "").strip().lower()
+                    force = bool(data.get("force"))
+                    exit_listen = purpose == "exit_listen" or (
+                        force and purpose in ("", "exit_listen")
+                    )
+                    if phase == "speaking":
                         voice_log(
                             "决策",
-                            f"忽略 client_listening（phase={phase}，仅 listening 可 unmute）",
+                            f"忽略 client_listening（phase=speaking，播报中不放麦）purpose={purpose or '-'}",
+                        )
+                    elif phase == "thinking" and not exit_listen:
+                        voice_log(
+                            "决策",
+                            f"忽略 client_listening（phase=thinking，仅 exit_listen 可放麦）",
                         )
                     elif self._bridge and hasattr(self._bridge, "release_stt_unmute_hold"):
-                        await self._bridge.release_stt_unmute_hold(reason="client_listening")
+                        reason = "exit_listen" if exit_listen else "client_listening"
+                        await self._bridge.release_stt_unmute_hold(reason=reason)
                 elif op == "stop":
                     break
         except WebSocketDisconnect:
@@ -355,6 +371,65 @@ class SpeechSession:
             voice_playback_event("流式正文", "", extra="本轮正文流结束，冲刷残句去合成")
             await self._bridge.inject_assistant_end()
 
+    async def _on_playback_ack(self, data: dict[str, Any]) -> None:
+        """FE local play lifecycle → utterance ledger."""
+        try:
+            from app.gateway.speech.playback_ledger import note_played, note_playing
+
+            phase = str(data.get("phase") or data.get("status") or "").strip().lower()
+            seq = int(data.get("seq") or 0)
+            if not seq:
+                return
+            tid = self._trace_id or ""
+            if phase == "playing":
+                note_playing(trace_id=tid, seq=seq, source="frame")
+            elif phase in ("played", "ended", "done"):
+                note_played(
+                    trace_id=tid,
+                    seq=seq,
+                    duration_ms=int(data.get("duration_ms") or 0),
+                    source="frame",
+                )
+        except Exception:
+            logger.debug("playback ack ledger failed", exc_info=True)
+
+    def _ledger_note_ready(self, seq: int, text: str) -> None:
+        try:
+            from app.gateway.speech.playback_ledger import note_ready
+
+            note_ready(
+                trace_id=self._trace_id or "",
+                seq=int(seq),
+                text=text or "",
+                sid=self._sid,
+                source="frame",
+                speaker=str(self._default_speaker or ""),
+                provider=str(self._tts_provider or "volcengine"),
+            )
+        except Exception:
+            logger.debug("ledger note_ready failed", exc_info=True)
+
+    def _ledger_note_wire_end(self, seq: int, text: str, *, cancelled: bool = False) -> None:
+        buf = self._tts_audio_buf.pop(int(seq), None)
+        raw = bytes(buf) if buf else b""
+        try:
+            from app.gateway.speech.playback_ledger import make_utterance_id, note_wire_end
+
+            uid = note_wire_end(
+                trace_id=self._trace_id or "",
+                seq=int(seq),
+                text=text or "",
+                bytes_n=len(raw),
+                cancelled=cancelled,
+                source="frame",
+            )
+            if raw and not cancelled:
+                from app.gateway.speech.playback_clips import save_clip_async
+
+                save_clip_async(uid or make_utterance_id(trace_id=self._trace_id or "", seq=int(seq)), raw)
+        except Exception:
+            logger.debug("ledger note_wire_end failed", exc_info=True)
+
     async def _on_barge_in(self, reason: str = "barge_in") -> None:
         if not self._worker:
             return
@@ -386,6 +461,12 @@ class SpeechSession:
             )
         except Exception:
             pass
+        try:
+            from app.gateway.speech.playback_ledger import note_cancelled
+
+            note_cancelled(sid=self._sid, reason=reason, source="frame")
+        except Exception:
+            pass
         # Close any open tts seqs for client
         await self._close_open_tts_seqs()
 
@@ -398,7 +479,9 @@ class SpeechSession:
                 )
             except Exception:
                 pass
+            self._ledger_note_wire_end(int(seq), "", cancelled=True)
         self._tts_open_seqs.clear()
+        self._tts_audio_buf.clear()
 
     async def _on_pipeline_output(self, frame: Frame) -> None:
         self._bind_trace()
@@ -430,12 +513,15 @@ class SpeechSession:
             if isinstance(frame, BotStartedSpeakingFrame):
                 self._tts_open_seqs.add(frame.seq)
                 text = getattr(frame, "text", "") or ""
+                self._tts_audio_buf.setdefault(int(frame.seq), bytearray())
+                self._ledger_note_ready(int(frame.seq), text)
                 await self._ws.send_json(
                     {
                         "type": "tts_start",
                         "seq": frame.seq,
                         "text": text,
                         "trace_id": self._trace_id,
+                        "utterance_id": f"{self._trace_id}:{int(frame.seq)}",
                     }
                 )
                 # fallback：Observer 未触发时仍用 worker.metrics
@@ -444,14 +530,20 @@ class SpeechSession:
             if isinstance(frame, TTSAudioRawFrame):
                 if frame.seq not in self._tts_open_seqs:
                     self._tts_open_seqs.add(frame.seq)
+                    self._tts_audio_buf.setdefault(int(frame.seq), bytearray())
+                    self._ledger_note_ready(int(frame.seq), "")
                     await self._ws.send_json(
                         {
                             "type": "tts_start",
                             "seq": frame.seq,
                             "text": "",
                             "trace_id": self._trace_id,
+                            "utterance_id": f"{self._trace_id}:{int(frame.seq)}",
                         }
                     )
+                chunk = bytes(frame.audio or b"")
+                if chunk:
+                    self._tts_audio_buf.setdefault(int(frame.seq), bytearray()).extend(chunk)
                 packet = int(frame.seq).to_bytes(4, "little") + frame.audio
                 await self._ws.send_bytes(packet)
                 await self._emit_user_to_bot_metric_once()
@@ -459,12 +551,14 @@ class SpeechSession:
             if isinstance(frame, BotStoppedSpeakingFrame):
                 self._tts_open_seqs.discard(frame.seq)
                 text = getattr(frame, "text", "") or ""
+                self._ledger_note_wire_end(int(frame.seq), text, cancelled=False)
                 await self._ws.send_json(
                     {
                         "type": "tts_end",
                         "seq": frame.seq,
                         "text": text,
                         "trace_id": self._trace_id,
+                        "utterance_id": f"{self._trace_id}:{int(frame.seq)}",
                     }
                 )
                 return
@@ -482,6 +576,12 @@ class SpeechSession:
                                 "cleared_ms": 0,
                             }
                         )
+                    except Exception:
+                        pass
+                    try:
+                        from app.gateway.speech.playback_ledger import note_cancelled
+
+                        note_cancelled(sid=self._sid, reason=reason, source="frame")
                     except Exception:
                         pass
                     # 关闭前端还开着的播放器，避免残句卡在播放队列里。

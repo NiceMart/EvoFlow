@@ -45,6 +45,8 @@ export {
   isXiaomiFramePipelineStarting,
   isXiaomiFrameAwaitingReply,
   feedXiaomiFrameAssistant,
+  flushXiaomiFrameAssistantSegment,
+  flushXiaomiFrameAssistantStash,
   stashXiaomiFrameAssistantPending,
   resetXiaomiFrameAssistantFeed,
   interruptXiaomiFrame,

@@ -127,17 +127,18 @@ function noteGate(
 
 function afterXiaomiSessionAdopted(expandRight: boolean): void {
   const snap = rightStageStore.getSnapshot()
+  // adopt 已不带主对话 workspace 签；此处只认小V 自己会话里的非 xiaomi 签
+  // （平台工具在语音域内新开的员工/任务），勿把主对话残留当成「该展开」。
   const sideContent = snap.tabs.find((t) => String(t.kind || '') !== 'xiaomi')
   if (expandRight) {
     rightStageStore.expand()
-    // 左栏已是小V语音域：右栏若还停在小V文字签，切到同会话其它签（截图/文件/壳页），
-    // 切勿在未 adopt 时点到主对话残留签——adopt 之后 live 表里已无外会话标签。
+    // 左栏已是小V语音域：右栏若还停在小V文字签，切到同会话其它签（截图/文件/壳页）。
     if (String(snap.activeKey || '').startsWith('xiaomi:') && sideContent) {
       rightStageStore.activateTab(`${sideContent.kind}:${sideContent.id}`)
     }
   } else if (sideContent) {
-    // 唤醒 left-only 期间平台工具可能已抢先 show() 开了员工/任务/进度；
-    // 再 collapse 会把刚打开的右栏打掉（竞态：adopt 异步晚于 maybeAutoOpen）。
+    // 唤醒 left-only 期间：仅当「本轮语音会话」里已有平台开签才展开；
+    // 主对话缓存签不应再出现在这里（adopt carryWorkspace:false）。
     rightStageStore.expand()
     rightStageStore.activateTab(`${sideContent.kind}:${sideContent.id}`)
   } else {
@@ -160,6 +161,10 @@ export function enterXwVoiceMode(opts: EnterXwVoiceModeOpts = {}): void {
     .catch(() => {
       afterXiaomiSessionAdopted(expandRight)
     })
+  // 进场 / 唤醒重进：prefer 小V + 会话强制关思考（语音要快回）
+  void import('./xiaomi-voice-defaults.js')
+    .then((m) => m.ensureXiaomiVoiceReplyOn())
+    .catch(() => {})
   if (isXwVoiceMode()) {
     // 再进语音（唤醒）：仍先藏状态卡，等本轮平台工具再放行
     clearXwVoiceSummary()
@@ -177,10 +182,6 @@ export function enterXwVoiceMode(opts: EnterXwVoiceModeOpts = {}): void {
     source: 'enterXwVoiceMode',
     reason: expandRight ? 'enter' : 'enter-left-only',
   })
-  // 默认开语音播报 + prefer 小V（火山 TTS 已配即可听会说）
-  void import('./xiaomi-voice-defaults.js')
-    .then((m) => m.ensureXiaomiVoiceReplyOn())
-    .catch(() => {})
 }
 
 /**

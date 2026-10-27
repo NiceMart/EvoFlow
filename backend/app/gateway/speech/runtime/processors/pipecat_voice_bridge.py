@@ -88,7 +88,8 @@ logger = logging.getLogger("evoflow.speech.pipecat_voice_bridge")
 TurnHandler = Callable[[str], Awaitable[None]]
 
 _READABLE = re.compile(r"[\w\u4e00-\u9fff]", re.UNICODE)
-_ACK_POOL = ("好的", "嗯", "收到", "好的，稍等", "行", "好嘞")
+# 用户说完后的即时应声（默认关闭；auto_ack=True 时随机抽）
+_ACK_POOL = ("好的", "收到")
 # Pipecat 推荐默认；STT p99 表按 0.2 标定
 _VAD_STOP_SECS = 0.2
 _VAD_START_SECS = 0.2
@@ -96,6 +97,38 @@ _VAD_START_SECS = 0.2
 
 def _has_readable(text: str) -> bool:
     return bool(_READABLE.search(text or ""))
+
+
+# 厂商单次合成长度软上限；超过才按句号切开（仍避免逗号/36 字碎切）
+_HOLD_ONESHOT_MAX_CHARS = 280
+_HOLD_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？!?；;])")
+
+
+def _split_hold_body_for_oneshot_tts(body: str) -> list[str]:
+    """Prefer one clip; only split on major punctuation when very long."""
+    text = (body or "").strip()
+    if not text:
+        return []
+    if len(text) <= _HOLD_ONESHOT_MAX_CHARS:
+        return [text]
+    parts = [p.strip() for p in _HOLD_SENTENCE_SPLIT_RE.split(text) if p and p.strip()]
+    if not parts:
+        return [text]
+    # 合并过短碎片，减少句间接头
+    merged: list[str] = []
+    buf = ""
+    for p in parts:
+        if not buf:
+            buf = p
+            continue
+        if len(buf) + len(p) <= _HOLD_ONESHOT_MAX_CHARS:
+            buf = f"{buf}{p}"
+        else:
+            merged.append(buf)
+            buf = p
+    if buf:
+        merged.append(buf)
+    return merged or [text]
 
 
 def _norm_tts_cover(text: str) -> str:
@@ -370,7 +403,7 @@ class PipecatVoiceBridge(FrameProcessor):
         speaker: str | None = None,
         on_user_turn: TurnHandler | None = None,
         silence_ms: float = 900.0,
-        auto_ack: bool = True,
+        auto_ack: bool = False,
     ) -> None:
         super().__init__(name="PipecatVoiceBridge")
         self._asr_provider = (asr_provider or "volcengine").strip().lower()
@@ -415,7 +448,7 @@ class PipecatVoiceBridge(FrameProcessor):
         self._end_fallback_task: asyncio.Task[None] | None = None
         # FE VoicePhase：idle|listening|thinking|speaking（unmute/barge 门控）
         self._client_phase = "listening"
-        # True：正文不流式分句，等 assistant_end 再整段 TTS（防残句少播）
+        # True：攒齐正文再 TTS；合成走 TTSSpeak 整段一次（仅超长按句号切），避免碎切拼接
         self._hold_body_tts_until_end = True
 
     # ── public API used by SpeechSession ───────────────────────────────
@@ -474,19 +507,19 @@ class PipecatVoiceBridge(FrameProcessor):
             voice_log("对话", "助手回复结束（空正文）")
         turn = self._turn
         if self._hold_body_tts_until_end:
-            # 流式 delta 只攒字；End 时原子写入 Start+Text+End 到 Pipecat。
-            # 勿经 Evo queue 拆成两帧：曾出现 Text 入管、End 见 _in_llm_turn=False
-            # 被跳过 → 尾句卡缓冲，1s 兜底再灌一遍 = 多播半句（日志 19:29:28）。
+            # 流式 delta 只攒字；End 后整段一次合成（不经 FastFirst 逗号/36 字切句）。
+            # 旧路径 Start+Text+End → 分句聚合 → 多段 MP3 串播，听感卡顿/漏词（前端近尾预切）。
             await self._close_llm_turn_and_drop_residual(reason="assistant_end_hold")
             if plain and _has_readable(plain) and not self._ignore_assistant:
                 body = strip_markdown_light(plain)
                 voice_log(
                     "分句",
-                    f"正文齐 → 整段入分句管线 turn={turn}：「{body[:80]}」"
+                    f"正文齐 → 整段一次合成 turn={turn} len={len(body)}：「{body[:80]}」"
                     + ("…" if len(body) > 80 else ""),
                 )
                 await self._push_hold_body_to_tts(body)
-                # hold 已保证 End 进管；勿再 coverage 补播（会与未完成的切句竞态重复）
+            # 清空，避免 text-end 后再来空 End / feed(final) 用旧 plain 重推一遍
+            self._assistant_plain = ""
             return
         await self.queue_frame(
             LLMResponseEndFrame(turn=turn), FrameDirection.DOWNSTREAM
@@ -498,17 +531,21 @@ class PipecatVoiceBridge(FrameProcessor):
             self._schedule_end_tts_fallback(plain, turn)
 
     async def _push_hold_body_to_tts(self, body: str) -> None:
-        """Atomically feed one full assistant reply into Pipecat TTS aggregation."""
+        """Hold 模式：整段一次 TTSSpeak（尽量单 seq），超长才按句号切开。"""
         await self._ensure_pipecat()
         if not self._pipe_worker or not self._ready:
             return
-        self._in_llm_turn = True
-        try:
-            await self._pipe_worker.queue_frame(LLMFullResponseStartFrame())
-            await self._pipe_worker.queue_frame(PipeLLMTextFrame(text=body))
-            await self._pipe_worker.queue_frame(LLMFullResponseEndFrame())
-        finally:
-            self._in_llm_turn = False
+        chunks = _split_hold_body_for_oneshot_tts(body)
+        for i, chunk in enumerate(chunks):
+            if not chunk or not _has_readable(chunk):
+                continue
+            if len(chunks) > 1:
+                voice_log(
+                    "分句",
+                    f"超长正文切块 {i + 1}/{len(chunks)} len={len(chunk)}：「{chunk[:60]}」",
+                )
+            # PipeTTSSpeakFrame：绕过 SentenceAggregator，一句一合成、韵律连续
+            await self._pipe_worker.queue_frame(PipeTTSSpeakFrame(text=chunk))
 
     def _cancel_end_fallback(self) -> None:
         t = self._end_fallback_task
@@ -587,20 +624,28 @@ class PipecatVoiceBridge(FrameProcessor):
 
     async def release_stt_unmute_hold(self, *, reason: str = "client_listening") -> None:
         """FE local playback drained — allow STT to unmute for the next turn."""
-        # 思考/播报相位：暂缓释放（FE 误发或 barge 附带 release 时）
-        # 真打断 reason 以 barge: 开头仍放行，避免打断后永远哑麦
+        # speaking：暂缓（防回声）；thinking：仅 barge / exit_listen 放行
+        # （确认句播完后的长思考若不放麦，用户喊「退出/停止」永远进不了 ASR）
         phase = self._client_phase or "listening"
-        is_barge_release = str(reason or "").startswith("barge:")
-        if phase in ("thinking", "speaking") and not is_barge_release:
+        reason_s = str(reason or "")
+        is_barge_release = reason_s.startswith("barge:")
+        is_exit_listen = reason_s == "exit_listen" or reason_s.startswith("exit_listen")
+        if phase == "speaking" and not is_barge_release:
             voice_log(
                 "决策",
-                f"暂缓 unmute hold 释放 phase={phase} reason={reason}",
+                f"暂缓 unmute hold 释放 phase=speaking reason={reason_s}",
+            )
+            return
+        if phase == "thinking" and not is_barge_release and not is_exit_listen:
+            voice_log(
+                "决策",
+                f"暂缓 unmute hold 释放 phase=thinking reason={reason_s}",
             )
             return
         was_audible = self._bot_audible
         self._bot_audible = False
         if self._stt and hasattr(self._stt, "release_unmute_hold"):
-            await self._stt.release_unmute_hold(reason=reason)
+            await self._stt.release_unmute_hold(reason=reason_s)
         # 对齐 Pipecat OutputTransport：用户听完 ≈ BotStoppedSpeaking
         if was_audible and self._pipe_worker and self._ready:
             try:
@@ -792,6 +837,21 @@ class PipecatVoiceBridge(FrameProcessor):
                     f"speaker={speaker}"
                 ),
             )
+            try:
+                from app.gateway.speech.playback_ledger import note_queued
+                from app.gateway.speech.voice_file_log import get_voice_trace
+
+                seq = self._seq_for(context_id)
+                note_queued(
+                    trace_id=get_voice_trace() or "",
+                    seq=seq,
+                    text=str(text or ""),
+                    source="frame",
+                    speaker=str(speaker or ""),
+                    provider=str(self._tts_provider or ""),
+                )
+            except Exception:
+                pass
 
         sink = _CaptureSink(self._out_q, host=self)
         pipeline = PipePipeline([vad, self._stt, turn, self._hook, self._tts, sink])

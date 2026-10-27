@@ -17,6 +17,7 @@ import {
   setXiaomiPlaybackIdleHandler,
   setXiaomiDeferClientListening,
   flushXiaomiClientListeningIfIdle,
+  sendXiaomiClientListening,
   sendXiaomiClientPhase,
   forceXiaomiOpenMic,
   adoptXiaomiFrameSocket,
@@ -95,6 +96,168 @@ let _endFlushTimer = 0
 let _unsubVisibility = null
 /** @type {(() => void) | null} */
 let _unsubPhaseVis = null
+
+/**
+ * 用户语音录入队列：把连续 turn_end（ASR 越听越长）收成一句再发，
+ * 思考/播报中禁止「延长句」打断 → 避免 RUN_ERROR / AI 回复没声。
+ */
+/** @type {ReturnType<typeof setTimeout> | 0} */
+let _coalesceTimer = 0
+/** 合并窗口内最新定稿 */
+let _coalesceText = ''
+/** 上次真正发出去的用户句 */
+let _lastCommittedTurn = ''
+let _lastCommittedAtMs = 0
+/** 「在呢」播完前 / 刚播完的宽限期，丢弃回声 turn_end */
+let _wakeAckUntilMs = 0
+/** ASR 连推间隔内合并（ms） */
+const USER_TURN_COALESCE_MS = 900
+/** 已发问后，延长/近义句静默窗口（ms） */
+const USER_TURN_DEDUP_MS = 12000
+
+function _normUserTurn(text) {
+  return String(text || '')
+    .replace(/[\s\u3000]+/g, '')
+    .replace(/[，。！？、,.!?;；：:"""''（）()【】\[\]…—\-]/g, '')
+    .toLowerCase()
+}
+
+/** 同轮 ASR 变体：相等 / 互相包含 / 前缀延长 */
+function _isSameOrExtendedTurn(a, b) {
+  const x = _normUserTurn(a)
+  const y = _normUserTurn(b)
+  if (!x || !y) return false
+  if (x === y) return true
+  if (x.includes(y) || y.includes(x)) return true
+  const shorter = x.length <= y.length ? x : y
+  const longer = x.length <= y.length ? y : x
+  if (shorter.length >= 4 && longer.startsWith(shorter)) return true
+  let i = 0
+  while (i < shorter.length && shorter[i] === longer[i]) i += 1
+  return i >= 8 && i >= Math.floor(shorter.length * 0.55)
+}
+
+/**
+ * 火山同会话 ASR 常把「上一句定稿」粘在新 interim 前面（日志第二轮上屏越叠越长）。
+ * 若能匹配已发送句前缀，只留下新增尾巴；纯回声 → 空串。
+ */
+function _peelCommittedAsrPrefix(text) {
+  let t = String(text || '').trim()
+  if (!t) return t
+  // 纯确认短句回声（整句「好的 / 收到」）
+  if (_isAckEchoText(t)) return ''
+  const prev = String(_lastCommittedTurn || '').trim()
+  if (!prev) {
+    // 短应声不再按 endsWith 剥尾——「…好的」会误伤正常句
+    return t
+  }
+  const np = _normUserTurn(prev)
+  const nt = _normUserTurn(t)
+  if (!np) return t
+  if (!nt || nt === np || (np.includes(nt) && nt.length >= 4 && nt.length <= np.length)) {
+    return ''
+  }
+  if (!nt.startsWith(np) || nt.length <= np.length) {
+    // 「确认回声 + 新话」：短应声须有标点边界（「好的，…」），避免「收到了吗」被剥前缀
+    for (const ack of _TURN_ACK_ECHO) {
+      if (nt.startsWith(ack) && nt.length > ack.length) {
+        let i = 0
+        let ai = 0
+        const noise = /[\s\u3000，。！？、,.!?;；：:"""''“”‘’（）()【】[\]…—\-]/
+        while (i < t.length && ai < ack.length) {
+          const ch = t[i]
+          if (noise.test(ch)) {
+            i += 1
+            continue
+          }
+          if (ch.toLowerCase() === ack[ai]) {
+            i += 1
+            ai += 1
+            continue
+          }
+          break
+        }
+        if (ai < ack.length) continue
+        const boundary = /[，。！？、,.!?;；：:\s\u3000]/
+        let j = i
+        let sawBoundary = false
+        while (j < t.length && boundary.test(t[j])) {
+          sawBoundary = true
+          j += 1
+        }
+        if (!sawBoundary) continue
+        t = t.slice(j).trim()
+        return _isAckEchoText(t) ? '' : t
+      }
+    }
+    return t
+  }
+  // 按规范化前缀在原文上跳过对应可读字符
+  let ni = 0
+  let i = 0
+  const noise = /[\s\u3000，。！？、,.!?;；：:"""''“”‘’（）()【】[\]…—\-]/
+  while (i < t.length && ni < np.length) {
+    const ch = t[i]
+    if (noise.test(ch)) {
+      i += 1
+      continue
+    }
+    if (ch.toLowerCase() === np[ni]) {
+      i += 1
+      ni += 1
+      continue
+    }
+    break
+  }
+  if (ni < Math.floor(np.length * 0.85)) return t
+  t = t.slice(i).replace(/^[，。！？、,.!?\s]+/, '').trim()
+  if (_isAckEchoText(t)) return ''
+  return t
+}
+
+/** 思考/播报中不应再改「你」区；仅允许空串清屏 */
+function _shouldHoldUserCaption() {
+  if (_sending || _awaitingReply) return true
+  const phase = getVoicePhase()
+  if (phase === 'thinking' || phase === 'speaking') return true
+  if (_tray === 'processing' || _tray === 'speaking') return true
+  return false
+}
+
+function _clearUserCaption(source = '清用户句') {
+  _partial = ''
+  void import('../background-voice-bridge.js')
+    .then((b) => {
+      b.updateVoicePartialText?.('')
+      b.clearPendingVoiceSend?.()
+    })
+    .catch(() => {})
+  noteVoicePanelDisplay('', { immediate: true, source })
+}
+
+function _isWakeAckEcho(text) {
+  const n = _normUserTurn(text)
+  return n === '在呢' || n === '我在' || n === '嗯请说' || n === '请说'
+}
+
+function _clearCoalesce() {
+  if (_coalesceTimer) {
+    window.clearTimeout(_coalesceTimer)
+    _coalesceTimer = 0
+  }
+  _coalesceText = ''
+}
+
+function _drainPendingAfterIdle(reason) {
+  const next = _pendingTurns.length ? String(_pendingTurns[_pendingTurns.length - 1] || '').trim() : ''
+  _pendingTurns.length = 0
+  if (!next) {
+    _refreshTray()
+    return
+  }
+  voiceFeLog('用户输入', `录入队列出队（${reason}）→「${next.slice(0, 60)}」`)
+  void _sendTurn(next)
+}
 
 export function isXiaomiFramePipelineActive() {
   return _running && isXiaomiFrameSessionActive()
@@ -203,9 +366,9 @@ async function _startXiaomiFramePipelineInner(opts = {}) {
     return false
   }
 
-  // 确认短句「行」播完仍等正文：勿 client_listening（与 VoicePhase.thinking 双保险）
+  // 整轮等回复 / 放麦宽限：一律勿 unmute（确认句播完≠可听；正文 TTS 未到更不能听）
   setXiaomiDeferClientListening(
-    () => (_awaitingReply && !_assistantEnded) || !canUnmuteStt(),
+    () => _awaitingReply || _inListenGrace() || !canUnmuteStt(),
   )
   _unsubVisibility = installVoiceVisibilityTerminal()
   // 切后台/回前台：重算 tray + 补发 listening（hidden hold 解除后）
@@ -244,42 +407,106 @@ async function _startXiaomiFramePipelineInner(opts = {}) {
     void import('../background-voice.js')
       .then((m) => m.notifyTTSStopped?.())
       .catch(() => {})
-    // 确认句播完但模型/正文未结束：保持「思考」，勿闪回聆听
-    if (_awaitingReply && !_assistantEnded) {
+    // 互斥：仍等本轮回复时不回「正常聆听」。
+    // 旧条件 `_awaitingReply && !_assistantEnded` 会在「确认句播完 + 模型已 end、正文 TTS 未到」
+    // 时误开聆听（日志 17:17:35 speaking→listening → 回声确认句进 ASR）。
+    // 但仍需 exit_listen 放麦：否则思考期喊「退出/停止」ASR 全哑。
+    if (_awaitingReply && (!_assistantEnded || !_heardBodySpeak)) {
       voiceDecisionLog('idle_keep_awaiting', {
         awaitingReply: true,
-        assistantEnded: false,
+        assistantEnded: !!_assistantEnded,
+        heardBodySpeak: !!_heardBodySpeak,
         playing: isXiaomiFramePlaying(),
       })
       _refreshTray()
+      _armExitListenWhileThinking('playback_idle_awaiting')
       return
     }
     _awaitingReply = false
     // 本轮播完回聆听：清空「你」区旧稿，避免下一轮开口前仍挂着上轮用户句
-    _partial = ''
-    void import('../background-voice-bridge.js')
-      .then((b) => {
-        b.updateVoicePartialText?.('')
-        b.clearPendingVoiceSend?.()
-      })
-      .catch(() => {})
-    noteVoicePanelDisplay('', { immediate: true, source: '播完回聆听清空' })
+    _clearUserCaption('播完回聆听清空')
+    // 思考期积压的下一句：播完再发，避免打断导致 AI 回复没声
+    if (_pendingTurns.length) {
+      _drainPendingAfterIdle('playback_idle')
+      return
+    }
+    // 先进入放麦宽限，再切 listening，避免 _refreshTray 立刻 flush client_listening
+    _scheduleListenUnmute('playback_idle')
     _refreshTray()
   })
 
   setXiaomiFrameEventHandler((m) => {
     const type = String(m?.type || '')
     if (type === 'partial' || (type === 'final' && !m.turn)) {
-      _partial = String(m.text || '')
+      const raw = String(m.text || '')
+      // 思考/播报：拒绝迟到 ASR 回灌（日志 17:08:03 开播清后又上屏旧句）
+      if (_shouldHoldUserCaption()) {
+        if (!raw.trim()) _clearUserCaption('hold期空ASR清屏')
+        return
+      }
+      const peeled = _peelCommittedAsrPrefix(raw)
+      _partial = peeled
       // 上屏字 + 上屏时间走面板日志（updateVoicePartialText → noteVoicePanelDisplay）
       void import('../background-voice-bridge.js').then((b) => {
-        b.updateVoicePartialText?.(_partial)
+        b.updateVoicePartialText?.(peeled)
       })
     }
     if (type === 'turn_end') {
-      const text = String(m.text || _partial || '').trim()
-      _partial = ''
+      const raw = String(m.text || _partial || '').trim()
+      // 先剥上轮用户定稿，再剥助手播报前缀，尽量留下用户新话
+      let text = _peelCommittedAsrPrefix(raw)
       if (text) {
+        const afterBot = _peelAssistantEchoPrefix(text)
+        if (afterBot !== text) {
+          voiceFeLog(
+            '用户输入',
+            `ASR 剥助手播报前缀：「${text.slice(0, 36)}」→「${(afterBot || '').slice(0, 36)}」`,
+          )
+          text = afterBot
+        }
+      }
+      _partial = ''
+      if (raw && !text) {
+        // 剥完变空：仍可能是粘连里夹了「退出/停止」——思考期靠这条才能停
+        void import('../xiaomi-voice-close.js')
+          .then(async (m) => {
+            if (m.isXiaomiVoiceExitCommand?.(raw)) {
+              voiceFeLog('用户输入', `回声剥空但仍命中退出口令 → 走闸门：「${raw.slice(0, 40)}」`)
+              await _handleTurnEndLocalOrEnqueue(raw)
+              return
+            }
+            noteVoicePanelDisplay('', { immediate: true, source: 'turn_end回声丢弃' })
+            voiceFeLog('用户输入', `turn_end 丢弃纯回声：「${raw.slice(0, 60)}」`)
+          })
+          .catch(() => {
+            noteVoicePanelDisplay('', { immediate: true, source: 'turn_end回声丢弃' })
+            voiceFeLog('用户输入', `turn_end 丢弃纯回声：「${raw.slice(0, 60)}」`)
+          })
+      } else if (text) {
+        // 仅「喇叭正在出声」时挡普通定稿（防自录）；宽限/思考中放行，交给录入队列
+        const speakerHot = isXiaomiFramePlaying() || getVoicePhase() === 'speaking'
+        if (speakerHot) {
+          void import('../xiaomi-voice-close.js')
+            .then(async (m) => {
+              if (m.isXiaomiVoiceExitCommand?.(raw) || m.isXiaomiVoiceExitCommand?.(text)) {
+                voiceFeLog('用户输入', `播报中命中退出口令 → 走闸门：「${text.slice(0, 40)}」`)
+                await _handleTurnEndLocalOrEnqueue(text || raw)
+                return
+              }
+              // 真打断：有实质用户尾巴则仍入队（_commitUserTurn 会 barge）
+              if (text.trim().length >= 6) {
+                voiceFeLog('用户输入', `播报中用户抢话 → 入队/打断：「${text.slice(0, 40)}」`)
+                await _handleTurnEndLocalOrEnqueue(text)
+                return
+              }
+              noteVoicePanelDisplay('', { immediate: true, source: 'turn_end播报短回声丢弃' })
+              voiceFeLog('用户输入', `turn_end 丢弃播报短回声：「${text.slice(0, 40)}」`)
+            })
+            .catch(() => {
+              void _handleTurnEndLocalOrEnqueue(text)
+            })
+          return
+        }
         const tid =
           String(m.trace_id || '').trim() ||
           getVoiceTrace() ||
@@ -288,13 +515,12 @@ async function _startXiaomiFramePipelineInner(opts = {}) {
         _turnEndAt = performance.now()
         _turnEndWall = formatVoiceLocalTs()
         _turnAwaitingPlay = text
-        // 定稿上屏（立即落盘，不等 120ms 合并）
         noteVoicePanelDisplay(text, { immediate: true, source: 'turn_end定稿' })
         void import('../background-voice-bridge.js').then((b) => {
           b.updateVoicePartialText?.(text)
         })
         _logDialogue(`用户说完定稿：「${text}」 定稿于=${_turnEndWall} TRACE=${tid}`)
-        void _enqueueTurn(text)
+        void _handleTurnEndLocalOrEnqueue(text)
       } else {
         noteVoicePanelDisplay('', { immediate: true, source: 'turn_end空' })
         _logDialogue('用户输入为空（turn_end 无文本）→ 本轮不发送')
@@ -313,6 +539,12 @@ async function _startXiaomiFramePipelineInner(opts = {}) {
         window.clearTimeout(_endFlushTimer)
         _endFlushTimer = 0
       }
+      // assistant_end 之后的首包 = 正文（确认短句一定在 end 之前）
+      if (_assistantEnded) {
+        _heardBodySpeak = true
+      }
+      // 开播再清一次（发送时已清；防迟到 ASR 在思考窗又灌回来）
+      _clearUserCaption('开播清用户句')
       // 勿清 _awaitingReply：确认短句 tts_start 之后模型往往还要跑几十秒
       _setTray('speaking')
       _syncPhase('tts_start')
@@ -354,6 +586,7 @@ async function _startXiaomiFramePipelineInner(opts = {}) {
       if (reason === 'stopAllAssistantSpeech' || reason === 'wake-word-hit') {
         const wasAwaiting = _awaitingReply
         _awaitingReply = false
+        _heardBodySpeak = false
         // 只清增量状态，不要 sendXiaomiAssistantBegin（那会空开一轮）
         _assistantPlain = ''
         _assistantEnded = false
@@ -366,12 +599,15 @@ async function _startXiaomiFramePipelineInner(opts = {}) {
           playing: isXiaomiFramePlaying(),
         })
         voiceFeLog('打断', `stopAll/wake 停播 → 释放思考态回聆听（不清模型 run）`)
+        _scheduleListenUnmute('stopall')
         _refreshTray()
         return
       }
       // 后端已停合成；前端同时丢弃迟到的正文增量，避免旧回复回流成语音。
       resetXiaomiFrameAssistantFeed()
       _awaitingReply = false
+      _heardBodySpeak = false
+      _scheduleListenUnmute('interrupted')
       _refreshTray()
       if (reason === 'client_barge_in') {
         // 前端主动 barge：勿再 abort（调用方已编排）
@@ -517,6 +753,8 @@ async function _startXiaomiFramePipelineInner(opts = {}) {
 }
 
 async function _playWakeAckSafe() {
+  // 宽限期覆盖「在呢」整段 + 收尾回声，避免把应答听进去当用户发问
+  _wakeAckUntilMs = Date.now() + 3500
   try {
     voiceFeLog('会话', '播放唤醒应答「在呢」…')
     const { playWakeChime } = await import('../wake-ack.js')
@@ -526,6 +764,8 @@ async function _playWakeAckSafe() {
     voiceFeLog('会话', '唤醒应答「在呢」播放完成')
   } catch (e) {
     voiceFeLog('会话', `唤醒应答「在呢」失败：${e?.message || e}`)
+  } finally {
+    _wakeAckUntilMs = Math.max(_wakeAckUntilMs, Date.now() + 800)
   }
 }
 
@@ -540,17 +780,181 @@ async function _abortModelRunForBargeIn() {
   }
 }
 
+/**
+ * Frame ASR 定稿：先走本地口令（停止/退出/停播报），命中则中断任务且不 chatSend。
+ * @param {string} text
+ */
+async function _handleTurnEndLocalOrEnqueue(text) {
+  const t = String(text || '').trim()
+  if (!t) return
+  try {
+    const { tryHandleXiaomiVoiceLocalCommand } = await import('../xiaomi-voice-close.js')
+    const handled = await tryHandleXiaomiVoiceLocalCommand(t, { source: 'frame-turn_end' })
+    if (handled === 'exited') {
+      // 关舞台会 teardown 管线；清排队，防迟到 enqueue 再发问
+      _pendingTurns.length = 0
+      _sending = false
+      _awaitingReply = false
+      _turnAwaitingPlay = ''
+      _logDialogue(`本地口令退出（不经模型）：「${t}」`)
+      return
+    }
+    if (handled === 'tts_stopped') {
+      _logDialogue(`本地口令停播报（不经模型）：「${t}」`)
+      _refreshTray()
+      return
+    }
+  } catch (e) {
+    voiceFeLog('打断', `本地口令闸失败，回退发问：${e?.message || e}`)
+  }
+  await _enqueueTurn(t)
+}
+
 async function _enqueueTurn(text) {
   const t = String(text || '').trim()
   if (!t) return
+  // 双保险：排队迟到句若是退出口令，也绝不发给模型（避免绕过 turn_end 闸）
+  try {
+    const { isXiaomiVoiceExitCommand } = await import('../xiaomi-voice-close.js')
+    const { isStopTtsOnlyCommand } = await import('../voice-listen-control.js')
+    if (isXiaomiVoiceExitCommand(t) || isStopTtsOnlyCommand(t)) {
+      voiceFeLog('用户输入', `排队句命中本地口令 → 改走闸门：「${t.slice(0, 40)}」`)
+      _clearCoalesce()
+      // 直接走闸门，勿再 _handleTurnEndLocalOrEnqueue→_enqueueTurn 递归
+      const { tryHandleXiaomiVoiceLocalCommand } = await import('../xiaomi-voice-close.js')
+      const handled = await tryHandleXiaomiVoiceLocalCommand(t, { source: 'frame-enqueue' })
+      if (handled === 'exited') {
+        _pendingTurns.length = 0
+        _sending = false
+        _awaitingReply = false
+        _turnAwaitingPlay = ''
+        return
+      }
+      if (handled === 'tts_stopped') {
+        _refreshTray()
+        return
+      }
+    }
+  } catch {
+    /* ignore — 下方正常发问 */
+  }
+
+  // 「在呢」回声 / 唤醒宽限期：绝不进模型
+  if (_isWakeAckEcho(t) || Date.now() < _wakeAckUntilMs) {
+    voiceFeLog(
+      '用户输入',
+      `录入队列丢弃（${_isWakeAckEcho(t) ? '唤醒回声' : '唤醒宽限期'}）：「${t.slice(0, 40)}」`,
+    )
+    return
+  }
+
+  // 合并窗口：ASR 越听越长只保留最新，900ms 静默后再 commit（用户录入队列）
+  if (_coalesceText && !_isSameOrExtendedTurn(_coalesceText, t)) {
+    // 明显新一句：先提交上一句，再开新窗口
+    const prev = _coalesceText
+    _clearCoalesce()
+    voiceFeLog('用户输入', `录入队列切句：先提交「${prev.slice(0, 40)}」再听「${t.slice(0, 40)}」`)
+    await _commitUserTurn(prev)
+  }
+  if (
+    !_coalesceText ||
+    _normUserTurn(t).length >= _normUserTurn(_coalesceText).length ||
+    _isSameOrExtendedTurn(_coalesceText, t)
+  ) {
+    _coalesceText = t
+  }
+  if (_coalesceTimer) window.clearTimeout(_coalesceTimer)
+  _coalesceTimer = window.setTimeout(() => {
+    _coalesceTimer = 0
+    const finalText = String(_coalesceText || '').trim()
+    _coalesceText = ''
+    if (finalText) void _commitUserTurn(finalText)
+  }, USER_TURN_COALESCE_MS)
+  voiceFeLog(
+    '用户输入',
+    `录入队列合并中（${USER_TURN_COALESCE_MS}ms）：「${t.slice(0, 60)}」`,
+  )
+  _refreshTray()
+}
+
+/**
+ * 合并窗口结束后真正入队/发送。思考/播报中：延长句丢弃；真新句入队等播完。
+ * @param {string} text
+ */
+async function _commitUserTurn(text) {
+  const raw = String(text || '').trim()
+  if (!raw) return
+  // 剥掉上轮粘连前缀，避免过 dedup 窗后整段「旧+新」当新句发出（面板叠加同源）
+  const peeled = _peelCommittedAsrPrefix(raw)
+  const t = peeled || raw
+  if (_lastCommittedTurn && !peeled && _isSameOrExtendedTurn(_lastCommittedTurn, raw)) {
+    voiceFeLog('用户输入', `录入队列丢弃上轮 ASR 回声：「${raw.slice(0, 60)}」`)
+    return
+  }
+  if (peeled && peeled !== raw) {
+    voiceFeLog(
+      '用户输入',
+      `ASR 粘连已剥前缀：「${raw.slice(0, 40)}」→「${peeled.slice(0, 40)}」`,
+    )
+  }
+  if (_isWakeAckEcho(t) || Date.now() < _wakeAckUntilMs) {
+    voiceFeLog('用户输入', `录入队列 commit 丢弃唤醒回声：「${t.slice(0, 40)}」`)
+    return
+  }
+
+  // 已发问后的 ASR 延长/近义：绝不打断（这是「AI 回复没声」主因）
+  if (
+    _lastCommittedTurn &&
+    Date.now() - _lastCommittedAtMs < USER_TURN_DEDUP_MS &&
+    _isSameOrExtendedTurn(_lastCommittedTurn, t)
+  ) {
+    voiceFeLog(
+      '用户输入',
+      `录入队列丢弃延长/近义（不打断回复）：「${t.slice(0, 60)}」距上次 ${Date.now() - _lastCommittedAtMs}ms`,
+    )
+    return
+  }
+
   if (_sending) {
-    // ASR 定稿会连推近义句：只保留最新一句，别堆成队列=5 连发
     _pendingTurns.length = 0
     _pendingTurns.push(t)
     voiceFeLog('用户输入', `上一轮仍在发送 → 覆盖排队为最新：「${t.slice(0, 60)}」`)
     _refreshTray()
     return
   }
+
+  const playing = isXiaomiFramePlaying()
+  const busy = _awaitingReply || playing
+  if (busy) {
+    if (_lastCommittedTurn && _isSameOrExtendedTurn(_lastCommittedTurn, t)) {
+      voiceFeLog('用户输入', `思考/播报中丢弃 ASR 延长句：「${t.slice(0, 60)}」`)
+      return
+    }
+    if (playing) {
+      // 用户真打断播报：停播 + 取消模型，立刻发新句
+      voiceFeLog('用户输入', `播报中真打断 →「${t.slice(0, 60)}」`)
+      _pendingTurns.length = 0
+      try {
+        await bargeInXiaomiFrame('user_turn_barge')
+      } catch {
+        /* ignore */
+      }
+      await _abortModelRunForBargeIn()
+      _awaitingReply = false
+      await _sendTurn(t)
+      return
+    }
+    // 思考中（模型还在跑、尚未开播）：入队等播完，不 abort → 保住本轮 TTS
+    _pendingTurns.length = 0
+    _pendingTurns.push(t)
+    voiceFeLog(
+      '用户输入',
+      `思考中新句入队（等本轮播完再发，不打断）：「${t.slice(0, 60)}」`,
+    )
+    _refreshTray()
+    return
+  }
+
   await _sendTurn(t)
 }
 
@@ -560,26 +964,66 @@ async function _sendTurn(text) {
     _pendingTurns.push(text)
     return
   }
+  // 发送前最后一道：退出/停播报口令永不进模型
+  try {
+    const { tryHandleXiaomiVoiceLocalCommand } = await import('../xiaomi-voice-close.js')
+    const handled = await tryHandleXiaomiVoiceLocalCommand(text, { source: 'frame-sendTurn' })
+    if (handled === 'exited' || handled === 'tts_stopped') {
+      _pendingTurns.length = 0
+      _awaitingReply = false
+      _refreshTray()
+      return
+    }
+  } catch {
+    /* ignore */
+  }
   _sending = true
   _awaitingReply = true
   _assistantEnded = false
+  _heardBodySpeak = false
+  _listenGraceUntilMs = 0
+  if (_listenUnmuteTimer) {
+    window.clearTimeout(_listenUnmuteTimer)
+    _listenUnmuteTimer = 0
+  }
+  _lastCommittedTurn = String(text || '').trim()
+  _lastCommittedAtMs = Date.now()
   if (_endFlushTimer) {
     window.clearTimeout(_endFlushTimer)
     _endFlushTimer = 0
   }
+  // 一进思考就清「你」区：勿等 tts_start；并挡住迟到 ASR 回灌
+  _clearUserCaption('发送后进思考清用户句')
   _setTray('processing')
+  // 等确认句/正文前也能喊退出（确认句开播后 TTS 会再 mute）
+  _armExitListenWhileThinking('send_turn')
   let releasedSending = false
   const releaseSending = () => {
     if (releasedSending) return
     releasedSending = true
     _sending = false
-    const next = _pendingTurns.pop()
-    _pendingTurns.length = 0
-    if (next) {
-      void _sendTurn(next)
-    } else {
-      _refreshTray()
+    // 发送窗口内积压的延长句若与刚发出的同轮 → 丢掉；真新句等播完再出队
+    if (_pendingTurns.length) {
+      const next = String(_pendingTurns[_pendingTurns.length - 1] || '').trim()
+      _pendingTurns.length = 0
+      if (next && _isSameOrExtendedTurn(_lastCommittedTurn, next)) {
+        voiceFeLog('用户输入', `发送后丢弃同轮延长排队：「${next.slice(0, 60)}」`)
+        _refreshTray()
+        return
+      }
+      if (next) {
+        // 仍在等回复：继续压住，勿立刻连发
+        if (_awaitingReply) {
+          _pendingTurns.push(next)
+          voiceFeLog('用户输入', `发送完成但仍在等回复 → 新句继续排队：「${next.slice(0, 60)}」`)
+          _refreshTray()
+          return
+        }
+        void _sendTurn(next)
+        return
+      }
     }
+    _refreshTray()
   }
   try {
     const { setPreferXiaomiVoice } = await import('../background-voice-bridge.js')
@@ -607,6 +1051,10 @@ export function stopXiaomiFramePipeline() {
   _running = false
   _pendingTurns.length = 0
   _sending = false
+  _clearCoalesce()
+  _lastCommittedTurn = ''
+  _lastCommittedAtMs = 0
+  _wakeAckUntilMs = 0
   // 退出小微对话后不再 prefer 小V，避免迟到 ASR 仍标小V 或误路由
   void import('../background-voice-bridge.js')
     .then((m) => {
@@ -616,6 +1064,12 @@ export function stopXiaomiFramePipeline() {
     })
     .catch(() => {})
   _awaitingReply = false
+  _heardBodySpeak = false
+  _listenGraceUntilMs = 0
+  if (_listenUnmuteTimer) {
+    window.clearTimeout(_listenUnmuteTimer)
+    _listenUnmuteTimer = 0
+  }
   _turnEndAt = 0
   _turnEndWall = ''
   _turnAwaitingPlay = ''
@@ -691,9 +1145,182 @@ export async function toggleXiaomiFramePipeline(opts = {}) {
 let _assistantPlain = ''
 /** 本轮已 assistant_end：禁止再推全文（否则会整段重播一遍） */
 let _assistantEnded = false
+/**
+ * assistant_end 之后是否已收到正文 tts_start（非确认短句）。
+ * 确认句本地播完时若模型已 end，旧逻辑会误回聆听→unmute→回声抢麦（日志 17:17:35）。
+ */
+let _heardBodySpeak = false
 /** Frame session 尚未就绪时暂存的累计正文（避免回落 legacy 双播） */
 let _stashBody = ''
 let _stashFinal = false
+/** 本轮已成功推给 Frame 的全部正文（跨多段累加），防 RUN_FINISHED 重喂已播段 */
+let _assistantFedText = ''
+/**
+ * text-end 已对当前段发过 assistant_end。
+ * RUN_FINISHED 再 feed(final) 时勿整段重推、勿二次 end（日志 vt-tnk9sn-2b66：工具后第二段播两遍）。
+ */
+let _assistantSegmentEndSent = false
+/** 播完回聆听后短暂延后放麦，躲开喇叭尾音 */
+let _listenUnmuteTimer = 0
+/** @type {number} */
+let _listenGraceUntilMs = 0
+/** 近尾预切后喇叭还有尾音；过长宽限会误丢用户紧接着说的话（日志 17:30） */
+const LISTEN_UNMUTE_GRACE_MS = 800
+
+/** 历史确认短句回声（应声已关；仍剥残留「好的/收到」） */
+const _TURN_ACK_ECHO = ['好的', '收到']
+
+function _isAckEchoText(text) {
+  const n = _normUserTurn(text)
+  if (!n) return false
+  // 短应声只认整句（可带语气词）；endsWith「好的」会误杀正常尾句
+  if (_TURN_ACK_ECHO.some((a) => n === a || n === `${a}啊` || n === `${a}呀` || n === `${a}呢` || n === `${a}哦`)) {
+    return true
+  }
+  return n.length <= 6 && /^(嗯|啊|哦|呐)+$/.test(n)
+}
+
+/**
+ * 粘连 ASR = 助手播报前缀 + 用户新话：只剥前缀，保留用户尾巴。
+ * 旧逻辑整段当回声丢掉 → 正常长句被漏发（日志 17:30–17:32）。
+ */
+function _peelAssistantEchoPrefix(text) {
+  const t = String(text || '').trim()
+  const fed = String(_assistantFedText || _assistantPlain || '').trim()
+  if (!t || !fed || fed.length < 10) return t
+  const nf = _normUserTurn(fed)
+  const nt = _normUserTurn(t)
+  if (!nf || !nt || nt.length <= 4) return t
+  // 整段就是助手原文（或更短子集）→ 空
+  if (nf === nt || (nf.includes(nt) && nt.length >= 6 && nt.length <= nf.length)) return ''
+  // 必须是前缀粘连才剥；句中偶然重合不动
+  const head = Math.min(24, nf.length)
+  if (head < 10 || !nt.startsWith(nf.slice(0, head))) return t
+  let ni = 0
+  let i = 0
+  const noise = /[\s\u3000，。！？、,.!?;；：:"""''“”‘’（）()【】[\]…—\-]/
+  while (i < t.length && ni < nf.length) {
+    const ch = t[i]
+    if (noise.test(ch)) {
+      i += 1
+      continue
+    }
+    if (ch.toLowerCase() === nf[ni]) {
+      i += 1
+      ni += 1
+      continue
+    }
+    break
+  }
+  // 至少对齐助手一半，才认为前面是回声
+  if (ni < Math.floor(Math.min(nf.length, 40) * 0.5)) return t
+  const rest = t.slice(i).replace(/^[，。！？、,.!?\s]+/, '').trim()
+  return rest
+}
+
+function _inListenGrace() {
+  return Date.now() < _listenGraceUntilMs
+}
+
+/**
+ * 思考期（等模型 / 确认句已播完、正文未到）专门放麦听「退出/停止」。
+ * 不改 phase、不开正常聆听；后端 purpose=exit_listen，播报中仍 mute。
+ */
+function _armExitListenWhileThinking(reason = 'think') {
+  if (!_running || !_awaitingReply) return
+  if (isXiaomiFramePlaying() || getVoicePhase() === 'speaking') return
+  voiceFeLog('管线', `思考期放麦听退出（${reason}）`)
+  voiceDecisionLog('exit_listen_arm', {
+    reason: String(reason || '-'),
+    awaitingReply: true,
+    assistantEnded: !!_assistantEnded,
+    heardBodySpeak: !!_heardBodySpeak,
+    phase: getVoicePhase(),
+  })
+  sendXiaomiClientListening({ force: true, purpose: 'exit_listen' })
+}
+
+function _scheduleListenUnmute(reason = 'grace') {
+  _listenGraceUntilMs = Date.now() + LISTEN_UNMUTE_GRACE_MS
+  if (_listenUnmuteTimer) {
+    window.clearTimeout(_listenUnmuteTimer)
+    _listenUnmuteTimer = 0
+  }
+  _listenUnmuteTimer = window.setTimeout(() => {
+    _listenUnmuteTimer = 0
+    _listenGraceUntilMs = 0
+    if (!_running || _awaitingReply || isXiaomiFramePlaying()) return
+    if (!canUnmuteStt()) return
+    voiceFeLog('管线', `放麦宽限结束（${reason}）→ client_listening`)
+    flushXiaomiClientListeningIfIdle()
+  }, LISTEN_UNMUTE_GRACE_MS)
+}
+
+function _noteFed(delta) {
+  const d = String(delta || '')
+  if (d) _assistantFedText += d
+}
+
+/** 忽略空白差异后比较正文是否已覆盖（防 text-end 后再 final 整段重推） */
+function _normSpeechBody(s) {
+  return String(s || '').replace(/\s+/g, '')
+}
+
+/**
+ * @param {string} fed
+ * @param {string} body
+ * @returns {boolean}
+ */
+function _fedCoversBody(fed, body) {
+  const f = String(fed || '')
+  const b = String(body || '')
+  if (!b) return true
+  if (!f) return false
+  if (f === b || f.endsWith(b) || b.endsWith(f) || f.includes(b)) return true
+  const nf = _normSpeechBody(f)
+  const nb = _normSpeechBody(b)
+  if (!nb) return true
+  return nf === nb || nf.endsWith(nb) || nb.endsWith(nf) || nf.includes(nb)
+}
+
+/**
+ * 同轮多段正文（工具调用之间）：冲刷上一段去 TTS，再开闸接下一段。
+ * 不置 _assistantEnded，语音 pending 继续；也不拆掉上一段本地播放队列。
+ */
+export function flushXiaomiFrameAssistantSegment(reason = 'segment') {
+  if (!isXiaomiFrameSessionActive()) return false
+  if (_assistantEnded) return false
+  const plain = String(_assistantPlain || '').trim()
+  if (plain) {
+    voicePlaybackMark(
+      '流式正文',
+      plain.slice(0, 120),
+      `段落冲刷→播报 reason=${reason}（${plain.length} 字）`,
+    )
+    sendXiaomiAssistantEnd()
+    _assistantPlain = ''
+    if (reason === 'text-end') _assistantSegmentEndSent = true
+  } else if (reason === 'text-end') {
+    // 空段 text-end：无字可冲；勿误开 begin
+    return false
+  }
+  // text-end = 本段正文结束，只 end 去 TTS。再 begin 会 +turn，且曾与确认短句后的
+  // 正文 TTSSpeak 竞态（合成完无首包下发）。下一段由 tool-start / non-prefix 开闸；
+  // 整轮收尾由 feed(final) 收口（若 text-end 已 end，则不再二次 end / 重推）。
+  if (reason === 'text-end') {
+    _awaitingReply = true
+    _assistantEnded = false
+    _refreshTray()
+    return true
+  }
+  // tool-start / non-prefix：下一段开闸，保留本段已在播/排队的音频
+  _assistantSegmentEndSent = false
+  sendXiaomiAssistantBegin({ preservePlayback: true })
+  _awaitingReply = true
+  _assistantEnded = false
+  _refreshTray()
+  return true
+}
 
 /** Feed assistant stream into Frame SentenceAgg (skips frontend cut). */
 export function feedXiaomiFrameAssistant(fullText, { final = false } = {}) {
@@ -704,7 +1331,23 @@ export function feedXiaomiFrameAssistant(fullText, { final = false } = {}) {
   }
   const body = String(fullText || '')
   const wasEmpty = !_assistantPlain
-  if (body.length > _assistantPlain.length && body.startsWith(_assistantPlain)) {
+  const fed = String(_assistantFedText || '')
+
+  // text-end 已冲刷 / RUN_FINISHED 重带全文：已喂过的正文一律不重推
+  if (fed && body && _fedCoversBody(fed, body)) {
+    if (wasEmpty || final) {
+      voicePlaybackMark('流式正文', body.slice(0, 40), '跳过已推送正文（text-end/已喂）')
+    }
+  } else if (final && fed && body && body.startsWith(fed)) {
+    const rest = body.slice(fed.length)
+    if (rest) {
+      voicePlaybackMark('流式正文', rest.slice(0, 80), '收尾补推未播尾巴')
+      sendXiaomiAssistantDelta(rest)
+      _noteFed(rest)
+      _assistantPlain = body
+      _assistantSegmentEndSent = false
+    }
+  } else if (body.length > _assistantPlain.length && body.startsWith(_assistantPlain)) {
     const delta = body.slice(_assistantPlain.length)
     _assistantPlain = body
     if (delta) {
@@ -713,24 +1356,47 @@ export function feedXiaomiFrameAssistant(fullText, { final = false } = {}) {
         voicePlaybackMark('流式正文', delta, '推送 Frame（增量）')
       }
       sendXiaomiAssistantDelta(delta)
+      _noteFed(delta)
+      _assistantSegmentEndSent = false
     }
   } else if (body && body !== _assistantPlain) {
-    // 已有前缀时禁止把整段当「非前缀」重推（清 plain 后的二次 final 曾走这里）
     if (!_assistantPlain) {
-      _assistantPlain = body
-      voicePlaybackMark('流式正文', body.slice(0, 80), '推送 Frame（首包整段）')
-      sendXiaomiAssistantDelta(body)
+      // 若 body 其实是已喂内容的子集/重复，跳过
+      if (fed && _fedCoversBody(fed, body)) {
+        voicePlaybackMark('流式正文', body.slice(0, 40), '跳过已推送正文')
+      } else if (fed && body.startsWith(fed)) {
+        const rest = body.slice(fed.length)
+        _assistantPlain = body
+        if (rest) {
+          voicePlaybackMark('流式正文', rest.slice(0, 80), '推送 Frame（续写）')
+          sendXiaomiAssistantDelta(rest)
+          _noteFed(rest)
+          _assistantSegmentEndSent = false
+        }
+      } else {
+        _assistantPlain = body
+        voicePlaybackMark('流式正文', body.slice(0, 80), '推送 Frame（首包整段）')
+        sendXiaomiAssistantDelta(body)
+        _noteFed(body)
+        _assistantSegmentEndSent = false
+      }
     } else {
+      // 工具后新开的正文块（openText 不再以前缀延续）→ 先播上一段，再喂本段
       voicePlaybackMark(
         '流式正文',
-        body.slice(0, 40),
-        `忽略非前缀更新（已有 ${_assistantPlain.length} 字）`,
+        body.slice(0, 80),
+        `非前缀新段（上段 ${_assistantPlain.length} 字）→ 冲刷后接新段`,
       )
+      flushXiaomiFrameAssistantSegment('non-prefix')
+      _assistantPlain = body
+      sendXiaomiAssistantDelta(body)
+      _noteFed(body)
+      _assistantSegmentEndSent = false
     }
   }
   if (final) {
     _assistantEnded = true
-    const plain = String(_assistantPlain || '').trim()
+    const plain = String(_assistantFedText || _assistantPlain || '').trim()
     _logDialogue(
       plain
         ? `助手回复：「${plain.slice(0, 800)}${plain.length > 800 ? '…' : ''}」`
@@ -740,9 +1406,15 @@ export function feedXiaomiFrameAssistant(fullText, { final = false } = {}) {
     voicePlaybackMark(
       '流式正文',
       plain.slice(0, 400),
-      `本轮结束累计 ${plain.length} 字，冲刷残句`,
+      `本轮结束累计 ${plain.length} 字${_assistantSegmentEndSent ? '（text-end 已冲，跳过二次 end）' : '，冲刷残句'}`,
     )
-    sendXiaomiAssistantEnd()
+    // text-end 已 end 过本段：再 end 会让后端把同一段再合成一遍（vt-tnk9sn-2b66 seq=2/3）
+    if (!_assistantSegmentEndSent) {
+      sendXiaomiAssistantEnd()
+    }
+    _assistantSegmentEndSent = false
+    // 正文 TTS 可能还要等几秒：这段窗口也要能喊退出
+    _armExitListenWhileThinking('assistant_end')
     // 正文 end 后 TTS 常晚 1–2s（火山 ttfb）；旧 1.2s 就 flush → 误 unmute →
     // 回声 stopAll → 只播一句（日志 18:30:23→25）。等 tts_start 取消；仅超久无播才兜底。
     if (_endFlushTimer) window.clearTimeout(_endFlushTimer)
@@ -750,14 +1422,20 @@ export function feedXiaomiFrameAssistant(fullText, { final = false } = {}) {
       _endFlushTimer = 0
       if (!_running || !_assistantEnded) return
       if (isXiaomiFramePlaying()) return
+      if (_heardBodySpeak) return
       voiceDecisionLog('end_flush_timeout', {
         awaitingReply: _awaitingReply,
+        heardBodySpeak: false,
         playing: false,
       })
       voiceFeLog('管线', '正文结束已久仍无本地播报 → 释放思考并 client_listening')
       _awaitingReply = false
-      _refreshTray()
-      flushXiaomiClientListeningIfIdle()
+      if (_pendingTurns.length) {
+        _drainPendingAfterIdle('end_flush_no_tts')
+      } else {
+        _refreshTray()
+        _scheduleListenUnmute('end_flush_timeout')
+      }
     }, 8000)
     // 注意：不要清空 _assistantPlain。清空后若再进 feed，会把全文当 delta 再推一遍。
   }
@@ -796,16 +1474,29 @@ function _flushStashedAssistant() {
   const final = _stashFinal
   _stashBody = ''
   _stashFinal = false
-  if (!isXiaomiFrameSessionActive()) return
+  if (!isXiaomiFrameSessionActive()) {
+    // 连上前又断了：写回暂存，等下次 flush
+    _stashBody = body
+    _stashFinal = final
+    voiceFeLog('流式正文', `冲刷暂存失败（Frame 未活跃）保留 ${_stashBody.length} 字`)
+    return
+  }
   voicePlaybackMark('流式正文', body.slice(0, 120), `Frame 已就绪，冲刷暂存 ${body.length} 字`)
   // arm 时 session 可能尚未连上，begin 没发出；冲刷前补一次开闸
   sendXiaomiAssistantBegin()
   feedXiaomiFrameAssistant(body, { final })
 }
 
+/** Frame WS 连上后由 session-client / sync 调用：把「连接中暂存」推进 TTS。 */
+export function flushXiaomiFrameAssistantStash() {
+  _flushStashedAssistant()
+}
+
 export function resetXiaomiFrameAssistantFeed() {
   _assistantPlain = ''
   _assistantEnded = false
+  _assistantFedText = ''
+  _assistantSegmentEndSent = false
   _stashBody = ''
   _stashFinal = false
   // 通知后端开闸抬轮次（键盘提问没有 UserTurnComplete）

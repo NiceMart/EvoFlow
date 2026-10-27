@@ -29,6 +29,7 @@ import { rightStageStore } from '../../../lib/right-stage/right-stage-store.js'
 import { notifyLayoutChromeChanged } from '../../../lib/layout-chrome.js'
 import { isXwVoiceMode, subscribeXwVoiceMode } from '../../../lib/xw-voice-mode.js'
 import { XiaomiV4Timeline } from '../../components/XiaomiV4Timeline.js'
+import { VoicePlaybackDiagnostics } from '../../components/VoicePlaybackDiagnostics.js'
 import './xiaomi-voice-stage.css'
 
 /** 舞台只暴露三态：跟流式/播报接口对齐，别再拆「待命/识别/占用」。 */
@@ -128,6 +129,8 @@ export function XiaomiVoiceStage() {
    * 开着时语音域固定左栏宽。本组件用按钮直接 collapse/expand store，不退出语音模式。
    */
   const [rightStageOpen, setRightStageOpen] = useState(() => rightStageStore.isOpen)
+  /** P2 播报台账诊断面板 */
+  const [ledgerOpen, setLedgerOpen] = useState(false)
 
   const liveRef = useRef({
     session: false,
@@ -264,11 +267,17 @@ export function XiaomiVoiceStage() {
         return
       }
       liveRef.current.tray = s
+      if (s === 'speaking' || s === 'processing') {
+        // 发送进思考 / 开播：中间「你」区空出来，勿继续挂上轮用户句
+        setTranscript('')
+        setLastUser('')
+      }
       if (s === 'recording') {
         liveRef.current.continuousListen = true
-        // 播报结束回到聆听：清听写草稿，保留 lastUser / reply（与右上角时间线一致）
+        // 播报结束回到聆听：听写草稿应已空（开播时清过）；勿回灌 lastUser
         if (stateRef.current === 'speak' && !liveRef.current.streaming) {
           setTranscript('')
+          setLastUser('')
         }
       }
       if (s === 'idle') liveRef.current.continuousListen = false
@@ -290,6 +299,11 @@ export function XiaomiVoiceStage() {
   useEffect(() => {
     const off = onSpeakingChange((v: boolean) => {
       liveRef.current.speaking = v
+      if (v) {
+        // 本地真正开播：清掉上一轮用户输入，舞台只留 AI 播报区
+        setTranscript('')
+        setLastUser('')
+      }
       derive()
     })
     return () => {
@@ -301,6 +315,20 @@ export function XiaomiVoiceStage() {
   useEffect(() => {
     return subscribeXiaomiVoicePartial((text) => {
       const t = String(text || '')
+      // 思考/播报中忽略迟到 partial，避免把已清掉的上一轮用户句又灌回来（叠加）
+      const holdCaption =
+        liveRef.current.speaking ||
+        liveRef.current.tray === 'speaking' ||
+        liveRef.current.tray === 'processing' ||
+        stateRef.current === 'speak' ||
+        stateRef.current === 'think'
+      if (holdCaption) {
+        if (!t.trim()) {
+          setTranscript('')
+          setLastUser('')
+        }
+        return
+      }
       setTranscript(t)
       if (t.trim()) setLastUser(t)
       liveRef.current.continuousListen = true
@@ -349,8 +377,12 @@ export function XiaomiVoiceStage() {
           break
         }
       }
-      // 已发送的 user 句优先（与 V4 时间线同源）；听写草稿只在聆听时盖上去
-      if (liveUser) setLastUser(liveUser)
+      // 已发送的 user 句：思考期可回填中间「你」区；播报中勿回灌（开播已清，等本轮输出）
+      const speakingNow =
+        liveRef.current.speaking ||
+        liveRef.current.tray === 'speaking' ||
+        stateRef.current === 'speak'
+      if (liveUser && !speakingNow) setLastUser(liveUser)
       derive()
     }
     sync()
@@ -589,10 +621,10 @@ export function XiaomiVoiceStage() {
 
   const showUser = useMemo(() => {
     // 聆听：只显示当前听写（空=等开口）；勿回退 lastUser，否则上一轮用户句清不掉
-    // 思考/播报：用已发送句（与右上角 V4 一致）
-    if (state === 'listen') {
-      return transcript
-    }
+    // 思考：暂留已发送句，方便对照「我在等什么」
+    // 播报：必须空 —— 上一轮用户输入应已清掉，中间区等本轮 AI 输出
+    if (state === 'listen') return transcript
+    if (state === 'speak') return ''
     return lastUser
   }, [state, transcript, lastUser])
 
@@ -709,7 +741,19 @@ export function XiaomiVoiceStage() {
             </svg>
           )}
         </button>
+        <button
+          type="button"
+          className={`xws-ledger${ledgerOpen ? ' is-on' : ''}`}
+          onClick={() => setLedgerOpen((v) => !v)}
+          aria-label="播报台账"
+          title="播报台账：按 TRACE 看每句合成/播放状态"
+          aria-pressed={ledgerOpen}
+        >
+          台账
+        </button>
       </div>
+
+      <VoicePlaybackDiagnostics open={ledgerOpen} onClose={() => setLedgerOpen(false)} />
 
       {/*
         右上角「对话」区 = V4 时间线。
