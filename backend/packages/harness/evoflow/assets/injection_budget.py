@@ -9,7 +9,13 @@ TIER0_SOUL_SUMMARY_CHARS = 400
 TIER0_SYSTEM_CHARS = 500
 TIER0_STANDING_CHARS = 320
 TIER0_USER_PROFILE_CHARS = 400
-TIER0_SKILLS_MAX_ITEMS = 8
+# Hard cap on <available_skills> entries. 8 was sized for the original 6-skill
+# install; the xiaobei media-ops port ships ~46 skills for the main agent, and
+# alphabetical truncation silently dropped everything past "c" (smart-search,
+# expert-*, …) — the agent then "cannot see" ported skills. Name-only entries
+# cost ~20 chars each, well inside TIER0_SKILLS_SECTION_CHARS, so the floor
+# degrades gracefully long before the cap bites.
+TIER0_SKILLS_MAX_ITEMS = 64
 TIER0_EPISODE_MAX_ITEMS = 4
 TIER0_CATALOG_MAX_ROWS = 10
 TIER0_SKILL_DESC_CHARS = 160
