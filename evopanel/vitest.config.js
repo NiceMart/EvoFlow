@@ -42,7 +42,9 @@ export default defineConfig({
     include: [
       'tests/shell-session-list-menu.test.tsx',
       'tests/platform-scope-ui.test.js',
+      'tests/codex-auth-panel.test.js',
       'tests/v4-wire-conformance.test.ts',
+      'tests/control-busy.test.ts',
       'tests/v4-running-text-interleave.test.ts',
       'tests/zcode-flat-reasoning.test.js',
       'tests/turn-history-fold.test.tsx',
@@ -91,6 +93,8 @@ export default defineConfig({
       'tests/plan-task-status.test.js',
       'tests/plan-from-api.test.js',
       'tests/collab-subtasks-from-api.test.js',
+      'tests/child-work-workflow-bridge.test.js',
+      'tests/use-collab-subtasks-error-resilience.test.tsx',
       'tests/collab-thread-ids.test.js',
       'tests/subtask-live-preview.test.js',
       'tests/workflow-node-activity.test.ts',
@@ -235,6 +239,7 @@ export default defineConfig({
       'tests/dept-group-dispatch-status.test.js',
       'tests/dept-group-mentions.test.js',
       'tests/dept-group-transcript.test.js',
+      'tests/dept-chat-list-cache.test.ts',
       'tests/dept-member-work-session.test.js',
       'tests/close-removed-entity-stage.test.js',
       'tests/builtin-action-labels.test.js',
@@ -257,9 +262,24 @@ export default defineConfig({
       'tests/user-facing-error.test.js',
       // 连发无回复：send_click 顶掉 sendTrace 后仍能识别上一轮无首帧
       'tests/chat-turn-timing-stalled.test.js',
+      // 首帧响应按回合幂等：后台回合无 sendTrace 时每 delta 双 IPC 落盘的洪水（1.2 万条/日）
+      'tests/chat-turn-timing-first-response-latch.test.js',
       'tests/live-execution-busy.test.js',
       // 多会话钉住 V4 投影：peekStore + pin 租约，切回不冷开空白
       'tests/v4-pin-sessions.test.js',
+      'tests/v4-session-keepwarm-cancel.test.ts',
+      // stream-404 remint：旧投影改挂新 thread，避免冷开清空时间线
+      'tests/v4-remint-rebind.test.ts',
+      'tests/langgraph-thread-stale-epoch.test.ts',
+      // 超大会话渲染层尾窗软顶（防 loadAllOlder / 长流式撑爆 window）
+      'tests/projection-window-cap.test.ts',
+      'tests/v4-userinput-visible-in-tail.test.ts',
+      'tests/v4-fold-health.test.ts',
+      'tests/v4-display-order-health.test.ts',
+      'tests/v4-running-text-interleave.test.ts',
+      // 点停 → API → UI idle 的 sinceStopMs 闭环
+      'tests/stream-stop-log.test.ts',
+      'tests/run-page-load-resume.test.ts',
       'tests/settings-modal-tauri-drag.test.js',
       'tests/task-duration.test.js',
       'tests/replay-real-run-133609527d1f.test.js',
@@ -276,10 +296,16 @@ export default defineConfig({
       'tests/composer-slash-menu.test.tsx',
       // 主窗口弹窗拦截（Agent 应用 iframe 的 window.open 不得弹到系统浏览器）
       'tests/main-popup-guard.test.ts',
+      // 小V语音隐式开文件策略闸门（点名/产物/媒体开，内部资料兜底不开）
+      'tests/file-auto-open-policy.test.js',
       // 工作流节点实时正文：LangGraph custom 通道必须转发 subagent_token_delta
       'tests/ws-subagent-token-delta.test.js',
       // 目标徽标 bridge：class store 的 subscribe 传参必须保持 this 绑定
       'tests/goal-status-badge-bridge.test.tsx',
+      // V4 轮尾 token 用量串格式化（复刻旧版 ↑in ↓out · ⚡cacheRead）
+      'tests/v4-assistant-usage-label.test.ts',
+      // 渲染进程内存瞭望：投影行字节估算（2026-11-15 renderer 1.7GB 悬案的下次定罪探针）
+      'tests/v4-projection-memory-probe.test.ts',
     ],
   },
 })

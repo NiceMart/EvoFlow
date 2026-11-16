@@ -34,6 +34,7 @@ import type {
   AttachmentRef,
   ArtifactRow,
   AssistantTextRow,
+  AssistantUsage,
   CommandAck,
   ConversationRow,
   ConversationRowTarget,
@@ -136,6 +137,10 @@ import {
 import { ConversationHookDetailsAction } from "@/v4/ConversationHookDetailsAction.js";
 import { formatModelChangeLabel } from "@/v4/composer/modelTriggerDisplay.js";
 import { formatMessageTimeLabel } from "@/v4/messageTimeLabel.js";
+import {
+  formatAssistantUsageLabel,
+  formatAssistantUsageTitle,
+} from "@/v4/assistantUsageLabel.js";
 import { parseConversationShareContext } from "@/lib/conversationShareContext.js";
 
 function RowShell({
@@ -1368,6 +1373,7 @@ export const ConversationAssistantTextActions = memo(function ConversationAssist
   hookInvocations,
   sessionId,
   turnId,
+  usage,
   onFork,
   onFeedbackChange,
   className,
@@ -1380,6 +1386,7 @@ export const ConversationAssistantTextActions = memo(function ConversationAssist
   hookInvocations?: readonly HookInvocationRow[];
   sessionId?: string | null;
   turnId?: string;
+  usage?: AssistantUsage | null;
   onFork?: (target: ConversationRowTarget) => void;
   onRetry?: (target: ConversationRowTarget) => void;
   onFeedbackChange?: AssistantFeedbackHandler;
@@ -1455,73 +1462,87 @@ export const ConversationAssistantTextActions = memo(function ConversationAssist
       });
     }
   }, [entityId, onFork, rowId]);
+  const usageLabel = formatAssistantUsageLabel(usage);
+  const usageTitle = formatAssistantUsageTitle(usage);
   return (
-    <MessageActions className={cn(className)}>
-      <CopyRowAction
-        text={text}
-        rowId={rowId}
-        label={copyLabel}
-        tooltip={resolveTooltip(copyLabel)}
-      />
-      {entityId && onFeedbackChange ? (
-        <>
-          <MessageAction
-            aria-label={likeLabel}
-            aria-pressed={localFeedback === "like"}
-            label={likeLabel}
-            tooltip={resolveTooltip(likeLabel)}
-            data-testid={testId(TID_V4_FEEDBACK_LIKE, String(rowId))}
-            className={localFeedback === "like" ? "!bg-success/10" : undefined}
-            onClick={() => handleFeedback("like")}
-          >
-            <span
-              className={cn(
-                "relative inline-flex",
-                localFeedback === "like" && "zcode-reaction-burst",
-              )}
-            >
-              <ThumbsUpIcon className="size-3.5" />
-            </span>
-          </MessageAction>
-          <MessageAction
-            aria-label={dislikeLabel}
-            aria-pressed={localFeedback === "dislike"}
-            label={dislikeLabel}
-            tooltip={resolveTooltip(dislikeLabel)}
-            data-testid={testId(TID_V4_FEEDBACK_DISLIKE, String(rowId))}
-            className={localFeedback === "dislike" ? "!bg-warning/10" : undefined}
-            onClick={() => handleFeedback("dislike")}
-          >
-            <span
-              className={cn(
-                "relative inline-flex",
-                localFeedback === "dislike" && "zcode-reaction-burst",
-              )}
-            >
-              <ThumbsDownIcon className="size-3.5" />
-            </span>
-          </MessageAction>
-        </>
-      ) : null}
-      {onFork && entityId ? (
-        <MessageAction
-          aria-label={forkLabel}
-          label={forkLabel}
-          tooltip={resolveTooltip(forkLabel)}
-          data-testid={testId(TID_V4_FORK, String(rowId))}
-          onClick={handleFork}
+    <MessageActions>
+      {/* token 用量 + 时间戳在最左（常显）；图标动作组在行尾悬停显现。
+          原实现图标组在最左，隐形时仍占位把用量挤到中间——用户反馈很怪。 */}
+      {usageLabel ? (
+        <span
+          title={usageTitle ?? undefined}
+          className="select-none text-ui-sm text-foreground-subtlest tabular-nums"
         >
-          <TrendingUpDownIcon className="size-3.5" />
-        </MessageAction>
-      ) : null}
-      {turnId && hookInvocations ? (
-        <ConversationHookDetailsAction rows={hookInvocations} turnId={turnId} />
+          {usageLabel}
+        </span>
       ) : null}
       {/* 旧 conversation surface 删除后，V4 动作栏漏掉了消息创建时间；
           时间是 row.createdAt 的只读派生展示，不新增 renderer 状态。 */}
       {timeLabel ? (
         <span className="select-none text-ui-sm text-foreground-subtlest">{timeLabel}</span>
       ) : null}
+      <div className={cn("flex items-center gap-1", className)}>
+        <CopyRowAction
+          text={text}
+          rowId={rowId}
+          label={copyLabel}
+          tooltip={resolveTooltip(copyLabel)}
+        />
+        {entityId && onFeedbackChange ? (
+          <>
+            <MessageAction
+              aria-label={likeLabel}
+              aria-pressed={localFeedback === "like"}
+              label={likeLabel}
+              tooltip={resolveTooltip(likeLabel)}
+              data-testid={testId(TID_V4_FEEDBACK_LIKE, String(rowId))}
+              className={localFeedback === "like" ? "!bg-success/10" : undefined}
+              onClick={() => handleFeedback("like")}
+            >
+              <span
+                className={cn(
+                  "relative inline-flex",
+                  localFeedback === "like" && "zcode-reaction-burst",
+                )}
+              >
+                <ThumbsUpIcon className="size-3.5" />
+              </span>
+            </MessageAction>
+            <MessageAction
+              aria-label={dislikeLabel}
+              aria-pressed={localFeedback === "dislike"}
+              label={dislikeLabel}
+              tooltip={resolveTooltip(dislikeLabel)}
+              data-testid={testId(TID_V4_FEEDBACK_DISLIKE, String(rowId))}
+              className={localFeedback === "dislike" ? "!bg-warning/10" : undefined}
+              onClick={() => handleFeedback("dislike")}
+            >
+              <span
+                className={cn(
+                  "relative inline-flex",
+                  localFeedback === "dislike" && "zcode-reaction-burst",
+                )}
+              >
+                <ThumbsDownIcon className="size-3.5" />
+              </span>
+            </MessageAction>
+          </>
+        ) : null}
+        {onFork && entityId ? (
+          <MessageAction
+            aria-label={forkLabel}
+            label={forkLabel}
+            tooltip={resolveTooltip(forkLabel)}
+            data-testid={testId(TID_V4_FORK, String(rowId))}
+            onClick={handleFork}
+          >
+            <TrendingUpDownIcon className="size-3.5" />
+          </MessageAction>
+        ) : null}
+        {turnId && hookInvocations ? (
+          <ConversationHookDetailsAction rows={hookInvocations} turnId={turnId} />
+        ) : null}
+      </div>
     </MessageActions>
   );
 });
@@ -1650,6 +1671,7 @@ const AssistantTextRowView = memo(function AssistantTextRowView({
           createdAt={row.createdAt}
           feedback={readAssistantFeedback(row)}
           sessionId={context.sessionId}
+          usage={row.usage}
           onFork={onFork}
           onRetry={onRetry}
           onFeedbackChange={onFeedbackChange}

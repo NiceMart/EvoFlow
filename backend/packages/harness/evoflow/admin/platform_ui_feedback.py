@@ -200,6 +200,7 @@ def _build_title(action: str, domain: str, verb: str, label: str, args: dict[str
         "employees.get": f"员工「{name}」",
         "employees.brief": f"员工「{name}」近况",
         "employees.list": "员工列表",
+        "employees.departments": "部门列表",
         "employees.org_status": "员工名册",
         "employees.board_overview": "员工看板",
         "employees.pause": f"已暂停员工「{name}」值班",
@@ -213,7 +214,6 @@ def _build_title(action: str, domain: str, verb: str, label: str, args: dict[str
         "agents.update": f"已更新智能体「{name}」配置",
         "agents.delete": f"已删除智能体「{name}」",
         "knowledge.create": f"已创建知识库「{name}」",
-        "knowledge.enable": f"知识库「{name}」已{'启用' if _arg_enabled(args, result) else '停用'}",
         "knowledge.ingest": f"已向知识库写入笔记「{name}」",
         "knowledge.note_delete": f"已删除笔记「{name}」",
         "knowledge.delete": f"已删除知识库「{name}」",
@@ -853,10 +853,11 @@ def _build_actions(
         )
     elif domain == "employees" and action in {
         "employees.list",
+        "employees.departments",
         "employees.org_status",
         "employees.board_overview",
     }:
-        # 列表 / 名册 / 看板 → 员工墙；详情走 /proactive/:code
+        # 列表 / 部门 / 名册 / 看板 → 员工墙；详情走 /proactive/:code
         actions.append(
             _shell_page_cta(
                 label="打开员工",
@@ -984,6 +985,7 @@ _SHELL_PAGE_READ_ACTIONS = frozenset({
     "employees.get",
     "employees.brief",
     "employees.list",
+    "employees.departments",
     "employees.org_status",
     "employees.board_overview",
     "employees.messages",

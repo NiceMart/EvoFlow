@@ -3596,9 +3596,15 @@ export function SessionPane({
       });
       // 同步落到 ~/.evoflow/logs/frontend-*.log，与 ChatApp stopSessionExecution 同源可对。
       void import("../../react/lib/stream-stop-log.js")
-        .then(({ logStreamStop }) => {
+        .then(({ logStreamStop, markStreamStopTrace, streamStopSinceMs }) => {
+          markStreamStopTrace({
+            threadId: sessionId,
+            runId: foregroundExecutionId ?? null,
+            source: stopTrigger,
+          });
           logStreamStop({
             sessionKey: sessionId,
+            threadId: sessionId,
             runId: foregroundExecutionId ?? null,
             trigger: stopTrigger,
             hasEndMarker: false,
@@ -3608,17 +3614,44 @@ export function SessionPane({
               whoZh,
               note: `V4 SessionPane 主动停止：${whoZh}`,
               uiSource: source,
+              sinceStopMs: 0,
             },
           });
+          void dispatchCommand(
+            "stop",
+            foregroundExecutionId ? { expectedForegroundExecutionId: foregroundExecutionId } : {},
+            sessionId,
+          )
+            .then(() => {
+              logStreamStop({
+                sessionKey: sessionId,
+                threadId: sessionId,
+                runId: foregroundExecutionId ?? null,
+                trigger: "stop_api_done",
+                hasEndMarker: false,
+                fromUiStopButton: false,
+                skipDedupe: true,
+                detail: {
+                  whoZh: "停止 API 已返回（V4 dispatchCommand stop）",
+                  note: "V4 stop 命令 ACK/返回；页面空闲看 ui_idle_after_stop + sinceStopMs",
+                  sinceStopMs: streamStopSinceMs({ threadId: sessionId }) ?? undefined,
+                  uiSource: source,
+                },
+              });
+            })
+            .catch((error) => {
+              logger.lifecycle.warn(`[v4-pane] stop 失败: ${String(error)}`);
+            });
         })
-        .catch(() => {});
-      void dispatchCommand(
-        "stop",
-        foregroundExecutionId ? { expectedForegroundExecutionId: foregroundExecutionId } : {},
-        sessionId,
-      ).catch((error) => {
-        logger.lifecycle.warn(`[v4-pane] stop 失败: ${String(error)}`);
-      });
+        .catch(() => {
+          void dispatchCommand(
+            "stop",
+            foregroundExecutionId ? { expectedForegroundExecutionId: foregroundExecutionId } : {},
+            sessionId,
+          ).catch((error) => {
+            logger.lifecycle.warn(`[v4-pane] stop 失败: ${String(error)}`);
+          });
+        });
     },
     [dispatchCommand, sessionId],
   );
@@ -3643,22 +3676,8 @@ export function SessionPane({
     });
   }, [dispatchCommand, sessionId]);
 
-  // composer parity：Esc → stop（旧 useChatViewEffects「Escape 停止生成」语义保真：
-  // 事件路径含 dialog / defaultPrevented 时跳过；mention/slash 面板打开时 Lexical 已
-  // preventDefault，本 handler 自然让路）。仅 focused pane 监听：
-  // 「stop 等危险操作永远作用于明确的 pane，快捷键走 focused pane」。
-  useEffect(() => {
-    if (!focused || readOnly) return;
-    if (!sessionId || !liveExecutionBusy) return;
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      if (shouldIgnoreEscapeForStopGeneration(event)) return;
-      event.preventDefault();
-      handleStop("escape");
-    };
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [focused, handleStop, liveExecutionBusy, readOnly, sessionId]);
+  // composer parity：Esc → stop effect 依赖 liveExecutionBusy（下方 stop/gear 区声明），
+  // 已整体移到该声明之后（避免 TDZ 型 TS 错误）。
 
   // handleStop 带 source 参数（button / escape 两个调用点），但 ConversationComposer 是 memo：
   // 直接写 onStop={() => handleStop("button")} 每次 render 都换引用，memo 白做，而 composer
@@ -3684,15 +3703,18 @@ export function SessionPane({
   }, [lease, snapshot?.logEpoch]);
 
   useEffect(() => {
-    if (!shareActive || !sessionId || !hasOlderRows(snapshot)) return;
+    if (!shareActive || !sessionId || !lease?.store || !hasOlderRows(snapshot)) return;
     const key = `${sessionId}:${snapshot?.logEpoch ?? "unknown"}`;
     if (shareHydratedSessionRef.current === key) return;
     shareHydratedSessionRef.current = key;
-    void handleLoadAllOlder().catch((error) => {
-      shareHydratedSessionRef.current = null;
-      logger.warn("[conversation-share] 补齐分享目录失败", { error });
-    });
-  }, [handleLoadAllOlder, sessionId, shareActive, snapshot]);
+    // 分享需要尽量完整的问题目录，走更大 softCap，勿用日常渲染的 400 行顶。
+    void lease.store
+      .loadAllOlder({ forShare: true })
+      .catch((error) => {
+        shareHydratedSessionRef.current = null;
+        logger.warn("[conversation-share] 补齐分享目录失败", { error });
+      });
+  }, [lease, sessionId, shareActive, snapshot]);
 
   useEffect(() => {
     if (
@@ -3921,6 +3943,22 @@ export function SessionPane({
     snapshot,
     runningBackgroundWorkCountForStop,
   );
+  // composer parity：Esc → stop（旧 useChatViewEffects「Escape 停止生成」语义保真：
+  // 事件路径含 dialog / defaultPrevented 时跳过；mention/slash 面板打开时 Lexical 已
+  // preventDefault，本 handler 自然让路）。仅 focused pane 监听：
+  // 「stop 等危险操作永远作用于明确的 pane，快捷键走 focused pane」。
+  useEffect(() => {
+    if (!focused || readOnly) return;
+    if (!sessionId || !liveExecutionBusy) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      if (shouldIgnoreEscapeForStopGeneration(event)) return;
+      event.preventDefault();
+      handleStop("escape");
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [focused, handleStop, liveExecutionBusy, readOnly, sessionId]);
   useEffect(() => {
     setTerminalSectionOpen(false);
     setAgentSectionOpen(false);

@@ -174,6 +174,32 @@ export async function runDeptMemberWorkTurn(
     .map((m) => String(m.role_name || m.agent_code || '').trim())
     .filter(Boolean)
     .slice(0, 40)
+  // 岗位思考 / 工作模型写在 role.config；群聊 sticky 原先不带 → 跟错默认。
+  // 每轮从岗位回填，与 1:1 摘要面板一致（后端 apply_role_* 再兜底）。
+  let roleRuntimePatch: Record<string, unknown> = {}
+  try {
+    const roleRes = await api.proactiveGetRole(code, { silent: true, skipRetry: true })
+    const role = roleRes?.role || roleRes
+    const cfg = role?.config && typeof role.config === 'object' ? role.config : {}
+    const te = cfg.thinking_enabled
+    if (te === true || te === false) {
+      roleRuntimePatch = {
+        ...roleRuntimePatch,
+        thinking_enabled: te,
+        thinking_type: 'manual',
+        reasoning_effort: te ? 'medium' : 'minimum',
+      }
+    }
+    const model = String(cfg.model_name || '').trim()
+    if (model && model.toLowerCase() !== 'default') {
+      // 配置类回填必须带 model_pinned=0（写入纪律，docs/design/model-resolution.md）：
+      // 否则会被当成用户 pin，岗位改模型后 sticky 会话跟不过去。
+      roleRuntimePatch = { ...roleRuntimePatch, model_name: model, model_pinned: false }
+    }
+  } catch {
+    /* 岗位拉不到时交给后端 apply_role_*_to_run_cfg */
+  }
+
   const sessionCtx = {
     source: 'proactive',
     proactive_agent_code: code,
@@ -191,6 +217,7 @@ export async function runDeptMemberWorkTurn(
     dept_group_steward: stewardMode,
     // 花名册进系统提示（dept_group_im）；勿再塞进用户消息
     dept_group_roster: rosterNames,
+    ...roleRuntimePatch,
   }
 
   try {

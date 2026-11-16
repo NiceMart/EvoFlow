@@ -15,7 +15,9 @@ session 时，把旧链路的 transcript（``evoflow_chat_messages``，与
 
 映射规则（v1）：
 - 按 ``run_id`` 分组 = turn（缺 run_id 的消息归入前一连续段）；每组先落
-  turnHeader（历史轮一律 completedSuccess，无运行中的轮）；
+  turnHeader（历史轮一律 completedSuccess；**当前 run 若 DB 仍在跑且新鲜
+  （``_probe_running_run``）→ 最后一轮保持 running，并写 running control
+  override——刷新/重连后 isRunning/停止键/轮尾 loading 恢复**）；
 - assistant.tool_calls 先建 toolCall 行（running），随后同 turn 的 tool 行按
   tool_call_id 回填 status/output；
 - tool 结果：与 live ``agui_mirror`` 对齐，从正文尾部
@@ -32,12 +34,21 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 _HYDRATION_MAX_MESSAGES = 2000
+
+# 运行态恢复探测（生命周期四件套第 1 件 / Phase B）：DB run_status=running 且
+# updated_at 在此窗口内才信。超窗疑似 zombie，交 run_status_reconcile / zombie
+# sweeper 收尾——hydrate 保持纯读，绝不 cancel。
+_RUNNING_PROBE_MAX_AGE_MS = max(
+    30_000,
+    int(os.getenv("EVOFLOW_V4_HYDRATE_RUNNING_MAX_AGE_S", "120") or "120") * 1000,
+)
 
 # 与 chat_message_repositories._HIDDEN_CONTEXT_USER_NAMES 对齐（避免 raw 回落路径漏滤）。
 _HIDDEN_CONTEXT_USER_TOOL_NAMES = frozenset(
@@ -259,11 +270,50 @@ def _build_hydrated_tool_output(
     input_text: str = "",
     thread_id: str = "",
 ) -> dict[str, Any]:
-    """Build ``output = {text, display?}`` for a hydrated tool row.
+    """Build ``output = {text, display?}`` for a hydrated tool row（出口处截断预览）。
 
     Live 路径由 ``agui_mirror`` 把 CUA 标记剥成 ``output.display``；冷恢复必须
     用同一逻辑，否则刷新后轮尾截图/应用徽标消失（正文仍在，面板无图）。
+
+    行内 ``output.text`` 只留预览（与 live agui_mirror._TOOL_OUTPUT_ROW_PREVIEW_MAX
+    同阈值）：transcript 里的巨型工具结果（视频生成 base64 等，实测单条 10MB）不进
+    投影行——快照字节预算收缩与 renderer OOM 的根因；全文走 /tool-results 按需拉取。
+    截断只作用在最终 text：display 构建（platform 出码 / CUA / 截图 JSON 解析）
+    全程使用全文。
     """
+    output = _build_hydrated_tool_output_full(
+        tool_name=tool_name,
+        out_text=out_text,
+        status=status,
+        payload=payload,
+        msg=msg,
+        input_text=input_text,
+        thread_id=thread_id,
+    )
+    row_text = output.get("text")
+    if isinstance(row_text, str) and len(row_text) > _TOOL_OUTPUT_ROW_PREVIEW_MAX_LOCAL:
+        output["text"] = (
+            row_text[:_TOOL_OUTPUT_ROW_PREVIEW_MAX_LOCAL]
+            + "\n…（已截断，完整内容点开工具卡查看）"
+        )
+    return output
+
+
+# 与 live agui_mirror._TOOL_OUTPUT_ROW_PREVIEW_MAX 同阈值；本地常量避免循环 import。
+_TOOL_OUTPUT_ROW_PREVIEW_MAX_LOCAL = 12_000
+
+
+def _build_hydrated_tool_output_full(
+    *,
+    tool_name: str,
+    out_text: str,
+    status: str,
+    payload: dict[str, Any] | None = None,
+    msg: dict[str, Any] | None = None,
+    input_text: str = "",
+    thread_id: str = "",
+) -> dict[str, Any]:
+    """同 {@link _build_hydrated_tool_output}，但 output.text 不截断（内部实现）。"""
     from app.gateway.v4.agui_mirror import (
         _cua_display_block,
         _extract_diff_texts_from_args_dict,
@@ -372,7 +422,9 @@ def _load_raw_messages_by_thread(thread_id: str) -> list[dict[str, Any]]:
     cursor = con.execute(
         """
         SELECT id, role, message_id, content_json, tool_call_id, tool_name,
-               run_id, thread_id, created_at
+               run_id, thread_id, created_at,
+               input_tokens, output_tokens, total_tokens,
+               cache_read_tokens, cache_creation_tokens, cache_miss_tokens
         FROM evoflow_chat_messages
         WHERE thread_id = ?
         ORDER BY seq ASC
@@ -398,6 +450,48 @@ def _coerce_messages_run_ids(messages: list[dict[str, Any]]) -> list[dict[str, A
     except Exception:
         logger.debug("[v4.hydration] enrich_run_ids skipped", exc_info=True)
         return list(messages or [])
+
+
+# evoflow_chat_messages 六个 token 列（harness transcript 每条 assistant 行带
+# 自己那次模型调用的 per-call usage；normalize_usage_counts 已归一化各家缓存字段）。
+_USAGE_SUM_KEYS = (
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "cache_read_tokens",
+    "cache_creation_tokens",
+    "cache_miss_tokens",
+)
+
+
+def _turn_usage_from_messages(messages: list[dict[str, Any]]) -> dict[str, int] | None:
+    """该轮 assistant 消息的 token 六字段求和 → assistantTextRow.usage（camelCase）。
+
+    per-call 求和即轮累计，与 live mirror 消费的 CUSTOM(name="usage")（同样是各次
+    模型调用累计，sse_ui_normalize._cumulative_usage_triplet）同口径；Anthropic 风格
+    per-call input 已含 cache_read/write，直接累加不重不漏。全 0 / 无值返回 None
+    （老会话没有 usage 列值 → 该轮不显示）。
+    """
+    sums = {key: 0 for key in _USAGE_SUM_KEYS}
+    for msg in messages:
+        if str(msg.get("role") or "") != "assistant":
+            continue
+        for key in _USAGE_SUM_KEYS:
+            value = msg.get(key)
+            if isinstance(value, (int, float)) and value > 0:
+                sums[key] += int(value)
+    if sums["input_tokens"] <= 0 and sums["output_tokens"] <= 0 and sums["total_tokens"] <= 0:
+        return None
+    usage: dict[str, int] = {
+        "inputTokens": sums["input_tokens"],
+        "outputTokens": sums["output_tokens"],
+        "totalTokens": sums["total_tokens"],
+    }
+    if sums["cache_read_tokens"] > 0:
+        usage["cacheReadTokens"] = sums["cache_read_tokens"]
+    if sums["cache_creation_tokens"] > 0:
+        usage["cacheWriteTokens"] = sums["cache_creation_tokens"]
+    return usage
 
 
 def _load_messages(thread_id: str) -> list[dict[str, Any]]:
@@ -526,6 +620,88 @@ def rehydrate_after_thread_remint(thread_id: str) -> int:
         return 0
 
 
+def read_run_status_row(thread_id: str) -> dict[str, Any] | None:
+    """读原始 run_status 行（**不做**新鲜窗判定）。
+
+    ``_probe_running_run`` 用于「恢复 running」——超窗宁可当作已完成；
+    终态收口（catchup / reconcile）需要相反方向的证据：只要 DB 明确给出
+    终态（done/success/fail/cancelled/…）就允许把陈旧 running control
+    settle 掉。running 且超窗在这条路径上**不**当终态（疑似 zombie，
+    交 zombie sweeper），返回原值让调用方保守处理。
+    """
+    tid = str(thread_id or "").strip()
+    if not tid:
+        return None
+    try:
+        from evoflow.persistence.db import run_db_read
+
+        def _query(conn: Any) -> Any:
+            return conn.execute(
+                """
+                SELECT run_status, updated_at, current_run_id
+                FROM evoflow_chat_sessions
+                WHERE is_deleted = 0 AND thread_id = ?
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (tid,),
+            ).fetchone()
+
+        row = run_db_read(_query)
+    except Exception:
+        logger.debug("[v4.hydration] run status read failed thread=%s", tid, exc_info=True)
+        return None
+    if not row:
+        return None
+    updated_ms = 0
+    raw_updated = str(row[1] or "").strip()
+    if raw_updated:
+        try:
+            from evoflow.persistence.timestamps import iso_z_to_ms
+
+            updated_ms = int(iso_z_to_ms(raw_updated) or 0)
+        except Exception:
+            updated_ms = 0
+    return {
+        "status": str(row[0] or "").strip().lower(),
+        "updated_at_ms": updated_ms,
+        "run_id": str(row[2] or "").strip(),
+    }
+
+
+def _probe_running_run(thread_id: str) -> dict[str, Any] | None:
+    """DB run_status 探测：running/pending 且 updated_at 新鲜 → 返回运行态摘要。
+
+    只读（read pool，hydrate 已在 to_thread 里），不做 cancel——zombie 交
+    run_status_reconcile / zombie sweeper。status 非活跃或超窗返回 None。
+    """
+    tid = str(thread_id or "").strip()
+    if not tid:
+        return None
+    row = read_run_status_row(tid)
+    if not row:
+        return None
+    status = str(row.get("status") or "").strip().lower()
+    if status not in {"running", "pending"}:
+        return None
+    updated_ms = int(row.get("updated_at_ms") or 0)
+    now_ms = int(time.time() * 1000)
+    if updated_ms <= 0 or now_ms - updated_ms > _RUNNING_PROBE_MAX_AGE_MS:
+        # running 但不新鲜：疑似 zombie，hydrate 维持「已完成」现状。
+        logger.debug(
+            "[v4.hydration] running probe stale thread=%s status=%s age_ms=%s",
+            tid,
+            status,
+            now_ms - updated_ms if updated_ms else -1,
+        )
+        return None
+    return {
+        "run_id": str(row.get("run_id") or "").strip(),
+        "status": status,
+        "updated_at_ms": updated_ms,
+    }
+
+
 def hydrate_session_from_transcript(hub: Any, thread_id: str) -> int:
     """把 thread 的持久 transcript hydrate 成 v4 行。返回写入的行数（0=跳过/无历史）。
 
@@ -612,10 +788,24 @@ def hydrate_session_from_transcript(hub: Any, thread_id: str) -> int:
     #    禁止逐行 author_append_row：会对全局 _write_lock + delta_log 打 N 次，
     #    与 live AG-UI 抢锁把 Gateway 事件循环拖死（多会话卡机）。
     #    turnHeader 最后写入（携带真实起止 + fileChanges 聚合），rowId 先分配保排序。
+    #
+    #    createdAt 必须吃消息真实时间并跨轮单调——旧逻辑整轮盖 now_ms，而
+    #    turnHeader.createdAt=turn_start，软窗里会出现
+    #    assistantText@now → 下一轮 turnHeader@更早，前端 display_order_anomaly。
     seeded_rows: list[dict[str, Any]] = []
+    seed_clock_ms = 0
     for turn in turns:
         turn_id = str(turn["run_id"])
-        created_at = now_ms
+        msg_times = [t for t in (_msg_timestamp_ms(m) for m in turn["messages"]) if t]
+        turn_start = min(msg_times) if msg_times else now_ms
+        turn_end = max(msg_times) if msg_times else now_ms
+        for msg in turn["messages"]:
+            started = _msg_timestamp_ms(msg)
+            dur = msg.get("turn_duration_ms")
+            if started and isinstance(dur, (int, float)) and dur > 0:
+                turn_end = max(turn_end, int(started + dur))
+        header_created_at = max(int(turn_start), seed_clock_ms)
+        seed_clock_ms = header_created_at
         header_row_id = next_row_id()
         rows: list[dict[str, Any]] = []
         tool_row_by_call_id: dict[str, dict[str, Any]] = {}
@@ -627,6 +817,9 @@ def hydrate_session_from_transcript(hub: Any, thread_id: str) -> int:
             role = str(msg.get("role") or "")
             msg_id = str(msg.get("id") or msg.get("message_id") or "")
             payload = parse_content(msg)
+            msg_ts = _msg_timestamp_ms(msg) or turn_start or now_ms
+            created_at = max(int(msg_ts), seed_clock_ms)
+            seed_clock_ms = created_at
 
             if role == "user":
                 text = _text_from_message_content(payload)
@@ -822,17 +1015,6 @@ def hydrate_session_from_transcript(hub: Any, thread_id: str) -> int:
                     row["error"] = {"code": "tool_error", "message": err_text[:2000]}
                 rows.append(row)
 
-        # 真实轮起止：display 路径用 turn_started_at/turn_duration_ms，raw 路径用
-        # created_at（ISO）；都没有则退化为同一时刻（工时 0）。
-        starts = [t for t in (_msg_timestamp_ms(m) for m in turn["messages"]) if t]
-        turn_start = min(starts) if starts else created_at
-        turn_end = max(starts) if starts else created_at
-        for msg in turn["messages"]:
-            started = _msg_timestamp_ms(msg)
-            dur = msg.get("turn_duration_ms")
-            if started and isinstance(dur, (int, float)) and dur > 0:
-                turn_end = max(turn_end, int(started + dur))
-
         # 轮级文件变更聚合（ZCode「N 个文件已更改 +A/-D」卡片 = turnHeader.fileChanges）。
         file_agg: dict[str, dict[str, int]] = {}
         for row in rows:
@@ -841,6 +1023,16 @@ def hydrate_session_from_transcript(hub: Any, thread_id: str) -> int:
                 agg = file_agg.setdefault(str(display.get("filePath")), {"additions": 0, "deletions": 0})
                 agg["additions"] += int(display.get("additions") or 0)
                 agg["deletions"] += int(display.get("deletions") or 0)
+
+        # 轮累计 token 用量盖轮尾正文行（V4 动作行显示；live 轮由 mirror 的
+        # CUSTOM(name="usage") 盖章，两侧口径一致）。正在跑的最后一轮也先盖——
+        # mirror 接管后终态帧会以同形状覆盖。
+        turn_usage_row = _turn_usage_from_messages(turn["messages"])
+        if turn_usage_row is not None:
+            for row in reversed(rows):
+                if row.get("kind") == "assistantText":
+                    row["usage"] = turn_usage_row
+                    break
 
         header_row: dict[str, Any] = {
             "rowId": header_row_id,
@@ -851,9 +1043,11 @@ def hydrate_session_from_transcript(hub: Any, thread_id: str) -> int:
             "state": "completedSuccess",
             "startedAt": turn_start,
             "endedAt": turn_end,
-            "createdAt": turn_start,
+            "createdAt": header_created_at,
             "createdAtSeq": 0,
         }
+        if rows:
+            seed_clock_ms = max(seed_clock_ms, int(rows[-1].get("createdAt") or seed_clock_ms))
         if file_agg:
             header_row["fileChanges"] = {
                 "additions": sum(v["additions"] for v in file_agg.values()),
@@ -863,6 +1057,36 @@ def hydrate_session_from_transcript(hub: Any, thread_id: str) -> int:
 
         seeded_rows.append(header_row)
         seeded_rows.extend(rows)
+
+    # ── 运行态恢复（生命周期四件套第 1 件 / Phase B）────────────────────────
+    # mirror 活跃时跳过（在线镜像才是真值；正常 mirror live ⇒ rows 非空早已
+    # return 0，这里是「探测与 RUN_STARTED 竞态」的守卫）。命中且探测 run_id
+    # 与最后一轮 turnId 一致 → 该轮 turnHeader 保持 running（不再一律盖
+    # completedSuccess）；run_id 不一致（run 刚起还没落任何消息）只恢复 control
+    # 不动历史轮——避免把上一轮错标成 running。
+    running_restore: dict[str, Any] | None = None
+    try:
+        from app.gateway.v4.agui_mirror import mirror_thread_is_live
+
+        mirror_live = bool(mirror_thread_is_live(tid))
+    except Exception:
+        mirror_live = False
+    if not mirror_live:
+        running_restore = _probe_running_run(tid)
+    if running_restore:
+        probe_run_id = str(running_restore.get("run_id") or "").strip()
+        last_header = next(
+            (r for r in reversed(seeded_rows) if r.get("kind") == "turnHeader"), None
+        )
+        matches_last_turn = bool(
+            last_header
+            and probe_run_id
+            and str(last_header.get("turnId") or "").strip() == probe_run_id
+        )
+        if matches_last_turn and last_header is not None:
+            last_header["state"] = "running"
+            last_header.pop("endedAt", None)
+        running_restore["_restore_header"] = bool(matches_last_turn)
 
     seed = getattr(hub, "author_seed_rows", None)
     if callable(seed):
@@ -878,6 +1102,31 @@ def hydrate_session_from_transcript(hub: Any, thread_id: str) -> int:
     if sess_final is not None and row_count > 0:
         # 与 observer catchup 指纹对齐，避免首轮 catchup 无意义 force-wipe。
         sess_final.catchup_fp = transcript_fingerprint(messages)
+    if running_restore:
+        # running control override：刷新/重连后快照 control=running/canStop=true，
+        # 前端 isRunning/停止键全部恢复（snapshot 与增量同源，见 Phase A）。
+        try:
+            from app.gateway.v4.conversation import _minimal_control
+
+            started_at = 0
+            if running_restore.get("_restore_header"):
+                last_header = next(
+                    (r for r in reversed(seeded_rows) if r.get("kind") == "turnHeader"), None
+                )
+                started_at = int((last_header or {}).get("startedAt") or 0)
+            hub.set_control_override(
+                tid, _minimal_control("running", run_started_at=started_at or None)
+            )
+            logger.info(
+                "[v4.hydration] running run restored thread=%s run_id=%s header=%s",
+                tid,
+                running_restore.get("run_id"),
+                bool(running_restore.get("_restore_header")),
+            )
+        except Exception:
+            logger.debug(
+                "[v4.hydration] running control restore failed thread=%s", tid, exc_info=True
+            )
     logger.info(
         "[v4.hydration] thread=%s rows=%d messages=%d seq=%s",
         tid,
@@ -891,6 +1140,7 @@ def hydrate_session_from_transcript(hub: Any, thread_id: str) -> int:
 __all__ = [
     "hydrate_session_from_transcript",
     "force_rehydrate_session_from_transcript",
+    "read_run_status_row",
     "transcript_fingerprint",
     "transcript_fingerprint_for_thread",
 ]

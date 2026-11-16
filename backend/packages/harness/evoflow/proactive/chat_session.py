@@ -173,6 +173,93 @@ def is_proactive_session_key(session_key: str | None) -> bool:
     return str(session_key or "").strip().startswith("proactive:")
 
 
+def apply_role_thinking_to_run_cfg(cfg: dict[str, Any] | None) -> None:
+    """Fill ``thinking_*`` from the employee role when the session did not pin it.
+
+    The employee rail toggle writes ``role.config.thinking_enabled`` (岗位偏好).
+    Duty/patrol runs already inject it via ``proactive.engine``. Interactive
+    paths (1:1 sticky, **dept group** ``proactive:{code}:chat:dept-…``) often
+    omit ``thinking_enabled`` / ``thinking_type`` → model ``default_mode=enabled``
+    re-opens thinking and the rail switch looks broken.
+
+    Precedence: if the run already set ``thinking_enabled`` or ``thinking_type``,
+    leave it alone. Otherwise, when the role has an explicit bool, pin
+    ``thinking_type=manual`` so model defaults cannot override.
+    """
+    if not isinstance(cfg, dict):
+        return
+    if cfg.get("thinking_enabled") is not None:
+        return
+    if str(cfg.get("thinking_type") or "").strip():
+        return
+
+    code = str(
+        cfg.get("proactive_agent_code") or cfg.get("agent_id") or cfg.get("agent_name") or ""
+    ).strip()
+    sk = str(cfg.get("session_key") or "").strip()
+    if not code and sk and is_proactive_session_key(sk):
+        code = proactive_agent_code_from_session_key(sk)
+    if not code or is_non_employee_session_code(code):
+        return
+    try:
+        from evoflow.proactive.repositories import ProactiveRepository
+
+        role = ProactiveRepository.get_role(code)
+    except Exception:
+        return
+    if role is None:
+        return
+    te = getattr(getattr(role, "config", None), "thinking_enabled", None)
+    if te is None:
+        return
+    on = bool(te)
+    cfg["thinking_enabled"] = on
+    cfg["thinking_type"] = "manual"
+    cfg["reasoning_effort"] = "medium" if on else "minimum"
+
+
+def apply_role_model_to_run_cfg(cfg: dict[str, Any] | None) -> None:
+    """Fill ``model_name`` from the employee role when the session did not pin it.
+
+    BOT 页「工作/执行模型」写在 ``role.config.model_name``。值班轮已由
+    ``proactive.engine`` 注入；交互会话（新开对话 / 群聊 sticky）常省略
+    ``model_name`` → 回落到智能体/全局默认，UI 与真跑模型都对不上岗位配置。
+
+    Precedence: existing ``model_name`` / ``model`` wins. Empty / ``default``
+    counts as unset (same as ``resolve_run_model``).
+    """
+    if not isinstance(cfg, dict):
+        return
+    for key in ("model_name", "model"):
+        raw = cfg.get(key)
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if text and text.lower() != "default":
+            return
+
+    code = str(
+        cfg.get("proactive_agent_code") or cfg.get("agent_id") or cfg.get("agent_name") or ""
+    ).strip()
+    sk = str(cfg.get("session_key") or "").strip()
+    if not code and sk and is_proactive_session_key(sk):
+        code = proactive_agent_code_from_session_key(sk)
+    if not code or is_non_employee_session_code(code):
+        return
+    try:
+        from evoflow.proactive.repositories import ProactiveRepository
+
+        role = ProactiveRepository.get_role(code)
+    except Exception:
+        return
+    if role is None:
+        return
+    model = str(getattr(getattr(role, "config", None), "model_name", None) or "").strip()
+    if not model or model.lower() == "default":
+        return
+    cfg["model_name"] = model
+
+
 # Session keys owned by an IM channel instance look like ``agent:{code}:{channel}:{chat}``
 # (shared/primary bot) while employee-panel runs use ``proactive:{code}:...``.
 # Employee deletion must sweep BOTH, otherwise Feishu chats of a deleted employee
@@ -274,6 +361,56 @@ def resolve_work_session_key(
     # duty default: one session per round stamp
     rid = str(round_id or stamp or "").strip()
     return proactive_duty_session_key(code, rid or None)
+
+
+def normalize_pinned_session_key(agent_code: str, raw_session_key: str | None) -> str:
+    """Validate a caller-pinned conversation key; return "" when it must be ignored.
+
+    【fullstack-dev · 2026-11-15 · 第17轮】自验证闭环装完机要把唤醒投回**用户正看着的
+    那一屏**，而 `resolve_work_session_key` 只会产 task/duty 两支，真人对话键
+    （``proactive:{code}:chat:{stamp}``）永远选不到。这里做单一口径校验，读侧（engine）
+    与写侧（router / CLI admin）共用，避免两处判定漂移。
+
+    复用 `_employee_owns_session_key` 的语义（同 admin/employees.py）：键必须属于该岗位，
+    否则会把消息投进别人的会话。平台注入的 ambient 键（``agent:main:…``）一律丢弃，
+    调用方据此退回默认 task/duty 桶，不报错——与 chat_send 的 ``ignored_caller_session`` 一致。
+    """
+    from evoflow.proactive.chat_session import parse_proactive_session_key
+
+    code = str(agent_code or "").strip()
+    sk = str(raw_session_key or "").strip()
+    if not code or not sk:
+        return ""
+    if not sk.startswith("proactive:"):
+        return ""
+    parsed = parse_proactive_session_key(sk)
+    if str(parsed.get("agent_code") or "").strip() != code:
+        return ""
+    if parsed.get("legacy"):
+        # 老键（proactive:{code}）没有 kind，钉上去会把值班轮灌进历史语义不明的会话
+        return ""
+    return sk
+
+
+def pinned_session_thread_id(session_key: str) -> str:
+    """Existing LangGraph thread bound to this session, or "" when there is none.
+
+    【fullstack-dev · 2026-11-15 · 第17轮】钉住真人对话键时必须**复用该会话已有线程**：
+    每轮新建 thread 会把 `evoflow_chat_sessions.thread_id` 覆写掉，用户下一句就落到只含
+    值班提示词的新线程上（值班轮 run_input 只有一条 user_prompt）——等于把这一屏的上下文
+    换掉。复用现线程则 checkpoint 直接带着本对话历史，模型接着聊而不是另起炉灶。
+    """
+    sk = str(session_key or "").strip()
+    if not sk:
+        return ""
+    try:
+        from evoflow.persistence import session_repositories as sess_repo
+
+        row = sess_repo.load_session_map().get(sk) or {}
+        return str(row.get("threadId") or row.get("thread_id") or "").strip()
+    except Exception:
+        logger.debug("pinned_session_thread_id failed session_key=%s", sk, exc_info=True)
+        return ""
 
 
 def resolve_transcript_round_id(session_key: str, round_id: str | None) -> str | None:
@@ -526,6 +663,10 @@ def prepare_proactive_chat_session(
     task_title: str | None = None,
     workspace_kind: str | None = None,
     workspace_root: str | None = None,
+    # 【fullstack-dev · 2026-11-15 · 第17轮】钉回真人会话时保标题：_session_title 对 chat 恒产
+    # 「{岗位} · 对话」，会把用户自己起的会话名改掉（resolve_session_title_for_upsert 里
+    # 非占位标题是直接覆盖）。传 None 给 title → SQL 空串 → ON CONFLICT 保留原标题。
+    preserve_title: bool = False,
 ) -> str | None:
     """Before a LangGraph run: upsert conversation session + seed brief/beat."""
     code = str(agent_code).strip()
@@ -576,13 +717,17 @@ def prepare_proactive_chat_session(
 
         rid = str(round_id or "").strip() or None
         related_task = str(task_id or "").strip() or None
-        title = _session_title(
-            role_name=role_name,
-            agent_code=code,
-            workspace_kind=wk,
-            task_id=related_task,
-            task_title=task_title,
-            round_id=rid,
+        title = (
+            None
+            if preserve_title
+            else _session_title(
+                role_name=role_name,
+                agent_code=code,
+                workspace_kind=wk,
+                task_id=related_task,
+                task_title=task_title,
+                round_id=rid,
+            )
         )
         ctx: dict[str, Any] = {
             "source": "proactive",

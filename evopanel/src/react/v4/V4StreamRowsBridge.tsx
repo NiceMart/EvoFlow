@@ -33,9 +33,20 @@ import { markStreamCompareSession } from "../lib/stream-compare-file-log.js";
 import { bindOpenTraceThread, endOpenTrace, markOpenStage } from "@zcode/ui/lib/openTrace.js";
 import { publishV4DisplayAuthority } from "./v4Gate.js";
 import { setV4TimelineBusy } from "./v4-timeline-busy-store.js";
-import { resolveLiveExecutionBusyFromSnapshot } from "../../zcode-ui/v4/live-execution-busy.js";
-import { getSessionRuntime, noteSessionEvent } from "../lib/session-runtime-store.js";
+import { resolveSessionBusyFromControl } from "./control-busy.js";
+import {
+  getSessionRuntime,
+  isLivePostStreamOpen,
+  isTurnBusy,
+  noteSessionEvent,
+} from "../lib/session-runtime-store.js";
+import { isSessionRecoveryCooldownActive } from "../lib/stream-reattach-cooldown.js";
 import { evoflowFetch } from "../../lib/ws-client.js";
+import {
+  noteRendererMemoryPressure,
+  pinMaxForMemoryLevel,
+  resolveRendererMemoryLevel,
+} from "../lib/renderer-memory-pressure.js";
 
 export interface V4TimelinePayload {
   sessionId: string;
@@ -43,6 +54,8 @@ export interface V4TimelinePayload {
   status: StoreState["status"];
   loadingOlder: boolean;
   onLoadOlder: () => Promise<void> | void;
+  /** 快照自动补拉（恢复可视性）：fresh subscribe / resync 后尾窗截断历史时用。 */
+  onAutoBackfill: () => Promise<void> | void;
 }
 
 export type V4BridgePhase =
@@ -81,13 +94,73 @@ const WARM_COLD_WINDOW_MS = 3_000;
 const WARM_COLD_MAX_PER_WINDOW = 1;
 const WARM_MAX_LIVE_SESSIONS = 4;
 /** 多会话并跑：钉住最近/执行中会话的租约，避免 30s keep-warm 过期后冷开空白。 */
-const PIN_MAX_SESSIONS = 4;
+const PIN_MAX_SESSIONS_DEFAULT = 4;
+/**
+ * 超大投影（复刻长会话常 1k–2k+ 行）后台 pin 会拖死 Gateway hydrate / context PATCH，
+ * 表现为「两个对话在跑时点别的会话一直 connecting」。同屏最多钉住 1 条超大会话。
+ */
+const MEGA_PIN_ROW_SOFT_CAP = 900;
+const MEGA_PIN_MAX = 1;
 let _warmColdTimestamps: number[] = [];
 const _pinnedLeases = new Map<string, SessionLease>();
 /** threadId → 取消 pin busy 订阅 */
 const _pinBusyUnsubs = new Map<string, () => void>();
 /** threadId → sessionKey（侧栏 busy 与 runtime lastEventAt 用 sessionKey） */
 const _pinSessionKeyByThread = new Map<string, string>();
+let _memPressureTimer: ReturnType<typeof setInterval> | null = null;
+
+function _ensureMemoryPressureWatch(): void {
+  if (_memPressureTimer != null || typeof window === "undefined") return;
+  _memPressureTimer = setInterval(() => {
+    try {
+      const level = noteRendererMemoryPressure({
+        pinned: _pinnedLeases.size,
+        layerSize: getSharedLayer().size,
+      });
+      if (level === "normal") return;
+      // 高压：只留 pin + 当前层已有 ref 的会话，清掉纯 keep-warm，防多会话投影叠爆 WebView。
+      const keep = [..._pinnedLeases.keys()];
+      const closed = getSharedLayer().releaseKeepWarmExcept(keep);
+      if (closed > 0) {
+        logV4Life({
+          event: "mem_pressure_evict_warm",
+          level: level === "critical" ? "error" : "warn",
+          zh: `渲染内存${level === "critical" ? "危急" : "偏高"}：清掉 ${closed} 条 keep-warm 投影，避免 WebView Out of Memory。`,
+          detail: { closed, level, pinned: _pinnedLeases.size },
+          skipDedupe: true,
+        });
+      }
+    } catch {
+      /* best-effort */
+    }
+  }, 15_000);
+}
+
+try {
+  _ensureMemoryPressureWatch();
+} catch {
+  /* ignore */
+}
+
+function _leaseRowCount(lease: SessionLease): number {
+  try {
+    const st = lease.store.getState();
+    return st.snapshot?.rows?.totalCount ?? st.snapshot?.rows?.window?.length ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
+function _pinnedMegaCount(): number {
+  let n = 0;
+  for (const lease of _pinnedLeases.values()) {
+    if (_leaseRowCount(lease) >= MEGA_PIN_ROW_SOFT_CAP) n += 1;
+  }
+  return n;
+}
+
+/** pin busy 订阅指纹：同 store+sk 已订则只推一次，避免 sync 循环撕订触发 #185 */
+const _pinBusyBindKey = new Map<string, string>();
 
 function _pushPinBusyFromStore(
   threadId: string,
@@ -97,7 +170,29 @@ function _pushPinBusyFromStore(
   const sk = String(sessionKey || "").trim();
   const tid = String(threadId || "").trim();
   if (!sk || !tid) return;
+  const bindKey = `${sk}::${tid}`;
   const prevUnsub = _pinBusyUnsubs.get(tid);
+  if (prevUnsub && _pinBusyBindKey.get(tid) === bindKey) {
+    // 已订同一会话：只同步一次 busy，不拆订阅（拆订+重订会在投影帧风暴里放大更新）
+    try {
+      const rt = getSessionRuntime(sk);
+      if (isSessionRecoveryCooldownActive(sk) || rt.uiTurnSettled) {
+        setV4TimelineBusy(sk, false);
+        return;
+      }
+      const snap = store.getState()?.snapshot ?? null;
+      const hostExecuting = isTurnBusy(rt) || isLivePostStreamOpen(rt);
+      setV4TimelineBusy(
+        sk,
+        resolveSessionBusyFromControl(snap, {
+          hostExecuting: hostExecuting ? true : false,
+        }),
+      );
+    } catch {
+      /* best-effort */
+    }
+    return;
+  }
   if (prevUnsub) {
     try {
       prevUnsub();
@@ -108,12 +203,23 @@ function _pushPinBusyFromStore(
   }
   const push = () => {
     try {
+      const rt = getSessionRuntime(sk);
+      // 用户点停后的冷却 / 已 settled：投影里陈旧 running 工具不得再钉齿轮与停止钮。
+      if (isSessionRecoveryCooldownActive(sk) || rt.uiTurnSettled) {
+        setV4TimelineBusy(sk, false);
+        return;
+      }
       const snap = store.getState()?.snapshot ?? null;
-      // 后台钉住会话：勿传 hostExecuting=false，否则终态 phase + 陈旧工具卡会被误清。
-      const busy = resolveLiveExecutionBusyFromSnapshot(snap);
+      // host 仍在跑：并集因子；host 已 idle 时 control 终态直接收口（control-first，
+      // 见 control-busy.ts——Phase A 后 control 与快照同源，可做权威）。
+      // 勿用 isSessionRuntimeLive（停后 stream 缓冲仍有字也会 true）。
+      // 禁止把 getV4TimelineBusy 并进 hostExecuting——会与 SyncV4TimelineBusy 互喂成 #185。
+      const hostExecuting = isTurnBusy(rt) || isLivePostStreamOpen(rt);
+      const busy = resolveSessionBusyFromControl(snap, {
+        hostExecuting: hostExecuting ? true : false,
+      });
       setV4TimelineBusy(sk, busy);
       if (busy) {
-        const rt = getSessionRuntime(sk);
         noteSessionEvent(sk, rt, { at: Date.now(), silent: true });
       }
     } catch {
@@ -121,6 +227,7 @@ function _pushPinBusyFromStore(
     }
   };
   push();
+  _pinBusyBindKey.set(tid, bindKey);
   _pinBusyUnsubs.set(tid, store.subscribe(push));
 }
 
@@ -136,6 +243,7 @@ function _releasePinBusy(threadId: string, clearBusy: boolean): void {
     }
     _pinBusyUnsubs.delete(tid);
   }
+  _pinBusyBindKey.delete(tid);
   const sk = _pinSessionKeyByThread.get(tid);
   _pinSessionKeyByThread.delete(tid);
   if (clearBusy && sk) setV4TimelineBusy(sk, false);
@@ -155,9 +263,11 @@ export function warmEvoflowV4Session(
     if (!known && !opts?.force) {
       if (layer.size >= WARM_MAX_LIVE_SESSIONS) return;
       if (_warmColdTimestamps.length >= WARM_COLD_MAX_PER_WINDOW) return;
+      // 已钉住超大会话时禁止再冷预热：否则 keep_warm 排队把切会话 subscribe 拖到十几秒。
+      if (_pinnedMegaCount() >= MEGA_PIN_MAX) return;
       _warmColdTimestamps.push(now);
     }
-    const lease = layer.acquire(id);
+    const lease = layer.acquire(id, { intent: "prefetch" });
     const st = lease.store.getState();
     const hasSnap = Boolean(st.snapshot);
     const rowCount =
@@ -173,6 +283,7 @@ export function warmEvoflowV4Session(
         hasSnapshot: hasSnap,
         rowCount,
         storeStatus: st.status,
+        intent: "prefetch",
       },
     });
     queueMicrotask(() => {
@@ -182,6 +293,91 @@ export function warmEvoflowV4Session(
         /* ignore */
       }
     });
+  } catch {
+    /* best effort */
+  }
+}
+
+/**
+ * LangGraph stream-404 remint：在 React 换 selectedThreadId 之前调用，
+ * 把旧 thread 投影原地改挂到新 thread，避免 cold open 清空时间线。
+ */
+export function rebindEvoflowV4ThreadOnRemint(
+  oldThreadId: string,
+  newThreadId: string,
+): boolean {
+  const oldId = String(oldThreadId || "").trim();
+  const newId = String(newThreadId || "").trim();
+  if (!oldId || !newId || oldId === newId) return false;
+  let ok = false;
+  try {
+    ok = getSharedLayer().rebindSessionId(oldId, newId);
+  } catch {
+    ok = false;
+  }
+  // pin 表也要跟着走，否则仍钉着旧 tid，新 tid 冷开。
+  try {
+    const pinned = _pinnedLeases.get(oldId);
+    if (pinned) {
+      _pinnedLeases.delete(oldId);
+      _pinnedLeases.set(newId, pinned);
+    }
+    const busyUnsub = _pinBusyUnsubs.get(oldId);
+    if (busyUnsub) {
+      _pinBusyUnsubs.delete(oldId);
+      _pinBusyUnsubs.set(newId, busyUnsub);
+    }
+    const sk = _pinSessionKeyByThread.get(oldId);
+    if (sk !== undefined) {
+      _pinSessionKeyByThread.delete(oldId);
+      _pinSessionKeyByThread.set(newId, sk);
+    }
+  } catch {
+    /* best effort */
+  }
+  if (ok) {
+    logV4Life({
+      event: "remint_rebind",
+      threadId: newId,
+      zh: `stream-404 remint：V4 投影已从 ${oldId.slice(0, 8)}… 改挂到新 thread，保留快照避免空白卡顿。`,
+      detail: { oldThreadId: oldId, newThreadId: newId },
+      skipDedupe: true,
+    });
+  }
+  return ok;
+}
+
+try {
+  (
+    window as Window & {
+      __evoflowRebindV4OnRemint?: (oldId: string, newId: string) => boolean;
+    }
+  ).__evoflowRebindV4OnRemint = rebindEvoflowV4ThreadOnRemint;
+} catch {
+  /* ignore non-browser */
+}
+
+/**
+ * 用户点开会话前调用：取消其它 keep-warm 中的冷 hydrate，
+ * 把 Gateway 订阅槽让给当前会话（仍保留已 pin 的执行中投影）。
+ */
+export function focusEvoflowV4SessionForOpen(sessionId: string): void {
+  const id = String(sessionId || "").trim();
+  if (!id) return;
+  try {
+    const level = noteRendererMemoryPressure({ focus: id });
+    // 危急水位：只保当前点开，连 pin 也先让路（随后 sync pin 会按更小上限重钉）。
+    const keep =
+      level === "critical" ? [id] : [id, ..._pinnedLeases.keys()];
+    const closed = getSharedLayer().releaseKeepWarmExcept(keep);
+    if (closed > 0) {
+      logV4Life({
+        event: "focus_cancel_warm",
+        threadId: id,
+        zh: `用户打开会话：取消 ${closed} 条后台 keep-warm 投影，避免 hydrate 排队堵点击。`,
+        detail: { closed, keepCount: keep.length, memLevel: level },
+      });
+    }
   } catch {
     /* best effort */
   }
@@ -204,6 +400,8 @@ export type V4PinTarget = {
 export function syncEvoflowV4PinnedSessions(
   targets: readonly (string | V4PinTarget)[],
 ): void {
+  const memLevel = resolveRendererMemoryLevel();
+  const pinMax = pinMaxForMemoryLevel(memLevel) || PIN_MAX_SESSIONS_DEFAULT;
   const want: string[] = [];
   const seen = new Set<string>();
   const sessionByThread = new Map<string, string>();
@@ -223,7 +421,7 @@ export function syncEvoflowV4PinnedSessions(
       sessionByThread.set(id, sk);
       _pinSessionKeyByThread.set(id, sk);
     }
-    if (want.length >= PIN_MAX_SESSIONS) break;
+    if (want.length >= pinMax) break;
   }
   const wantSet = new Set(want);
   for (const [id, lease] of [..._pinnedLeases.entries()]) {
@@ -243,10 +441,31 @@ export function syncEvoflowV4PinnedSessions(
     });
   }
   const layer = getSharedLayer();
+  const primaryId = want[0] || "";
+  let megaPinned = _pinnedMegaCount();
   for (const id of want) {
     const sk = sessionByThread.get(id) || _pinSessionKeyByThread.get(id) || "";
     const existing = _pinnedLeases.get(id);
     if (existing) {
+      const existingRows = _leaseRowCount(existing);
+      // 非首选的超大 pin：一律释放，把 Gateway 留给当前点开的会话 hydrate。
+      if (existingRows >= MEGA_PIN_ROW_SOFT_CAP && id !== primaryId) {
+        try {
+          existing.release();
+        } catch {
+          /* ignore */
+        }
+        _pinnedLeases.delete(id);
+        _releasePinBusy(id, true);
+        megaPinned = Math.max(0, megaPinned - 1);
+        logV4Life({
+          event: "pin_release",
+          threadId: id,
+          zh: `释放超大投影钉住（行数≈${existingRows}）→ 避免拖死其它会话打开。`,
+          detail: { rowCount: existingRows, pinned: _pinnedLeases.size },
+        });
+        continue;
+      }
       try {
         existing.store.ensureConnected();
       } catch {
@@ -258,10 +477,26 @@ export function syncEvoflowV4PinnedSessions(
     try {
       // pin 集合已截断到 PIN_MAX；允许冷 acquire，不被悬停 warm 的 live 上限挡住。
       const lease = layer.acquire(id);
-      _pinnedLeases.set(id, lease);
       const st = lease.store.getState();
       const rowCount =
         st.snapshot?.rows?.totalCount ?? st.snapshot?.rows?.window?.length ?? 0;
+      const isMega = rowCount >= MEGA_PIN_ROW_SOFT_CAP;
+      if (isMega && megaPinned >= MEGA_PIN_MAX && id !== primaryId) {
+        try {
+          lease.release();
+        } catch {
+          /* ignore */
+        }
+        logV4Life({
+          event: "pin_skip_mega",
+          threadId: id,
+          zh: `跳过钉住超大投影（行数≈${rowCount}，已有 ${megaPinned} 条）→ 保护切会话。`,
+          detail: { rowCount, megaPinned, primaryId: primaryId || null },
+        });
+        continue;
+      }
+      _pinnedLeases.set(id, lease);
+      if (isMega) megaPinned += 1;
       if (sk) _pushPinBusyFromStore(id, sk, lease.store);
       logV4Life({
         event: "pin_acquire",
@@ -548,6 +783,8 @@ export function V4StreamRowsBridge(props: {
   const { sessionId, enabled, children } = props;
   const layer = useMemo(() => getSharedLayer(), []);
   const [lease, setLease] = useState<SessionLease | null>(null);
+  /** 重入补拉节流：sessionKey → 上次触发时间（refreshEvoflowV4Session 自身还有去重/冷却）。 */
+  const switchBackCatchupAtRef = useRef<Map<string, number>>(new Map());
 
   // layout：尽量在绘制前换租约，减少「新 sessionId + 旧 store」错配一帧。
   useLayoutEffect(() => {
@@ -557,6 +794,8 @@ export function V4StreamRowsBridge(props: {
     }
     bindV4OpenThread(sessionId);
     bindOpenTraceThread(sessionId);
+    // 先清掉其它 keep-warm 冷 hydrate，再 acquire——用户点击插队。
+    focusEvoflowV4SessionForOpen(sessionId);
     const acquireStartedAt = Date.now();
     const acquired = layer.acquire(sessionId);
     const acquireMs = Date.now() - acquireStartedAt;
@@ -622,6 +861,32 @@ export function V4StreamRowsBridge(props: {
         }
       }, 1_200);
     }
+    // 重入（warm/keep_warm 命中缓存快照）≠ 冷开：缓存快照可能是切走期间冻结
+    // 的旧投影——后台 run 的终态与新增行不会自己走进来，且服务端 10s 收口
+    // reconcile 只覆盖「已终态」。补拉一次 catchup：mirror 活着会被服务端拒绝，
+    // 幂等且有 in-flight/冷却去重，同会话 8s 内不重复触发。
+    if (hasSnap && rowCount > 0) {
+      const key = String(sessionId);
+      const now = Date.now();
+      const last = switchBackCatchupAtRef.current.get(key) ?? 0;
+      if (now - last > 8_000) {
+        switchBackCatchupAtRef.current.set(key, now);
+        if (switchBackCatchupAtRef.current.size > 64) {
+          const cutoff = now - 60_000;
+          for (const [k, at] of switchBackCatchupAtRef.current) {
+            if (at < cutoff) switchBackCatchupAtRef.current.delete(k);
+          }
+        }
+        queueMicrotask(() => refreshEvoflowV4Session(key, { softIntervalMs: 2_800 }));
+        logV4Life({
+          event: "switch_back_catchup",
+          threadId: sessionId,
+          zh: "切回会话：缓存快照可能是冻结的旧投影，补拉一次 catchup 校准。",
+          detail: { openKind: acquired.openKind, rowCount },
+          skipDedupe: true,
+        });
+      }
+    }
     setLease(acquired);
     return () => {
       if (earlyRetryTimer != null) window.clearTimeout(earlyRetryTimer);
@@ -650,6 +915,13 @@ export function V4StreamRowsBridge(props: {
     [store],
   );
 
+  const onAutoBackfill = useMemo(
+    () => async () => {
+      await store?.autoBackfillForRestore();
+    },
+    [store],
+  );
+
   const snapshot: ConversationSnapshot | null = state?.snapshot ?? null;
   const storeFailed = !!sessionId && !snapshot && state?.status === "error";
   const pathState = !enabled
@@ -666,24 +938,29 @@ export function V4StreamRowsBridge(props: {
   const connectingSessionRef = useRef<string | null>(null);
 
   // 闸门权威：仅 ready（有快照）时闸 AG-UI TEXT_*；failed/connecting 必须放行正文。
-  // 幂等：只在「非 live → live」时 +1，「live → 非 live」时 -1，卸载时 -1。
-  // 快照每帧更新都会重跑这个 effect，若按帧 +1 会把引用计数撑爆。
+  // 只依赖 hasSnapshot 布尔，禁止依赖 snapshot 对象引用——流式每帧新引用会
+  // 触发 cleanup(−1)+setup(+1)，并在 layout 里和 SyncV4TimelineBusy / useSyncExternalStore
+  // 叠成 React #185（Maximum update depth）→ 整页空白。
+  const hasSnapshot = !!snapshot;
   const authorityRef = useRef<string | null>(null);
   useLayoutEffect(() => {
-    const live = enabled && !!sessionId && !!snapshot;
+    const live = enabled && !!sessionId && hasSnapshot;
     const tid = live ? sessionId! : null;
     const prev = authorityRef.current;
     if (prev === tid) return;
     if (prev) publishV4DisplayAuthority({ threadId: prev, live: false });
     if (tid) publishV4DisplayAuthority({ threadId: tid, live: true });
     authorityRef.current = tid;
+  }, [enabled, sessionId, hasSnapshot]);
+  // 卸载 / 换会话：只在 session 边界清权威，勿绑 snapshot 引用。
+  useLayoutEffect(() => {
     return () => {
       if (authorityRef.current) {
         publishV4DisplayAuthority({ threadId: authorityRef.current, live: false });
         authorityRef.current = null;
       }
     };
-  }, [enabled, sessionId, snapshot]);
+  }, [sessionId]);
 
   useLayoutEffect(() => {
     const key = `${pathState}:${sessionId ?? ""}`;
@@ -860,7 +1137,7 @@ export function V4StreamRowsBridge(props: {
         detail: { path: pathState, reason },
       });
     }
-  }, [pathState, sessionId, enabled, snapshot, state?.status, leaseForSession]);
+  }, [pathState, sessionId, enabled, hasSnapshot, state?.status, leaseForSession]);
 
   // connecting 每秒打进度；无订阅 2s / 有订阅等首帧 5s 后 warn + recovery。
   useLayoutEffect(() => {
@@ -975,8 +1252,9 @@ export function V4StreamRowsBridge(props: {
       status,
       loadingOlder,
       onLoadOlder,
+      onAutoBackfill,
     };
-  }, [sessionId, snapshot, status, loadingOlder, onLoadOlder, store]);
+  }, [sessionId, snapshot, status, loadingOlder, onLoadOlder, onAutoBackfill, store]);
 
   if (!enabled || !sessionId) {
     return children(null, !enabled ? "disabled" : "no-thread");

@@ -8,6 +8,7 @@
 import {
   applyConversationDeltas,
   isDeterministicContentFault,
+  conversationTopic,
   parseConversationTopic,
   PROTOCOL_V4_LIMITS,
   SUBSCRIPTION_CONTENT_REJECTED,
@@ -24,6 +25,13 @@ import type { ConversationTurnNavigatorHydrationResult } from "@/v4/conversation
 import type { ConversationTransport } from "@/v4/transport.js";
 import { uiMemoryDiagnosticsRegistry } from "@/lib/memoryDiagnostics.js";
 import { markOpenStage } from "@/lib/openTrace.js";
+import {
+  PROJECTION_WINDOW_SHARE_CAP,
+  PROJECTION_WINDOW_SOFT_CAP,
+  capAndLightenProjectionWindow,
+  countRealUserQueries,
+  resolveProjectionWindowSoftCap,
+} from "@/v4/projectionWindowCap.js";
 
 /**
  * runtime 换代打断 subscribe 后的退避节奏。
@@ -277,30 +285,83 @@ export function shouldAutoLoadIncompleteLeadingTurn(
  * rows/range 结果并入本地窗口（合并规范）：按 rowId 键控、只收
  * 窗口首行之前的行、去重后前插；顺序键 = rowId 升序（全序保证）。
  * 返回 null 表示无可并入行（窗口无变化，调用方不换引用）。
+ *
+ * 超软顶时按 prefer 裁切：上滚补历史用 head（保住刚拉到的更早行），
+ * 直播/导航探测用 tail（保住最新）。
  */
 function mergeOlderRows(
   window: readonly ConversationRow[],
   fetched: readonly ConversationRow[],
+  opts?: { softCap?: number; prefer?: "tail" | "head" },
 ): ConversationRow[] | null {
   const firstRowId = window[0]?.rowId ?? Number.POSITIVE_INFINITY;
   const older = fetched.filter((row) => row.rowId < firstRowId);
   if (older.length === 0) return null;
-  return [...older, ...window];
+  const merged = [...older, ...window];
+  const softCap = opts?.softCap ?? resolveProjectionWindowSoftCap();
+  const prefer = opts?.prefer ?? "head";
+  const capped = capAndLightenProjectionWindow(merged, { softCap, prefer });
+  return capped === merged ? merged : [...capped];
+}
+
+/** snapshot / delta 应用后裁尾窗 + 瘦旧工具卡，避免多轮撑爆 WebView2。 */
+function applySoftCapToSnapshot(
+  snapshot: ConversationSnapshot,
+  prefer: "tail" | "head" = "tail",
+  softCap: number = resolveProjectionWindowSoftCap(),
+): ConversationSnapshot {
+  const prev = snapshot.rows.window;
+  const next = capAndLightenProjectionWindow(prev, { softCap, prefer });
+  if (next === prev) return snapshot;
+  if (next.length < prev.length) {
+    logger.info("[v4-store] projection window soft-capped", {
+      from: prev.length,
+      to: next.length,
+      softCap,
+      prefer,
+      totalCount: snapshot.rows.totalCount,
+    });
+  }
+  return {
+    ...snapshot,
+    rows: {
+      ...snapshot.rows,
+      window: [...next],
+    },
+  };
 }
 
 /**
  * 外部 store（useSyncExternalStore 兼容：subscribe + getState 返回稳定引用）。
  * 生命周期由 SessionDataLayer 管（引用计数 + keep-warm），组件不直接 new。
  */
-// 内存诊断计数器：统计存活 store 数与其 rows.window 行数之和，
+/**
+ * 内存诊断：单行近似字节（JSON 序列化长度）。
+ * 行数软顶（400）不约束字节——大 tool output 行会让窗口撑到远超预期，
+ * 渲染进程内存定罪需要字节维度（2026-11-15 renderer 1.7GB 悬案）。
+ */
+export function estimateConversationRowBytes(row: ConversationRow): number {
+  try {
+    return JSON.stringify(row)?.length ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
+// 内存诊断计数器：统计存活 store 数与其 rows.window 行数/字节之和，
 // 用于观察窗口数据的内存增长。构造时加入、close() 时移除。
 const liveProjectionStores = new Set<ConversationProjectionStore>();
 uiMemoryDiagnosticsRegistry.register("projection", () => {
   let rows = 0;
+  let windowBytes = 0;
+  let maxRowBytes = 0;
   for (const store of liveProjectionStores) {
     rows += store.countProjectionRows();
+    const est = store.estimateProjectionWindowBytes();
+    windowBytes += est.windowBytes;
+    if (est.maxRowBytes > maxRowBytes) maxRowBytes = est.maxRowBytes;
   }
-  return { stores: liveProjectionStores.size, rows };
+  return { stores: liveProjectionStores.size, rows, windowBytes, maxRowBytes };
 });
 
 export class ConversationProjectionStore {
@@ -360,11 +421,18 @@ export class ConversationProjectionStore {
       > & { directoryRevision: number })
     | null = null;
   private closed = false;
+  /** Mutable so stream-404 remint can rebind without dropping the snapshot. */
+  private _topic: string;
+
+  get topic(): string {
+    return this._topic;
+  }
 
   constructor(
-    readonly topic: string,
+    topic: string,
     private readonly transport: ConversationTransport,
   ) {
+    this._topic = topic;
     liveProjectionStores.add(this);
     this.offAssemblyFault = transport.onAssemblyFault((fault) => {
       if (fault.topic === this.topic) {
@@ -404,6 +472,35 @@ export class ConversationProjectionStore {
     return { ...this.sessionOpenRendererTiming };
   }
 
+  /**
+   * LangGraph stream-404 remint：threadId 换了但 transcript 已灌进新 thread。
+   * 原地改 topic、保留现有 snapshot，再后台 subscribe——避免冷开清空时间线卡死 UI。
+   */
+  rebindSessionId(newSessionId: string): void {
+    const sid = String(newSessionId || "").trim();
+    if (!sid || this.closed) return;
+    const nextTopic = conversationTopic(sid);
+    if (nextTopic === this._topic) return;
+    const prevTopic = this._topic;
+    this._topic = nextTopic;
+    const snap = this.state.snapshot;
+    if (snap && snap.sessionId !== sid) {
+      this.setState({
+        snapshot: { ...snap, sessionId: sid },
+      });
+    }
+    logger.lifecycle.info("v4 conversation store remint rebind", {
+      event: "v4.conversation.store.remint_rebind",
+      module: "ui.v4.conversation_projection_store",
+      prevTopic,
+      topic: nextTopic,
+      hasSnapshot: Boolean(this.state.snapshot),
+      status: "completed",
+    });
+    // 有快照时勿把 status 打成 connecting（bridge 靠 snapshot 判 v4；仍要换订阅收新帧）
+    void this.connect({ forceSnapshot: false, remintPreserveUi: true });
+  }
+
   subscribe(listener: () => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
@@ -428,6 +525,10 @@ export class ConversationProjectionStore {
       forceSnapshot?: boolean;
       initialOverflowRetry?: boolean;
       rendererPrepareStartedAt?: number;
+      /** 悬停预热 → 服务端 hydrate 低优先；用户打开默认 open。 */
+      intent?: "open" | "prefetch";
+      /** remint：已有快照时保持 UI ready，只换订阅。 */
+      remintPreserveUi?: boolean;
     } = {},
   ): Promise<void> {
     if (this.closed) return;
@@ -444,18 +545,24 @@ export class ConversationProjectionStore {
       module: "ui.v4.conversation_projection_store",
       status: "started",
       topic: this.topic,
+      remintPreserveUi: !!options.remintPreserveUi,
     });
     this.sessionOpenRendererTiming = {
       rendererPrepareMs: roundedDuration(connectStartedAt, subscribeStartedAt),
     };
     this.initialSubscribeAckAt = null;
     this.connectInFlight += 1;
-    this.setState({ status: "connecting", rendererTiming: this.sessionOpenRendererTiming });
+    if (options.remintPreserveUi && snapshot) {
+      this.setState({ rendererTiming: this.sessionOpenRendererTiming });
+    } else {
+      this.setState({ status: "connecting", rendererTiming: this.sessionOpenRendererTiming });
+    }
     try {
       const subscribeParams = {
         topic: this.topic,
         base: snapshot ? { logEpoch: snapshot.logEpoch, seq: snapshot.seq } : undefined,
-      };
+        ...(options.intent === "prefetch" ? { intent: "prefetch" as const } : {}),
+      } as Parameters<ConversationTransport["subscribe"]>[0];
       const result = await Promise.race([
         this.transport.subscribe(subscribeParams),
         new Promise<never>((_, reject) => {
@@ -803,20 +910,22 @@ export class ConversationProjectionStore {
         "snapshot",
       );
       // 规则 1：整体替换，扔掉手里的一切换新的。
+      // Wire 尾窗通常 ≤60；仍做 soft-cap，防止异常大 snapshot / 测试夹具撑爆。
+      const snapshot = applySoftCapToSnapshot(frame.payload.snapshot, "tail");
       this.setState({
-        snapshot: frame.payload.snapshot,
+        snapshot,
         planDirectoryRevision: this.state.planDirectoryRevision + 1,
         // snapshot 整体替换后 real-user query 集合可能已变，终态缓存必须失效。
         turnNavigatorDirectoryRevision: this.state.turnNavigatorDirectoryRevision + 1,
       });
       this.subscriptionHasAppliedBase = true;
       this.clearInitialFrameWatchdog();
-      this.reconcileOptimistic(frame.payload.snapshot);
-      this.reconcileAcceptedInputProjection(frame.payload.snapshot);
+      this.reconcileOptimistic(snapshot);
+      this.reconcileAcceptedInputProjection(snapshot);
       // initial 丢失时，publisher 允许完整 online snapshot 建立首个
       // applied base；其中的持久 transition 可能早于本次订阅，不能冒充实时新事件。
       // 首帧只播种观察基线，后续 online 跃迁才通知 pane。
-      this.observeModelTransition(frame.payload.snapshot, context.online && hadAppliedBase);
+      this.observeModelTransition(snapshot, context.online && hadAppliedBase);
       if (context.subscribeMode !== null && context.frameReceivedAt !== undefined) {
         const snapshotAppliedAt = monotonicNow();
         this.sessionOpenRendererTiming = {
@@ -875,6 +984,11 @@ export class ConversationProjectionStore {
     }
     const applied = applyConversationDeltas(current, frame.payload.deltas);
     // seq 是快照对齐水位，delta 帧应用完推进到帧右端点。
+    // delta 帧不做软顶裁切/瘦身（2026-11-15 回撤，对齐 ZCode）：直播窗口只增不减、
+    // 行引用保持稳定（行级 memo 的前提），历史行被裁掉后 rows/range 游标救不回来
+    // （「最新用户消息/前面轮次看不到」实锤）。内存安全网改为：行内重载荷在服务端
+    // mirror/hydrate 出口截断（agui_mirror._TOOL_OUTPUT_ROW_PREVIEW_MAX）+ 快照
+    // apply / loadOlder 合并这两条一次性路径上的 cap+lighten。
     const next = { ...applied, seq: frame.toSeq };
     logSubagentProjectionTransition(this.topic, current, next, "deltas");
     const removedFromRowId = frame.payload.deltas.reduce<number | null>(
@@ -1189,7 +1303,13 @@ export class ConversationProjectionStore {
       // 在途期间游标失效（row.removed 截断 / snapshot resync 整体替换）→ 结果作废，
       // 防止把权威侧已移除的历史行复活；下次触发按新窗口重新拉。
       if (current.rows.window[0]?.rowId !== beforeRowId) return;
-      const window = mergeOlderRows(current.rows.window, result.rows);
+      // 上滚意图：prefer head，滑动到更早历史。软顶放大到 1200（行内重载荷已在
+      // 服务端截断）：400 会在长回合/大会话里把流式尾部裁掉（行被裁后 rows/range
+      // 游标救不回来）——「正流着突然只剩一点点」的另一实锤。
+      const window = mergeOlderRows(current.rows.window, result.rows, {
+        softCap: Math.max(resolveProjectionWindowSoftCap(), 1_200),
+        prefer: "head",
+      });
       if (window === null) return;
       this.setState({
         snapshot: { ...current, rows: { ...current.rows, window } },
@@ -1205,13 +1325,115 @@ export class ConversationProjectionStore {
   }
 
   /**
+   * 快照自动补拉（恢复可视性，对齐 ZCode SessionPane 冷快照自动补拉语义）。
+   *
+   * fresh subscribe / resync 后 window 只有服务端尾窗——长回合中途 resubscribe 时
+   * 最新 realUser 行和前面轮次都被截在窗口之外。逐页 loadOlder 直到：
+   * ① 窗口首行所在轮补到 turnHeader；② 直播中窗口里出现 realUser 行；
+   * ③ 没有更早行 / 首行不再前进 / 达到页数上限（有界，不做全量）。
+   *
+   * **批量拉取、一次性提交**（对齐 loadAllOlder 的纪律「等全部页成功后只换一次
+   * snapshot」）：逐页 commit 会让 timeline 每页重建 render units + virtualizer
+   * 并重新锚定——大会话打开时表现为「从上滚到下再滚一遍」（2026-11-16 用户实锤）。
+   * 合并软顶放大到 1200（行内重载荷已在服务端截断），prefer head 只保历史页——
+   * 页数上限 × 页大小 < 软顶，不会裁到流式尾部。
+   */
+  async autoBackfillForRestore(maxPages: number = 8): Promise<void> {
+    if (this.closed || this.state.loadingOlder) return;
+    const startSnapshot = this.state.snapshot;
+    if (!startSnapshot || !hasOlderRows(startSnapshot)) return;
+    const startWindow = startSnapshot.rows.window;
+    if (!Array.isArray(startWindow) || startWindow.length === 0) return;
+    const sessionId = parseConversationTopic(this.topic);
+    if (!sessionId) return;
+    const startEpoch = startSnapshot.logEpoch;
+    const startFirstRowId = startWindow[0]?.rowId;
+    // 触发条件在起点快照上判定（拉取期间窗口首行不变，尾部 delta 追加不影响）。
+    const leadingIncomplete = !startWindow.some(
+      (r) => r.turnId === startWindow[0]?.turnId && r.kind === "turnHeader",
+    );
+    const turnLive = startSnapshot.control?.canStop === true;
+    const userMissing =
+      turnLive &&
+      !startWindow.some((r) => r.kind === "userInput" && r.origin === "realUser");
+    if (!leadingIncomplete && !userMissing) return;
+
+    this.setState({ loadingOlder: true });
+    try {
+      let beforeRowId = startFirstRowId;
+      const combined: ConversationRow[] = [];
+      for (let page = 0; page < Math.max(1, maxPages); page += 1) {
+        const result = await this.transport.rowsRange({
+          sessionId,
+          beforeRowId,
+          limit: PROTOCOL_V4_LIMITS.snapshotTailWindowRows,
+        });
+        if (this.closed) return;
+        const current = this.state.snapshot;
+        if (
+          !current ||
+          result.atLogEpoch !== startEpoch ||
+          current.logEpoch !== startEpoch ||
+          current.rows.window[0]?.rowId !== startFirstRowId
+        ) {
+          return; // 代际/游标失效：本次补拉作废，下次触发按新窗口重来
+        }
+        const known = new Set(combined.map((r) => r.rowId));
+        const older = result.rows.filter(
+          (r) => r.rowId < (beforeRowId ?? Number.POSITIVE_INFINITY) && !known.has(r.rowId),
+        );
+        if (older.length === 0) break; // 没有更早行 → 到顶
+        combined.unshift(...older); // rows/range 升序返回，头插保持整体升序
+        beforeRowId = older[0]?.rowId;
+        // 停止条件按「已拉到的行 + 原窗口」预判，满足即不再翻页：
+        const projectedLeading = combined[0]?.turnId;
+        const leadingSettled =
+          projectedLeading != null &&
+          combined.some((r) => r.turnId === projectedLeading && r.kind === "turnHeader");
+        const userSettled =
+          !turnLive ||
+          combined.some((r) => r.kind === "userInput" && r.origin === "realUser");
+        if ((leadingIncomplete && leadingSettled) || (userMissing && userSettled)) break;
+        if (result.rows.length < PROTOCOL_V4_LIMITS.snapshotTailWindowRows) break; // 到顶
+      }
+      if (combined.length === 0) return;
+      const current = this.state.snapshot;
+      if (
+        !current ||
+        current.logEpoch !== startEpoch ||
+        current.rows.window[0]?.rowId !== startFirstRowId
+      ) {
+        return;
+      }
+      // 一次性提交：单次重排 + 单次锚定
+      const merged = mergeOlderRows(current.rows.window, combined, {
+        softCap: Math.max(resolveProjectionWindowSoftCap(), 1_200),
+        prefer: "head",
+      });
+      if (merged === null) return;
+      this.setState({
+        snapshot: { ...current, rows: { ...current.rows, window: merged } },
+      });
+    } catch (error) {
+      logger.warn(
+        `[v4-store] autoBackfill ${this.topic} 失败: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    } finally {
+      if (!this.closed) this.setState({ loadingOlder: false });
+    }
+  }
+
+  /**
    * 完整问题目录：沿既有 rows/range 游标把当前有效分支一次补齐。
    *
    * 问题导航过去直接扫描 renderer 的 tail window，因此 1000 轮会话只显示
    * 已加载的几十轮。这里按协议上限分页读取，但等全部页成功后只换一次 snapshot，
    * 避免每 200 行重建一次 timeline render units 与两个 virtualizer。
    */
-  async loadAllOlder(): Promise<ConversationTurnNavigatorHydrationResult> {
+  async loadAllOlder(opts?: {
+    /** 分享目录需要更大窗口；默认走渲染软顶，避免超大会话把完整历史钉进 timeline。 */
+    forShare?: boolean;
+  }): Promise<ConversationTurnNavigatorHydrationResult> {
     const stale = (logEpoch = this.state.snapshot?.logEpoch ?? "unknown") => ({
       status: "stale" as const,
       logEpoch,
@@ -1233,16 +1455,42 @@ export class ConversationProjectionStore {
     const initialBeforeRowId = snapshot.rows.window[0]?.rowId;
     if (!sessionId || initialBeforeRowId === undefined) return stale(snapshot.logEpoch);
 
+    const softCap = opts?.forShare
+      ? PROJECTION_WINDOW_SHARE_CAP
+      : resolveProjectionWindowSoftCap();
+    // 已在软顶且窗口内已有 ≥2 条 query：不必再为 rail 拉全量历史。
+    if (
+      !opts?.forShare &&
+      snapshot.rows.window.length >= softCap &&
+      countRealUserQueries(snapshot.rows.window) >= 2
+    ) {
+      const early = {
+        status: "hydrated" as const,
+        logEpoch: snapshot.logEpoch,
+        directoryRevision,
+      };
+      this.turnNavigatorHydrationTerminal = early;
+      logger.info("[v4-store] 完整问题目录跳过（已在软顶）", {
+        loadedRows: snapshot.rows.window.length,
+        softCap,
+        totalRows: snapshot.rows.totalCount,
+        sessionId,
+      });
+      return early;
+    }
+
     const initialLogEpoch = snapshot.logEpoch;
     const preserveIncompleteLeadingTurn = shouldAutoLoadIncompleteLeadingTurn(snapshot, false);
     const pages: ConversationRow[][] = [];
     let beforeRowId = initialBeforeRowId;
     let committed = false;
+    let hitSoftCap = false;
     this.setState({ loadingOlder: true });
     logger.debug("[v4-store] 完整问题目录开始补拉历史 rows", {
       beforeRowId,
       loadedRows: snapshot.rows.window.length,
       sessionId,
+      softCap,
       totalRows: snapshot.rows.totalCount,
     });
 
@@ -1282,6 +1530,19 @@ export class ConversationProjectionStore {
         }
         pages.push(older);
         beforeRowId = nextBeforeRowId;
+        const pendingRows =
+          pages.reduce((n, page) => n + page.length, 0) + current.rows.window.length;
+        if (pendingRows >= softCap) {
+          hitSoftCap = true;
+          logger.info("[v4-store] 完整问题目录补拉触软顶，停止继续拉", {
+            pendingRows,
+            softCap,
+            pages: pages.length,
+            sessionId,
+            totalRows: current.rows.totalCount,
+          });
+          break;
+        }
         if (!result.hasMore) break;
       }
 
@@ -1294,13 +1555,13 @@ export class ConversationProjectionStore {
         return stale(initialLogEpoch);
       }
       const olderRows = [...pages].reverse().flat();
-      const realUserQueryCount = [...olderRows, ...current.rows.window].reduce(
-        (count, row) => (row.kind === "userInput" && row.origin === "realUser" ? count + 1 : count),
-        0,
-      );
+      const realUserQueryCount = countRealUserQueries([...olderRows, ...current.rows.window]);
       if (realUserQueryCount < 2) {
         if (preserveIncompleteLeadingTurn) {
-          const window = mergeOlderRows(current.rows.window, olderRows);
+          const window = mergeOlderRows(current.rows.window, olderRows, {
+            softCap,
+            prefer: "tail",
+          });
           if (window === null) return stale(initialLogEpoch);
           committed = true;
           this.setState({
@@ -1331,7 +1592,11 @@ export class ConversationProjectionStore {
         this.turnNavigatorHydrationTerminal = result;
         return result;
       }
-      const window = mergeOlderRows(current.rows.window, olderRows);
+      // 导航/日常：prefer tail，保住最近对话；分享 forShare 用更大 softCap。
+      const window = mergeOlderRows(current.rows.window, olderRows, {
+        softCap,
+        prefer: "tail",
+      });
       if (window === null) return stale(initialLogEpoch);
       committed = true;
       this.setState({
@@ -1339,9 +1604,11 @@ export class ConversationProjectionStore {
         snapshot: { ...current, rows: { ...current.rows, window } },
       });
       logger.debug("[v4-store] 完整问题目录历史 rows 补拉完成", {
+        hitSoftCap,
         loadedRows: window.length,
         pages: pages.length,
         sessionId,
+        softCap,
       });
       const result = {
         status: "hydrated" as const,
@@ -1506,6 +1773,19 @@ export class ConversationProjectionStore {
   /** 内存诊断：当前 rows.window 行数；只读。 */
   countProjectionRows(): number {
     return this.state.snapshot?.rows.window.length ?? 0;
+  }
+
+  /** 内存诊断：当前 rows.window 近似字节与最大单行字节；只读。 */
+  estimateProjectionWindowBytes(): { windowBytes: number; maxRowBytes: number } {
+    const window = this.state.snapshot?.rows.window ?? [];
+    let windowBytes = 0;
+    let maxRowBytes = 0;
+    for (const row of window) {
+      const bytes = estimateConversationRowBytes(row);
+      windowBytes += bytes;
+      if (bytes > maxRowBytes) maxRowBytes = bytes;
+    }
+    return { windowBytes, maxRowBytes };
   }
 
   /** 退订并终结本 store（仅 SessionDataLayer 调用）。 */

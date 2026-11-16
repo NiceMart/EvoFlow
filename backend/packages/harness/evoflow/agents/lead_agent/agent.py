@@ -47,6 +47,7 @@ from evoflow.agents.middlewares.exploration_graph_live_footer_middleware import 
 )
 from evoflow.agents.middlewares.external_memory_plugin_middleware import ExternalMemoryPluginMiddleware
 from evoflow.agents.middlewares.loop_detection_middleware import LoopDetectionMiddleware
+from evoflow.agents.middlewares.task_notification_prefix_middleware import TaskNotificationProviderPrefixMiddleware
 from evoflow.agents.middlewares.memory_live_footer_middleware import MemoryLiveFooterMiddleware
 from evoflow.agents.middlewares.memory_middleware import MemoryMiddleware
 from evoflow.agents.middlewares.memory_runtime_control_middleware import MemoryRuntimeControlMiddleware
@@ -923,6 +924,10 @@ def _build_middlewares(config: RunnableConfig, model_name: str | None, agent_nam
         )
 
         middlewares.append(PostCompactionToolPairSanitizeMiddleware())
+    # Task-notification wake inputs: inject the SYSTEM NOTIFICATION preamble at
+    # the provider boundary only. Transcript/wire keep bare <task-notification>
+    # blocks so every user-bubble filter keeps matching (bare-prefix contract).
+    middlewares.append(TaskNotificationProviderPrefixMiddleware())
     # AFTER compaction: before_model still injects; wrap_model_call reattaches
     # data-URIs if strip left "base64 data omitted" (Mode A). Later in the list
     # ⇒ inner wrap ⇒ runs after compaction's strip.
@@ -1051,6 +1056,24 @@ def make_lead_agent(config: RunnableConfig, runtime: ServerRuntime | None = None
     except Exception:
         pass
     _inject_goal_mode_into_cfg(cfg)
+    # Non-pin model_name stamps must not freeze the run: legacy create-time stamps set
+    # model_name == primary_model_name, and config-class writers (dept-group role
+    # backfill) set model_pinned=0. Drop both so resolve_run_model can follow
+    # agent → live primary. A real user pin (model_pinned=1) survives — see
+    # docs/design/model-resolution.md.
+    try:
+        from evoflow.persistence.session_context_fields import effective_session_model_override
+
+        _pinned = effective_session_model_override(
+            cfg.get("model_name"), cfg.get("primary_model_name"), cfg.get("model_pinned")
+        )
+        if not _pinned:
+            cfg.pop("model_name", None)
+            cfg.pop("model_pinned", None)
+            if str(cfg.get("model") or "").strip() == str(cfg.get("primary_model_name") or "").strip():
+                cfg.pop("model", None)
+    except Exception:
+        pass
     effective_config: RunnableConfig = {**config, "configurable": cfg}
 
     session_mode = str(cfg.get("session_mode") or "").strip().lower()
@@ -1092,6 +1115,19 @@ def make_lead_agent(config: RunnableConfig, runtime: ServerRuntime | None = None
     # Voice mode: lower temperature for more concise, deterministic output
     _voice_temp = 0.35 if voice_mode else None
 
+    # Employee rail「思考」/ BOT「工作模型」写岗位 config；群聊/新开对话常不带。
+    # 未 pin 时从岗位回填，避免跟全局默认、思考被模型 default_mode 重新打开。
+    try:
+        from evoflow.proactive.chat_session import (
+            apply_role_model_to_run_cfg,
+            apply_role_thinking_to_run_cfg,
+        )
+
+        apply_role_model_to_run_cfg(cfg)
+        apply_role_thinking_to_run_cfg(cfg)
+    except Exception:
+        pass
+
     thinking_type: str | None = str(cfg.get("thinking_type") or "").strip().lower() or None
     # Missing thinking_enabled must NOT default ON — Auto means omit vendor params.
     _te_raw = cfg.get("thinking_enabled", None)
@@ -1107,13 +1143,15 @@ def make_lead_agent(config: RunnableConfig, runtime: ServerRuntime | None = None
         thinking_enabled = False
         reasoning_effort = "minimal"
     # Voice turns: force non-thinking — long reasoning adds latency and TTS noise.
+    # Do NOT leave reasoning_effort="minimal": older factory mapped minimal→low and
+    # re-enabled DeepSeek reasoning. Prefer omit + thinking_type=disabled.
     if voice_mode:
         thinking_enabled = False
-        reasoning_effort = "minimal"
+        reasoning_effort = None
         thinking_type = "disabled"
         cfg["thinking_enabled"] = False
         cfg["thinking_type"] = "disabled"
-        cfg["reasoning_effort"] = "minimal"
+        cfg.pop("reasoning_effort", None)
         # Fast path (native-style backend executor): skip plan middleware unless mid-collab.
         _voice_phase = str(collab_phase or "").strip().lower()
         if _voice_phase in ("", "idle", "done"):
@@ -1122,11 +1160,11 @@ def make_lead_agent(config: RunnableConfig, runtime: ServerRuntime | None = None
     # 小V 前台：接待/分诊要快回，永不开思考（含模型 default_mode=enabled）。
     if xiaomi_front_desk:
         thinking_enabled = False
-        reasoning_effort = "minimal"
+        reasoning_effort = None
         thinking_type = "disabled"
         cfg["thinking_enabled"] = False
         cfg["thinking_type"] = "disabled"
-        cfg["reasoning_effort"] = "minimal"
+        cfg.pop("reasoning_effort", None)
     auto_thinking_active = (
         session_mode != "flash"
         and not voice_mode
@@ -1334,21 +1372,25 @@ def make_lead_agent(config: RunnableConfig, runtime: ServerRuntime | None = None
     custom_system_prompt = str(agent_config.system_prompt).strip() if agent_config and agent_config.system_prompt else ""
     # Single source of truth for model resolution. Order: cfg.model_name (the
     # slot proactive employees + front-end session UI write to) -> Agent.model
-    # -> primary_model -> models[0]. See ``evoflow.models.resolver``.
+    # -> primary_model -> models[0]. See ``evoflow.models.resolver``. The
+    # resolved tier is logged + traced every run (observability closed loop).
     from evoflow.models.resolver import (
         NoChatModelConfiguredError,
-        resolve_run_model,
+        resolve_run_model_with_source,
+        source_name as resolver_source_name,
     )
 
     try:
-        model_name = resolve_run_model(
+        model_name, _model_source_idx = resolve_run_model_with_source(
             agent_code=str(agent_name) if agent_name else None,
             cfg=cfg,
         )
+        model_source = resolver_source_name(_model_source_idx)
     except NoChatModelConfiguredError:
         # Empty configuration — let the dedicated error block below format the
         # actionable message (it has live AppConfig at hand).
         model_name = ""
+        model_source = "unresolved"
         model_config = None
         app_config = get_app_config()
         raise ValueError(
@@ -1375,6 +1417,7 @@ def make_lead_agent(config: RunnableConfig, runtime: ServerRuntime | None = None
                 fallback,
             )
             model_name = fallback
+            model_source = "stale_fallback"
             model_config = app_config.get_model_config(model_name)
 
     if model_config is None:
@@ -1384,6 +1427,15 @@ def make_lead_agent(config: RunnableConfig, runtime: ServerRuntime | None = None
             "Models are stored in SQLite (evoflow_models). "
             "If the table was cleared, re-add your provider API keys in the UI and restart Gateway."
         )
+    # 观测闭环：每轮一行 INFO，标明模型来自哪一层（pin/岗位=runtime、智能体、primary、first）。
+    # 排查「改了模型为什么不生效」时在 gateway 日志 grep 'model resolved: source='。
+    logger.info(
+        "model resolved: source=%s name=%r agent=%s session=%s",
+        model_source,
+        model_name,
+        agent_name or "-",
+        str(cfg.get("session_key") or "").strip() or "-",
+    )
     if thinking_enabled and not model_config.supports_thinking:
         logger.warning(f"Thinking mode is enabled but model '{model_name}' does not support it; fallback to non-thinking mode.")
         thinking_enabled = False
@@ -1394,18 +1446,31 @@ def make_lead_agent(config: RunnableConfig, runtime: ServerRuntime | None = None
         reasoning_effort = resolve_effective_reasoning_effort(reasoning_effort, model_config, thinking_enabled=True)
         cfg["reasoning_effort"] = reasoning_effort
 
-    logger.debug(
-        "Create Agent(%s) -> session_mode: %s, thinking_enabled: %s, reasoning_effort: %s, model_name: %s, is_plan_mode: %s, subagent_enabled: %s, max_concurrent_subagents: %s, include_search: %s",
+    _agent_log = (
+        "Create Agent(%s) -> session_mode: %s, thinking_enabled: %s, reasoning_effort: %s, "
+        "model_name: %s, model_source: %s, is_plan_mode: %s, subagent_enabled: %s, max_concurrent_subagents: %s, "
+        "include_search: %s, voice_mode: %s, xiaomi_front_desk: %s, thinking_type: %s"
+    )
+    _agent_args = (
         agent_name or "default",
         session_mode or "-",
         thinking_enabled,
         reasoning_effort,
         model_name,
+        model_source,
         is_plan_mode,
         subagent_enabled,
         max_concurrent_subagents,
         include_search,
+        voice_mode,
+        xiaomi_front_desk,
+        thinking_type or "-",
     )
+    # 语音/小V 关思考必须 INFO：否则用户对着「还在思考」查 gateway 像没日志。
+    if voice_mode or xiaomi_front_desk or (thinking_enabled is False and thinking_type == "disabled"):
+        logger.info(_agent_log, *_agent_args)
+    else:
+        logger.debug(_agent_log, *_agent_args)
 
     # Inject run metadata for LangSmith trace tagging
     if "metadata" not in effective_config:
@@ -1415,6 +1480,7 @@ def make_lead_agent(config: RunnableConfig, runtime: ServerRuntime | None = None
         {
             "agent_name": agent_name or "default",
             "model_name": model_name or "default",
+            "model_source": model_source,
             "thinking_enabled": thinking_enabled,
             "reasoning_effort": reasoning_effort,
             "is_plan_mode": is_plan_mode,

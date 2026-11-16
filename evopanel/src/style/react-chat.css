@@ -1222,6 +1222,173 @@ html.dark .shell-view-tab.is-active {
   align-items: flex-start;
   gap: 2px;
   min-width: 0;
+  flex: 1;
+}
+
+.dept-im__tts-btn {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-secondary, #64748b);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.dept-im__tts-btn:hover {
+  background: var(--surface-hover, rgba(15, 23, 42, 0.06));
+  color: var(--text-primary, #0f172a);
+}
+
+.dept-im__tts-btn.is-on {
+  color: var(--accent, #4f46e5);
+}
+
+.dept-im__tts-hint {
+  margin: 0;
+  font-size: 11px;
+  color: var(--text-tertiary, #94a3b8);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 140px;
+}
+
+.dept-voice-settings {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-primary, rgba(15, 23, 42, 0.08));
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.dept-voice-settings__title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary, #64748b);
+}
+
+.dept-voice-settings__hint {
+  margin: 0;
+  font-size: 11px;
+  color: var(--text-tertiary, #94a3b8);
+}
+
+.dept-voice-settings__field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.dept-voice-settings__label {
+  font-size: 11px;
+  color: var(--text-secondary, #64748b);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.dept-voice-settings__label em {
+  font-style: normal;
+  color: var(--text-tertiary, #94a3b8);
+}
+
+.dept-voice-settings__speaker-row {
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+  min-width: 0;
+}
+
+.dept-voice-settings__speaker-trigger {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border-primary, rgba(15, 23, 42, 0.12));
+  background: var(--surface, #fff);
+  color: var(--text-primary, #0f172a);
+  text-align: left;
+  cursor: pointer;
+}
+
+.dept-voice-settings__speaker-trigger:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent, #2563eb) 45%, var(--border-primary));
+}
+
+.dept-voice-settings__speaker-trigger:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.dept-voice-settings__speaker-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.dept-voice-settings__speaker-label {
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dept-voice-settings__speaker-id {
+  font-size: 10px;
+  color: var(--text-tertiary, #94a3b8);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dept-voice-settings__speaker-chevron {
+  flex-shrink: 0;
+  opacity: 0.55;
+}
+
+.dept-voice-settings__preview-btn {
+  flex-shrink: 0;
+  width: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  border: 1px solid var(--border-primary, rgba(15, 23, 42, 0.12));
+  background: var(--surface, #fff);
+  color: var(--text-secondary, #64748b);
+  cursor: pointer;
+}
+
+.dept-voice-settings__preview-btn:hover:not(:disabled) {
+  color: var(--accent, #2563eb);
+  border-color: color-mix(in srgb, var(--accent, #2563eb) 45%, var(--border-primary));
+}
+
+.dept-voice-settings__preview-btn.is-playing {
+  color: var(--accent, #2563eb);
+  background: color-mix(in srgb, var(--accent, #2563eb) 12%, transparent);
+}
+
+.dept-voice-settings__preview-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.dept-voice-settings__range {
+  width: 100%;
 }
 
 .dept-im__titles {
@@ -3992,6 +4159,58 @@ html.dark .shell-account-menu {
   transition: height var(--dur-base) ease-out;
 }
 
+/* 侧栏可见「加载更多对话」——分组树改造后不能只靠 height:0 sentinel */
+.react-chat-session-workspace-load-more {
+  list-style: none;
+  margin: 6px 8px 10px;
+  padding: 0;
+}
+
+.react-chat-session-workspace-load-more-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 30px;
+  padding: 4px 10px;
+  border: 1px solid color-mix(in srgb, var(--shell-border, #e8eaf1) 80%, transparent);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--shell-text-muted, #6b7280);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color var(--dur-fast) ease-out, color var(--dur-fast) ease-out,
+    border-color var(--dur-fast) ease-out;
+}
+
+.react-chat-session-workspace-load-more-btn:hover:not(:disabled) {
+  background: var(--shell-hover, rgba(0, 0, 0, 0.04));
+  color: var(--shell-text, #171a2b);
+  border-color: var(--shell-border, #e8eaf1);
+}
+
+.react-chat-session-workspace-load-more-btn:disabled {
+  cursor: default;
+  opacity: 0.75;
+}
+
+.react-chat-session-ws-group-count {
+  flex-shrink: 0;
+  min-width: 1.25rem;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--shell-border, #e8eaf1) 55%, transparent);
+  color: var(--shell-text-muted, #6b7280);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.35;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
 .react-chat-session-workspace-load-spinner {
   display: inline-block;
   width: 13px;
@@ -4188,7 +4407,7 @@ html[data-theme='dark'] .react-chat-history-item.active {
   gap: 6px;
 }
 
-/* Owner 分组下标清触发方式：对话 / 渠道 / 定时 / 任务 / 部门 */
+/* Owner 分组下标清触发方式：对话 / 渠道 / 定时 / 任务 / 群聊 */
 .react-chat-session-trigger-chip {
   flex: 0 0 auto;
   max-width: 3.5em;
@@ -6342,6 +6561,44 @@ html.evopanel-macos-titlebar .react-chat-header {
 
 .react-chat-header-goal-badge[data-goal-status="paused"] {
   color: var(--text-tertiary, #94a3b8);
+}
+
+.react-chat-header-childwork-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--bg-secondary, #f1f5f9) 100%, transparent);
+  border: 1px solid color-mix(in srgb, #22c55e 30%, transparent);
+  color: #15803d;
+  cursor: pointer;
+}
+
+.react-chat-header-childwork-badge:hover {
+  border-color: color-mix(in srgb, #22c55e 60%, transparent);
+}
+
+.react-chat-header-childwork-badge-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #22c55e;
+  animation: react-chat-childwork-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes react-chat-childwork-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+.react-chat-header-childwork-badge-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .react-chat-header-run-badge.is-idle {
@@ -14266,6 +14523,39 @@ html.dark .react-chat-icon-stop-btn:hover {
   min-width: 150px;
   max-width: 220px;
   overflow: visible;
+}
+
+/* 模型菜单状态行：跟随中（岗位/智能体/全局）或会话固定 + 恢复跟随（docs/design/model-resolution.md） */
+.react-chat-model-follow-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 11px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 2px;
+}
+.react-chat-model-follow-label {
+  font-size: 11px;
+  color: var(--text-secondary, #656b73);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 16px;
+}
+.react-chat-model-follow-action {
+  flex: none;
+  border: 1px solid var(--border);
+  background: transparent;
+  border-radius: 6px;
+  padding: 2px 8px;
+  font-size: 11px;
+  cursor: pointer;
+  color: var(--accent, #2563eb);
+  transition: background var(--dur-fast, 140ms);
+}
+.react-chat-model-follow-action:hover {
+  background: var(--hover-bg, rgba(0, 0, 0, 0.05));
 }
 
 /* 模型级联菜单：厂商列表项容器 */

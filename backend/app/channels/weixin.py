@@ -394,6 +394,11 @@ class WeixinChannel(Channel):
     Uses HTTP long-polling for inbound messages — no public IP or webhook needed.
     Media files are transferred through an AES-128-ECB encrypted CDN.
 
+    Supports **multi-account binding** via ``account_id`` (same pattern as
+    ``WecomChannel``): each WeChat iLink bot is one account, and every account
+    talks to the same main agent unless its ``evoflow_bot_bindings`` row carries
+    an ``agent_code`` (then the manager routes it to that employee).
+
     Configuration keys (in ``config.yaml`` under ``channels.weixin``):
         - ``account_id``: iLink Bot account ID (required, or auto-loaded from disk).
         - ``token``: iLink Bot token (required, or auto-loaded from disk).
@@ -410,7 +415,13 @@ class WeixinChannel(Channel):
 
     MAX_MESSAGE_LENGTH = 2000
 
-    def __init__(self, bus: MessageBus, config: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        bus: MessageBus,
+        config: dict[str, Any],
+        *,
+        account_id: str = "",
+    ) -> None:
         super().__init__(name="weixin", bus=bus, config=config)
         self._thread: asyncio.Task | None = None
         self._session: Any = None  # aiohttp.ClientSession
@@ -420,9 +431,17 @@ class WeixinChannel(Channel):
         self._recent_outbound_fingerprint: dict[str, tuple[str, float]] = {}
         self._temp_media_paths: set[str] = set()
 
-        # Resolve credentials: config > env > persisted file
+        # Resolve credentials: ctor > config > env > persisted per-account file.
+        # ``account_id == ""`` keeps the legacy single-binding behaviour (the
+        # channel resolves its own account from config/env/first credential
+        # file), so old callers passing only ``(bus, config)`` are unaffected.
         extra = config.get("extra", {}) if isinstance(config.get("extra"), dict) else {}
-        self._account_id = str(extra.get("account_id") or config.get("account_id") or os.getenv("WEIXIN_ACCOUNT_ID", "")).strip()
+        self._account_id = str(
+            account_id
+            or extra.get("account_id")
+            or config.get("account_id")
+            or os.getenv("WEIXIN_ACCOUNT_ID", "")
+        ).strip()
         self._token = str(extra.get("token") or config.get("token") or os.getenv("WEIXIN_TOKEN", "")).strip()
         self._base_url = str(extra.get("base_url") or config.get("base_url") or os.getenv("WEIXIN_BASE_URL", ILINK_BASE_URL)).strip().rstrip("/")
         self._cdn_base_url = str(extra.get("cdn_base_url") or config.get("cdn_base_url") or os.getenv("WEIXIN_CDN_BASE_URL", WEIXIN_CDN_BASE_URL)).strip().rstrip("/")
@@ -437,23 +456,31 @@ class WeixinChannel(Channel):
         self._group_allow_from = self._coerce_list(group_allow_from)
 
         # Try loading persisted credentials if not configured
-        if not self._token or not self._account_id:
-            from app.channels.weixin_setup import load_first_weixin_credentials
+        if self._account_id and not self._token:
+            # Dedicated account instance: load ONLY this account's credential
+            # file — first-wins would risk binding another account's token to
+            # this slot once several accounts exist on disk.
+            from app.channels.weixin_setup import load_weixin_credentials
+
+            creds = load_weixin_credentials(self._account_id)
+            if creds:
+                self._token = str(creds.get("token") or "").strip()
+                if not self._base_url or self._base_url == ILINK_BASE_URL:
+                    self._base_url = str(creds.get("base_url") or "").strip().rstrip("/")
+        elif not self._account_id:
+            from app.channels.weixin_setup import _weixin_home, load_first_weixin_credentials
 
             creds = load_first_weixin_credentials()
             if creds:
-                if not self._account_id:
-                    # Use the first account filename as account_id
-                    from app.channels.weixin_setup import _weixin_home
-
-                    home = _weixin_home()
-                    for p in sorted(home.glob("*.json")):
-                        self._account_id = p.stem
-                        break
+                # Use the first account filename as account_id
+                home = _weixin_home()
+                for p in sorted(home.glob("*.json")):
+                    self._account_id = p.stem
+                    break
                 if not self._token:
-                    self._token = creds.get("token", "")
+                    self._token = str(creds.get("token") or "").strip()
                 if not self._base_url or self._base_url == ILINK_BASE_URL:
-                    self._base_url = creds.get("base_url", self._base_url)
+                    self._base_url = str(creds.get("base_url") or "").strip().rstrip("/")
 
         # Init token store
         data_dir = self._data_dir()
@@ -677,29 +704,80 @@ class WeixinChannel(Channel):
         if not text and not media_paths:
             return
 
-        event = InboundMessage(
-            channel_name=self.name,
+        # Same shape as WeCom: Manager → context_files / V4 attachments /
+        # ContextFilesMiddleware. Previously files=[] even when media=1, so
+        # image turns looked empty (ops: no assets, agent never saw the image).
+        media_descriptors = [
+            self._build_file_descriptor(path, mime)
+            for path, mime in zip(media_paths, media_types)
+            if str(path or "").strip()
+        ]
+
+        # Must stamp account_id (same slot as subscribe_outbound) or Manager
+        # publishes replies with account_id="" and Bus drops them while only
+        # ``weixin:<bot_id>`` is registered — ops shows 「失败发送失败」.
+        event = self._make_inbound(
             chat_id=effective_chat_id,
             user_id=sender_id,
             text=text,
             msg_type=_message_type_from_media(media_types, text),
             thread_ts=message_id or None,
-            files=[],  # media_paths are local file paths, not platform dicts
-            metadata={"chat_type": chat_type},
+            files=list(media_descriptors),
+            metadata={
+                "chat_type": chat_type,
+                # Manager releases after the agent turn — do not unlink here.
+                "_owned_temp_paths": [str(p) for p in media_paths if str(p or "").strip()],
+            },
+            account_id=self._account_id,
         )
         logger.info(
-            "[Weixin] inbound from=%s chat_id=%s type=%s text_len=%d media=%d\n--- user ---\n%s\n---",
+            "[Weixin] inbound from=%s chat_id=%s type=%s text_len=%d media=%d files=%d\n--- user ---\n%s\n---",
             _safe_id(sender_id),
             _safe_id(effective_chat_id),
             chat_type,
             len(text or ""),
             len(media_paths),
+            len(media_descriptors),
             (text or "").strip() or "(empty)",
         )
         asyncio.create_task(self.send_typing(sender_id))
         await self.bus.publish_inbound(event)
-        if media_paths:
+        # Files are owned by the manager via metadata["_owned_temp_paths"].
+        if not media_descriptors and media_paths:
             asyncio.create_task(self._cleanup_temp_paths(list(media_paths)))
+
+    def _build_file_descriptor(self, path: str, mime: str) -> dict[str, Any]:
+        """Normalize cached media into ``InboundMessage.files`` (WeCom-compatible)."""
+        mime_n = str(mime or "application/octet-stream").split(";", 1)[0].strip()
+        if mime_n.startswith("image/"):
+            kind = "image"
+        elif mime_n.startswith("video/"):
+            kind = "video"
+        elif mime_n.startswith("audio/"):
+            kind = "audio"
+        else:
+            kind = "file"
+        p = Path(path)
+        size = 0
+        try:
+            size = int(p.stat().st_size)
+        except OSError:
+            size = 0
+        return {
+            "kind": kind,
+            "path": str(path),
+            "mime": mime_n or "application/octet-stream",
+            "filename": p.name or "attachment",
+            "size": size,
+            "url": "",
+            "account_id": self._account_id or "",
+        }
+
+    def release_owned_temp_paths(self, paths: list[str] | None) -> None:
+        """Manager hook after the agent turn — same contract as WeCom/Feishu."""
+        if not paths:
+            return
+        asyncio.create_task(self._cleanup_temp_paths(list(paths)))
 
     async def _collect_media(
         self,
@@ -894,19 +972,25 @@ class WeixinChannel(Channel):
 
     async def send(self, msg: OutboundMessage) -> None:
         if not self._session or not self._token:
-            return
+            raise RuntimeError("Weixin channel not connected")
 
         # Weixin only supports complete messages (no Feishu-style card patch stream).
         if not msg.is_final:
             return
 
         text = feishu_outbound_text(msg.text or "")
+        chunks = self._split_text(text)
+        # Attachment-only outbound: base Channel sends text then files; empty
+        # text is OK and must not block send_file.
+        if not chunks:
+            return
+
         logger.info(
             "[Weixin] outbound chat_id=%s thread_id=%s text_len=%d chunks=%d\n--- assistant ---\n%s\n---",
             _safe_id(msg.chat_id),
             msg.thread_id,
             len(text),
-            max(1, len(self._split_text(text))),
+            len(chunks),
             text.strip() or "(empty)",
         )
         now = time.monotonic()
@@ -921,7 +1005,7 @@ class WeixinChannel(Channel):
         context_token = self._token_store.get(self._account_id, msg.chat_id) if self._token_store else None
         client_id = f"evoflow-weixin-{uuid.uuid4().hex}"
 
-        chunks = self._split_text(text)
+        sent_chunks = 0
         idx = 0
         while idx < len(chunks):
             chunk = chunks[idx]
@@ -970,19 +1054,28 @@ class WeixinChannel(Channel):
                     break
             else:
                 logger.warning("[Weixin] chunk %d dropped after %d retries", idx, MAX_SEND_RETRIES)
-            if sent_ok and idx < len(chunks) - 1:
-                await asyncio.sleep(0.3)
+            if sent_ok:
+                sent_chunks += 1
+                if idx < len(chunks) - 1:
+                    await asyncio.sleep(0.3)
             idx += 1
 
+        # Raise so MessageBus audits failure and base Channel skips attachments
+        # (partial text+file deliveries are worse than a clean retry).
+        if sent_chunks == 0:
+            raise RuntimeError(
+                f"Weixin text send failed chat={_safe_id(msg.chat_id)} chunks={len(chunks)}"
+            )
+
     async def send_file(self, msg: OutboundMessage, attachment: ResolvedAttachment) -> bool:
-        """Send a file via encrypted CDN upload."""
+        """Send an image/file via encrypted CDN upload + iLink sendmessage."""
         if not self._session or not self._token:
             return False
 
         try:
             # 媒体文件整读不下事件循环
             plaintext = await asyncio.to_thread(attachment.actual_path.read_bytes)
-            mime = attachment.mime_type
+            mime = str(attachment.mime_type or "").strip().lower() or "application/octet-stream"
 
             # Determine media type
             if mime.startswith("image/"):
@@ -1014,6 +1107,15 @@ class WeixinChannel(Channel):
                 token=self._token,
                 timeout_ms=API_TIMEOUT_MS,
             )
+            if not self._api_response_ok(upload_resp):
+                errmsg = upload_resp.get("errmsg") or upload_resp.get("msg") or "getuploadurl failed"
+                logger.warning(
+                    "[Weixin] getUploadUrl error: ret=%s errcode=%s errmsg=%s",
+                    upload_resp.get("ret"),
+                    upload_resp.get("errcode"),
+                    errmsg,
+                )
+                return False
 
             upload_param = str(upload_resp.get("upload_param") or "")
             upload_full_url = str(upload_resp.get("upload_full_url") or "")
@@ -1065,6 +1167,17 @@ class WeixinChannel(Channel):
                         "mid_size": len(ciphertext),
                     },
                 }
+            elif mime.startswith("video/"):
+                media_item = {
+                    "type": ITEM_VIDEO,
+                    "video_item": {
+                        "media": {
+                            "encrypt_query_param": encrypted_param,
+                            "aes_key": aes_key_for_api,
+                            "encrypt_type": 1,
+                        },
+                    },
+                }
             else:
                 media_item = {
                     "type": ITEM_FILE,
@@ -1079,25 +1192,60 @@ class WeixinChannel(Channel):
                     },
                 }
 
-            await _api_post(
-                self._session,
-                base_url=self._base_url,
-                endpoint=EP_SEND_MESSAGE,
-                payload={
-                    "msg": {
-                        "from_user_id": "",
-                        "to_user_id": msg.chat_id,
-                        "client_id": client_id,
-                        "message_type": MSG_TYPE_BOT,
-                        "message_state": MSG_STATE_FINISH,
-                        "item_list": [media_item],
-                        **({"context_token": context_token} if context_token else {}),
-                    }
-                },
-                token=self._token,
-                timeout_ms=API_TIMEOUT_MS,
+            send_ok = False
+            for _attempt in range(MAX_SEND_RETRIES):
+                resp = await _api_post(
+                    self._session,
+                    base_url=self._base_url,
+                    endpoint=EP_SEND_MESSAGE,
+                    payload={
+                        "msg": {
+                            "from_user_id": "",
+                            "to_user_id": msg.chat_id,
+                            "client_id": client_id,
+                            "message_type": MSG_TYPE_BOT,
+                            "message_state": MSG_STATE_FINISH,
+                            "item_list": [media_item],
+                            **({"context_token": context_token} if context_token else {}),
+                        }
+                    },
+                    token=self._token,
+                    timeout_ms=API_TIMEOUT_MS,
+                )
+                if self._api_response_ok(resp):
+                    send_ok = True
+                    break
+                ret = resp.get("ret")
+                errcode = resp.get("errcode")
+                is_expired = ret == SESSION_EXPIRED_ERRCODE or errcode == SESSION_EXPIRED_ERRCODE
+                if is_expired and context_token:
+                    context_token = None
+                    logger.warning(
+                        "[Weixin] session expired while sending file to %s; retrying without token",
+                        _safe_id(msg.chat_id),
+                    )
+                    continue
+                if ret == RATE_LIMIT_ERRCODE or errcode == RATE_LIMIT_ERRCODE:
+                    await asyncio.sleep(3)
+                    continue
+                errmsg = resp.get("errmsg") or resp.get("msg") or "unknown error"
+                logger.warning(
+                    "[Weixin] file send error: file=%s ret=%s errcode=%s errmsg=%s",
+                    attachment.filename,
+                    ret,
+                    errcode,
+                    errmsg,
+                )
+                break
+
+            if not send_ok:
+                return False
+            logger.info(
+                "[Weixin] file sent: %s kind=%s to chat=%s",
+                attachment.filename,
+                "image" if mime.startswith("image/") else ("video" if mime.startswith("video/") else "file"),
+                _safe_id(msg.chat_id),
             )
-            logger.info("[Weixin] file sent: %s to chat=%s", attachment.filename, msg.chat_id)
             return True
         except Exception:
             logger.exception("[Weixin] failed to send file: %s", attachment.filename)

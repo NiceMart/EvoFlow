@@ -239,12 +239,31 @@ async function _maybeHealLanggraphRuntime() {
     return
   }
   if (!info?.backendRunning) return
-  if (info.langgraphRunning) {
+  // No LG port recorded → never spawned (inprocess fallback); skip.
+  const lgPort = Number(info.langgraphPort) || 0
+  if (!lgPort) return
+
+  // Child-slot alone is not truth: orphan / manually healed LG still serves /ok.
+  // Reloading would kill_gateway_port and restart the death loop.
+  let lgUp = !!info.langgraphRunning
+  if (!lgUp) {
+    try {
+      const ctrl = new AbortController()
+      const t = setTimeout(() => ctrl.abort(), 1500)
+      const res = await fetch(`http://127.0.0.1:${lgPort}/ok`, {
+        signal: ctrl.signal,
+        cache: 'no-store',
+      })
+      clearTimeout(t)
+      lgUp = res.ok
+    } catch {
+      lgUp = false
+    }
+  }
+  if (lgUp) {
     _lgConsecutiveDown = 0
     return
   }
-  // No LG port recorded → never spawned (inprocess fallback); skip.
-  if (!info.langgraphPort) return
 
   _lgConsecutiveDown += 1
   if (_lgConsecutiveDown < LG_DOWN_RESTART_THRESHOLD) return
@@ -259,7 +278,7 @@ async function _maybeHealLanggraphRuntime() {
       .then((m) =>
         m.noteGatewayWatch?.(
           'guardian_reload_langgraph',
-          { port: info.langgraphPort, attempt: _lgConsecutiveDown },
+          { port: lgPort, attempt: _lgConsecutiveDown },
           { level: 'warn', forceFile: true },
         ),
       )
@@ -269,6 +288,13 @@ async function _maybeHealLanggraphRuntime() {
     )
     await invoke('reload_langgraph_runtime')
     _lgConsecutiveDown = 0
+    // In-memory LG threads are gone — next chatSend must probe/remint before stream.
+    try {
+      const { markLangGraphThreadsStale } = await import('./ws-client.js')
+      markLangGraphThreadsStale('guardian_reload_langgraph')
+    } catch {
+      /* ignore */
+    }
   } catch (e) {
     console.warn('[gateway-guardian] reload_langgraph_runtime failed:', e)
   } finally {
@@ -411,6 +437,12 @@ async function _tryAutoRestart(options = {}) {
         _setGatewayRunning(true)
         _runningSince = Date.now()
         console.info('[gateway-guardian] Gateway recovered after reload (/health/ready)')
+        try {
+          const { markLangGraphThreadsStale } = await import('./ws-client.js')
+          markLangGraphThreadsStale('guardian_reload_gateway')
+        } catch {
+          /* ignore */
+        }
         return
       }
     }

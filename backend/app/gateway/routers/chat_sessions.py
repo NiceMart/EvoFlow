@@ -62,6 +62,7 @@ class SessionRowResponse(BaseModel):
     localWorkspaceRoot: str | None = None
     useVirtualPaths: bool | None = None
     modelName: str | None = None
+    modelPinned: bool | None = None
     primaryModelName: str | None = None
     sessionMode: str | None = None
     thinkingEnabled: bool | None = None
@@ -88,6 +89,9 @@ class SessionRowResponse(BaseModel):
     inputTokens: int = 0
     outputTokens: int = 0
     totalTokens: int = 0
+    cacheReadTokens: int = 0
+    cacheCreationTokens: int = 0
+    cacheMissTokens: int = 0
     isPinned: bool = False
     pinOrder: int = 0
     hiddenFromList: bool = False
@@ -1090,11 +1094,17 @@ async def get_live_run_snapshot(request: Request, session_key: str) -> dict[str,
 async def put_live_run_snapshot(request: Request, session_key: str, body: LiveRunSnapshotBody) -> dict[str, Any]:
     key = _require_session_access(request, session_key)
     from app.gateway.db_async import run_db
+    from app.gateway.hang_diagnostics import should_shed_best_effort
     from evoflow.persistence import live_run_repositories as live_repo
 
     key = session_key.strip()
     if not key:
         raise HTTPException(status_code=422, detail="session_key required")
+
+    # Best-effort lane already 503-sheds under lag; also no-op here so FE debounce
+    # does not pile write work while subscribe hydrate needs the DB thread pool.
+    if should_shed_best_effort():
+        return {"ok": True, "sessionKey": key, "shed": True, "snapshot": None}
 
     def _write() -> dict[str, Any]:
         if sess_repo.is_session_deleted(key):
@@ -1320,6 +1330,48 @@ async def append_session_message(request: Request, session_key: str, body: Appen
         raise HTTPException(status_code=422, detail=str(e)) from e
     if result is None:
         return {"ok": True, "skipped": True, "messageCount": await run_db(msg_repo.count_messages, key)}
+    # User transcript landed before /runs/stream. Mirror a visible V4 userInput now so a
+    # subsequent LG 503 does not leave the timeline without the bubble (FE also keeps
+    # optimistic; this covers switch-away / refresh before RUN_STARTED).
+    if str(body.role or "").strip().lower() == "user":
+        try:
+            tid = str(body.threadId or (result or {}).get("threadId") or "").strip()
+            if not tid:
+                row = (await run_db(sess_repo.load_session_map) or {}).get(key) or {}
+                tid = str(row.get("threadId") or "").strip()
+            text = ""
+            if isinstance(body.content, str):
+                text = body.content.strip()
+            elif isinstance(body.contentJson, dict):
+                cj = body.contentJson
+                raw_c = cj.get("text")
+                if isinstance(raw_c, str) and raw_c.strip():
+                    text = raw_c.strip()
+                else:
+                    blocks = cj.get("content") if isinstance(cj.get("content"), list) else cj.get("blocks")
+                    if isinstance(blocks, list):
+                        parts = []
+                        for b in blocks:
+                            if isinstance(b, str) and b.strip():
+                                parts.append(b.strip())
+                            elif isinstance(b, dict):
+                                t = str(b.get("text") or "").strip()
+                                if t and str(b.get("type") or "text") in ("", "text"):
+                                    parts.append(t)
+                        text = "\n".join(parts).strip()
+                    elif isinstance(cj.get("content"), str):
+                        text = str(cj.get("content") or "").strip()
+            if tid and text:
+                from app.gateway.v4.agui_mirror import mirror_ensure_transcript_user_input
+
+                mirror_ensure_transcript_user_input(
+                    tid,
+                    text,
+                    message_id=str(body.messageId or (result or {}).get("messageId") or "").strip()
+                    or None,
+                )
+        except Exception:
+            logger.debug("append_session_message v4 userInput mirror skipped", exc_info=True)
     return {"ok": True, **result}
 
 
@@ -1945,46 +1997,64 @@ async def get_chat_session(request: Request, session_key: str) -> SessionRowResp
 @router.patch("/{session_key:path}/context", summary="Update session context fields (memory_enabled, etc.)")
 async def patch_session_context(request: Request, session_key: str, body: UpdateSessionContextBody) -> dict[str, Any]:
     key = _require_session_access(request, session_key)
-    if sess_repo.is_session_deleted(key):
-        raise HTTPException(status_code=404, detail="session not found")
+    from app.gateway.db_async import run_db
+    from app.gateway.hang_diagnostics import should_shed_best_effort
 
-    prev_agent = ""
-    try:
-        prev_row = sess_repo.get_session_row_for_ui(key) or {}
-        prev_ctx = prev_row.get("context") if isinstance(prev_row.get("context"), dict) else {}
-        prev_agent = str(prev_ctx.get("agent_id") or prev_row.get("agentId") or "").strip()
-    except Exception:
+    ctx_patch = body.context if isinstance(body.context, dict) else {}
+    agent_touched = "agent_id" in ctx_patch or "agent_name" in ctx_patch
+    # Soft memory/context patches under lag: do not block event loop / DB pool
+    # (2026-11-13 12:02: PATCH context 27s + event_loop_lag 26s while switching).
+    if not agent_touched and should_shed_best_effort():
+        return {"ok": True, "sessionKey": key, "shed": True, "session": None}
+
+    def _work() -> dict[str, Any]:
+        if sess_repo.is_session_deleted(key):
+            return {"deleted": True}
         prev_agent = ""
+        try:
+            prev_row = sess_repo.get_session_row_for_ui(key) or {}
+            prev_ctx = prev_row.get("context") if isinstance(prev_row.get("context"), dict) else {}
+            prev_agent = str(prev_ctx.get("agent_id") or prev_row.get("agentId") or "").strip()
+        except Exception:
+            prev_agent = ""
 
-    sess_repo.upsert_session_row(key, context=body.context)
-    row = sess_repo.get_session_row_for_ui(key)
+        sess_repo.upsert_session_row(key, context=body.context)
+        row = sess_repo.get_session_row_for_ui(key)
 
-    # Role switch: rewrite active/pending tool columns under the new agent allowlist.
-    # Must not rely on session_key embedding (often still agent:main:…) — flat agent_id is source of truth.
-    try:
-        new_ctx = row.get("context") if isinstance(row, dict) and isinstance(row.get("context"), dict) else {}
-        ctx_patch = body.context if isinstance(body.context, dict) else {}
-        new_agent = str(new_ctx.get("agent_id") or (row.get("agentId") if isinstance(row, dict) else None) or ctx_patch.get("agent_id") or ctx_patch.get("agent_name") or "").strip()
-        agent_touched = "agent_id" in ctx_patch or "agent_name" in ctx_patch
-        if agent_touched and new_agent:
-            from evoflow.session_tool_binding.agent_tools import invalidate_agent_tool_names_cache
-            from evoflow.session_tool_binding.service import repair_session_tool_state
+        # Role switch: rewrite active/pending tool columns under the new agent allowlist.
+        try:
+            new_ctx = row.get("context") if isinstance(row, dict) and isinstance(row.get("context"), dict) else {}
+            new_agent = str(
+                new_ctx.get("agent_id")
+                or (row.get("agentId") if isinstance(row, dict) else None)
+                or ctx_patch.get("agent_id")
+                or ctx_patch.get("agent_name")
+                or ""
+            ).strip()
+            if agent_touched and new_agent:
+                from evoflow.session_tool_binding.agent_tools import invalidate_agent_tool_names_cache
+                from evoflow.session_tool_binding.service import repair_session_tool_state
 
-            invalidate_agent_tool_names_cache()
-            repair_session_tool_state(key)
-            row = sess_repo.get_session_row_for_ui(key)
-            logger.info(
-                "patch_session_context: repaired tools after role switch session=%s %s -> %s active=%s pending=%s",
-                key,
-                prev_agent or "?",
-                new_agent,
-                (row or {}).get("activeTools"),
-                (row or {}).get("pendingTools"),
-            )
-    except Exception:
-        logger.warning("patch_session_context: tool snapshot refresh failed", exc_info=True)
+                invalidate_agent_tool_names_cache()
+                repair_session_tool_state(key)
+                row = sess_repo.get_session_row_for_ui(key)
+                logger.info(
+                    "patch_session_context: repaired tools after role switch session=%s %s -> %s active=%s pending=%s",
+                    key,
+                    prev_agent or "?",
+                    new_agent,
+                    (row or {}).get("activeTools"),
+                    (row or {}).get("pendingTools"),
+                )
+        except Exception:
+            logger.warning("patch_session_context: tool snapshot refresh failed", exc_info=True)
 
-    return {"ok": True, "sessionKey": key, "session": row}
+        return {"deleted": False, "row": row}
+
+    result = await run_db(_work)
+    if result.get("deleted"):
+        raise HTTPException(status_code=404, detail="session not found")
+    return {"ok": True, "sessionKey": key, "session": result.get("row")}
 
 
 @router.delete("/{session_key:path}", summary="Delete session (transcript + LangGraph thread + local data)")

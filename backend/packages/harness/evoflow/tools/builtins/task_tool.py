@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import sys
-import threading
 import time
 from dataclasses import replace
 from datetime import datetime
@@ -1492,13 +1491,27 @@ async def task_tool(
         except Exception:
             logger.debug("task_tool: session child-work complete skipped", exc_info=True)
 
-    def _notify_plain_detached_completion(*, status: str, body: str) -> None:
-        """Re-invoke lead after a detached plain-chat subagent finishes.
+    def _notify_plain_detached_completion(
+        *,
+        status: str,
+        body: str,
+        kind: str = "subagent",
+        work_kind: str = "subagent",
+        title_override: str | None = None,
+        allow_collab: bool = False,
+    ) -> None:
+        """Re-invoke lead after a detached subagent / collab subtask finishes.
 
         Claim → schedule → on schedule failure release claim so the next
         user turn can hydrate the same completion (no silent drop).
+
+        会话绑定:thread/session 一律取自**派发本次任务**的 lead 会话
+        (parent_tid_for_subagent / parent_session_key),通知只回到派发者,
+        不会跨会话;inject claim 以 (session_key, work_ref) 为界,幂等。
+        collab 子任务通过 allow_collab=True 显式接入(此前被整体排除,
+        detached collab 子任务完成后主对话永远看不到结果)。
         """
-        if resolved_collab or resolved_subtask:
+        if (resolved_collab or resolved_subtask) and not allow_collab:
             return
         import html as _html
 
@@ -1519,7 +1532,7 @@ async def task_tool(
                 sk = resolve_session_key(thread_id=lead_tid, parent_thread_id=lead_tid)
             if not sk:
                 return
-            work_ref = f"{KIND_SUBAGENT}:{task_id}"
+            work_ref = f"{work_kind}:{task_id}"
             if not safe_try_claim_inject(sk, SOURCE_CHILD_WORK_COMPLETE, work_ref):
                 return
         except Exception:
@@ -1527,7 +1540,10 @@ async def task_tool(
             return
 
         st = str(status or "completed").strip().lower() or "completed"
-        title = _html.escape(str(description or effective_subagent_type or "subagent").strip()[:120], quote=False)
+        title = _html.escape(
+            str(title_override or description or effective_subagent_type or "subagent").strip()[:120],
+            quote=False,
+        )
         summary = _html.escape(str(body or "").strip(), quote=False)
         if len(summary) > 6000:
             summary = summary[:6000] + "\n…[truncated]"
@@ -1535,7 +1551,7 @@ async def task_tool(
             "<task-notification>\n"
             f"<task-id>{_html.escape(task_id, quote=False)}</task-id>\n"
             f"<tool-use-id>{_html.escape(task_id, quote=False)}</tool-use-id>\n"
-            f"<kind>subagent</kind>\n"
+            f"<kind>{_html.escape(kind, quote=False)}</kind>\n"
             f"<title>{title}</title>\n"
             f"<status>{_html.escape(st, quote=False)}</status>\n"
             f"<summary>{summary}</summary>\n"
@@ -1897,20 +1913,25 @@ async def task_tool(
                             executor_subagent_type=effective_subagent_type,
                         )
                         _mark_child_work_terminal(ex_name if _kind != "superseded" else "superseded")
+                        if detach_effective and _kind != "superseded":
+                            # collab detached 子任务完成也唤醒**派发会话**(统一
+                            # task-notification 管线)。闭包绑定的
+                            # parent_tid_for_subagent / parent_session_key 就是派发
+                            # 会话,通知不会跨会话;inject claim 幂等防重。
+                            # kind 用字面量("collab_subtask"),不依赖上方 try 块的
+                            # 导入是否成功。
+                            _notify_plain_detached_completion(
+                                status=ex_name,
+                                body=str(result.result or result.error or ""),
+                                kind="collab_subtask",
+                                work_kind="collab_subtask",
+                                allow_collab=True,
+                            )
                         cleanup_background_task(task_id)
                         _pw = locals().get("persistent_writer")
                         if _pw is not None and hasattr(_pw, "close"):
                             _pw.close()
                         return msg
-                        try:
-                            await _persist_collab_task_memory(ex_name, result)
-                        except Exception:
-                            logger.warning(
-                                "persist collab task memory failed main=%s sub=%s",
-                                resolved_collab,
-                                resolved_subtask,
-                                exc_info=True,
-                            )
                     if result.status == SubagentStatus.COMPLETED:
                         out_text = str(result.result or "")
                         writer(_ws({"type": "task_completed", "task_id": task_id, "result": out_text}))
@@ -1975,7 +1996,17 @@ async def task_tool(
                 poll_count += 1
                 if poll_count >= max_poll_count or float(time.time()) >= _poll_deadline:
                     # Subagent may still be RUNNING; do not cleanup_background_task (race with executor).
-                    err_msg = "Polling safety limit exceeded (subagent still running)."
+                    if getattr(result, "status", None) == SubagentStatus.PENDING:
+                        # 排队饥饿：双 5-worker 池被打满，任务从未开跑。这不是执行
+                        # 超时——任务未丢失，worker 空出后会执行；明确告知模型可用
+                        # taskoutput 稍后再取，避免把“从未开始”当成“跑了 N 分钟没完成”。
+                        err_msg = (
+                            "Task was still queued (PENDING, never started) when the polling window "
+                            "closed — the subagent pool is saturated by other tasks. The task is not "
+                            "lost and will start when a worker frees up; poll again later via taskoutput."
+                        )
+                    else:
+                        err_msg = "Polling safety limit exceeded (subagent still running)."
                     logger.warning(
                         "[trace=%s] %s task_id=%s polls=%s deadline=%s",
                         trace_id,
