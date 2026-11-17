@@ -231,10 +231,17 @@ def _reset_logging_before_server() -> None:
       Uvicorn/LangGraph reconfigure logging via dictConfig, which calls shutdown() on
     existing handlers. In frozen builds some StreamHandlers lack ``lock`` and crash with:
       AttributeError: 'StreamHandler' object has no attribute 'lock'
+
+    Never ``close()`` handlers bound to ``sys.stdout`` / ``sys.stderr``: Tauri redirects
+    LG stderr to a daily log file; closing that StreamHandler closes the fd and later
+    logging (MCP/warm) dies with "I/O operation on closed file" / lost sys.stderr.
     """
     root = logging.getLogger()
     for handler in list(root.handlers):
         root.removeHandler(handler)
+        stream = getattr(handler, "stream", None)
+        if stream is sys.stdout or stream is sys.stderr:
+            continue
         if not hasattr(handler, "lock"):
             handler.lock = threading.RLock()
         try:
@@ -308,7 +315,11 @@ def _run_langgraph(port: int) -> None:
     from app.gateway.logging_setup import configure_gateway_file_logging
     from langgraph_api.cli import run_server
 
+    from evoflow.desktop_stdio import shield_stdio_from_handler_close
     from evoflow.langgraph_runtime_env import run_server_kwargs
+
+    # Before file logging / run_server dictConfig: keep Tauri stderr tee open.
+    shield_stdio_from_handler_close()
 
     # Whole process is Agent Runtime → daily ``langgraph-YYYY-MM-DD.log`` (+ Tauri stderr tee).
     configure_gateway_file_logging(log_name="langgraph.log", force=True)
@@ -364,7 +375,10 @@ def main() -> None:
     _ensure_runtime_env()
 
     if args.mode == "langgraph":
-        _reset_logging_before_server()
+        # Do not _reset_logging_before_server() here: closing/removing handlers that
+        # still reference pre-reconfigure stderr races with Tauri's stderr tee and
+        # can kill the process after Welcome (lost sys.stderr). File logging is
+        # reconfigured inside _run_langgraph via configure_gateway_file_logging.
         _run_langgraph(args.langgraph_port)
         return
 
@@ -416,19 +430,16 @@ def main() -> None:
         if force_all in ("0.0.0.0", "::", "*"):
             bind_host = "0.0.0.0"
             logging.info("EVOFLOW_GATEWAY_BIND=%s — binding Gateway to 0.0.0.0", force_all)
-        elif (os.environ.get("EVOFLOW_APP_SERVER_STDIO") or "").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        ):
-            logging.debug("desktop stdio mode — keep Gateway bind %s (skip WebUI DB bind rewrite)", bind_host)
         elif _pinned:
             logging.info(
                 "EVOFLOW_GATEWAY_BIND_HOST=%s — keeping loopback bind (skip WebUI-wide rewrite)",
                 _pinned,
             )
         else:
+            # Probe WebUI even under desktop stdio (EVOFLOW_APP_SERVER_STDIO=1).
+            # Settings → WebUI 远程访问 advertises LAN URLs and reload_gateway; the old
+            # stdio early-return left listeners on 127.0.0.1 only → ERR_CONNECTION_REFUSED
+            # for http://<lan-ip>:port while the UI still showed those links.
             try:
                 import threading
 

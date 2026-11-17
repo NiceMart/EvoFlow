@@ -1143,6 +1143,74 @@ async def get_role_wecom_binding(request: Request, agent_code: str) -> dict[str,
     return {"agent_code": agent_code, "binding": wecom_binding_public(role.config)}
 
 
+# ── Per-employee Weixin (personal WeChat, iLink) binding endpoints ──────
+# weixin slots are keyed by the iLink account_id (NOT agent_code) because many
+# bindings may share the empty agent_code = 主智能体; the employee code lives on
+# the binding row. See :mod:`evoflow.proactive.weixin_binding`.
+
+
+@router.post("/roles/{agent_code}/weixin/registration/{session_id}/apply")
+async def apply_role_weixin_registration(request: Request, agent_code: str, session_id: str) -> dict[str, Any]:
+    """Apply a completed WeChat (iLink) QR registration to this employee AI bot."""
+    _require_role_agent(request, agent_code)
+    from evoflow.proactive.weixin_binding import apply_registration_to_role
+    from evoflow.runtime.ports import get_weixin_registration_client
+
+    client = get_weixin_registration_client()
+    if client is None:
+        raise HTTPException(status_code=503, detail="Weixin registration client not available")
+    session = client.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Registration session not found")
+    if session.status != "completed":
+        msg = {
+            "expired": "Registration session expired. Please start a new registration.",
+            "failed": f"Registration failed: {session.error or 'unknown error'}",
+        }.get(session.status, f"Registration is not complete (status={session.status})")
+        raise HTTPException(status_code=400, detail=msg)
+    if not session.account_id or not session.token:
+        raise HTTPException(status_code=500, detail="Registration completed but credentials are missing")
+
+    try:
+        return await apply_registration_to_role(
+            agent_code,
+            account_id=session.account_id,
+            token=session.token,
+            base_url=str(getattr(session, "confirmed_base_url", "") or ""),
+        )
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@router.delete("/roles/{agent_code}/weixin/binding")
+async def unbind_role_weixin(request: Request, agent_code: str) -> dict[str, Any]:
+    """Remove this employee's WeChat bot binding."""
+    _require_role_agent(request, agent_code)
+    from evoflow.proactive.weixin_binding import unbind_role_weixin as _unbind
+
+    try:
+        return await _unbind(agent_code)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+
+
+@router.get("/roles/{agent_code}/weixin/binding")
+async def get_role_weixin_binding(request: Request, agent_code: str) -> dict[str, Any]:
+    """Return UI-safe WeChat binding status for an employee."""
+    _require_role_agent(request, agent_code)
+    from evoflow.proactive.weixin_binding import weixin_binding_public
+    from evoflow.persistence.config_repositories import get_bot_binding
+
+    role = ProactiveRepository.get_role(agent_code)
+    if not role:
+        raise HTTPException(status_code=404, detail=f"Role '{agent_code}' not found")
+    account_id = str(getattr(role.config, "weixin_account_id", "") or "").strip()
+    binding = get_bot_binding("weixin", account_id) if account_id else None
+    return {"agent_code": agent_code, "binding": weixin_binding_public(binding)}
+
+
 @router.post("/roles/{agent_code}/heartbeat")
 async def trigger_heartbeat(
     request: Request,
@@ -1790,6 +1858,12 @@ async def get_role_work_board(
         rounds = _synthesize_round_journals_from_chat(code, limit=min(limit, 40))
 
     pending_approvals = [_approval_to_dict(a, enrich=True) for a in ProactiveRepository.list_pending_approvals() if a.role_agent_code == code]
+
+    # Enrich display fields so Panel never has to show raw agent_code / risk enum.
+    try:
+        tasks = [_enrich_work_board_task(t) for t in tasks]
+    except Exception:
+        logger.debug("work-board task enrich failed", exc_info=True)
 
     return {
         "agent_code": code,
@@ -2919,6 +2993,73 @@ def _synthesize_round_journals_from_chat(
                 "updated_at": last_at,
             }
         )
+    return out
+
+
+_RISK_LEVEL_ZH = {
+    "low": "低风险",
+    "medium": "中风险",
+    "med": "中风险",
+    "high": "高风险",
+    "critical": "严重",
+}
+
+_BUILTIN_AGENT_ZH = {
+    "xiaomi": "小V",
+    "main": "主对话",
+    "lead_agent": "主对话",
+    "executor": "执行器",
+}
+
+
+def _agent_display_name(code: str) -> str:
+    """Resolve agent_code → 中文展示名（agent_name / role_name / 内置表）。"""
+    c = str(code or "").strip()
+    if not c:
+        return ""
+    try:
+        from evoflow.config.agents_config import load_agent_config
+
+        cfg = load_agent_config(c)
+        name = str(getattr(cfg, "agent_name", None) or "").strip() if cfg is not None else ""
+        if name and name.casefold() != c.casefold():
+            return name
+    except Exception:
+        pass
+    try:
+        role = ProactiveRepository.get_role(c)
+        if role is not None:
+            for cand in (getattr(role, "agent_name", None), getattr(role, "role_name", None)):
+                name = str(cand or "").strip()
+                if name and name.casefold() != c.casefold():
+                    return name
+    except Exception:
+        pass
+    return _BUILTIN_AGENT_ZH.get(c.casefold(), c)
+
+
+def _enrich_work_board_task(task: dict[str, Any]) -> dict[str, Any]:
+    """Attach *_zh fields for Panel employee task rail."""
+    if not isinstance(task, dict):
+        return task
+    out = dict(task)
+    assignee = str(out.get("assigned_to") or "").strip()
+    raised = str(out.get("raised_by") or "").strip()
+    risk = str(out.get("risk_level") or "").strip()
+    if assignee:
+        out["assigned_to_zh"] = _agent_display_name(assignee)
+    if raised:
+        out["raised_by_zh"] = _agent_display_name(raised)
+    if risk:
+        out["risk_level_zh"] = _RISK_LEVEL_ZH.get(risk.casefold(), risk)
+    # Prefer Chinese status when backend already stamped status_zh; else leave UI to map.
+    if not str(out.get("status_zh") or "").strip():
+        try:
+            from evoflow.admin.tasks import _status_zh
+
+            out["status_zh"] = _status_zh(str(out.get("status") or ""))
+        except Exception:
+            pass
     return out
 
 

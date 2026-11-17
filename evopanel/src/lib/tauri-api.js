@@ -1231,6 +1231,7 @@ const _EXTENDED_API_PREFIXES = [
   '/api/stage/news',
   '/api/meetings',
   '/api/organizations',
+  '/api/resource-market',
   '/api/task-detail',
   '/api/runtime',
   '/api/debug',
@@ -1757,6 +1758,12 @@ async function _hardReloadGatewayProcess(reason = 'hard_config') {
     /* ignore */
   }
   await invoke('reload_gateway')
+  try {
+    const { markLangGraphThreadsStale } = await import('./ws-client.js')
+    markLangGraphThreadsStale(reason || 'hard_reload_gateway')
+  } catch {
+    /* ignore */
+  }
 }
 
 function _debouncedReloadGateway({ hard = false } = {}) {
@@ -1852,7 +1859,16 @@ export const api = {
     await _hardReloadGatewayProcess('api_reload_gateway')
   },
   /** Restart Agent Runtime only (split process model); Control Plane stays up. */
-  reloadLanggraphRuntime: () => invoke('reload_langgraph_runtime'),
+  reloadLanggraphRuntime: async () => {
+    await invoke('reload_langgraph_runtime')
+    // Wipe FE thread-trust cache so the next send remints before stream (no 404 retry).
+    try {
+      const { markLangGraphThreadsStale } = await import('./ws-client.js')
+      markLangGraphThreadsStale('api_reload_langgraph')
+    } catch {
+      /* ignore */
+    }
+  },
   softReloadGateway: () => _softReloadGatewayCaches(),
   // 测试模型连接（轻量 /models/test，不走 /models/invoke，不强制应用配置）
   testModel: async (baseUrl, apiKey, modelId, apiType = null, configName = null) => {
@@ -2843,7 +2859,26 @@ export const api = {
   orgInstall: async (payload) => gatewayProxy('POST', '/organizations/install', payload || {}),
   orgUninstall: async (payload) => gatewayProxy('POST', '/organizations/uninstall', payload || {}),
   orgExport: async (payload) => gatewayProxy('POST', '/organizations/export', payload || {}),
-  orgMarketCatalog: async () => gatewayProxy('GET', '/organizations/market/catalog'),
+  orgMarketCatalog: async (force = false) =>
+    gatewayProxy('GET', '/organizations/market/catalog', null, force ? { force: true } : {}),
+  resourceMarketSources: async () => gatewayProxy('GET', '/resource-market/sources'),
+  resourceMarketSourceAdd: async (payload) =>
+    gatewayProxy('POST', '/resource-market/sources', payload || {}),
+  resourceMarketSourceRemove: async (sourceId) =>
+    gatewayProxy('DELETE', `/resource-market/sources/${encodeURIComponent(String(sourceId || ''))}`),
+  resourceMarketSourceEnable: async (sourceId, enabled) =>
+    gatewayProxy(
+      'PUT',
+      `/resource-market/sources/${encodeURIComponent(String(sourceId || ''))}/enabled`,
+      { enabled: !!enabled },
+    ),
+  resourceMarketHostStatus: async () => gatewayProxy('GET', '/resource-market/host/status'),
+  resourceMarketHostEnable: async (payload) =>
+    gatewayProxy('POST', '/resource-market/host/enable', payload || {}),
+  resourceMarketHostPublish: async (payload) =>
+    gatewayProxy('POST', '/resource-market/host/publish', payload || {}),
+  resourceMarketHostUnpublish: async (packId) =>
+    gatewayProxy('DELETE', `/resource-market/host/packs/${encodeURIComponent(String(packId || ''))}`),
   assetsUsageStats: async ({ entityType, entityId, topN = 12 } = {}) =>
     gatewayProxy('GET', '/assets/stats', null, { entityType, entityId, topN }),
   /** Asset Hub Phase1/Phase2 processing run log (verification). */
@@ -3140,7 +3175,10 @@ export const api = {
     }),
   proactiveOrgTree: async (status = null) =>
     gatewayProxy('GET', '/proactive/org-tree', null, status ? { status } : null),
-  proactiveListDepartments: async () => gatewayProxy('GET', '/proactive/departments'),
+  proactiveListDepartments: async () =>
+    gatewayProxy('GET', '/proactive/departments', null, null, {
+      preferGatewayHttp: true,
+    }),
   proactiveListDeptAvatarPresets: async () => {
     const data = await gatewayProxy('GET', '/proactive/departments/avatar-presets')
     return Array.isArray(data?.presets) ? data.presets : []
@@ -3374,7 +3412,35 @@ export const api = {
       silent: true,
       skipRetry: true,
     }),
-  applyWeixinRegistration: async (sessionId, enabled = true) => gatewayProxy('POST', `/channels/weixin/registration/${sessionId}/apply`, { enabled }),
+  // 多账号：apply 可带 agent_code（空 = 主智能体）与 display_name（改绑在 PATCH 里做）
+  applyWeixinRegistration: async (sessionId, enabled = true, agentCode = '', displayName = '') =>
+    gatewayProxy('POST', `/channels/weixin/registration/${sessionId}/apply`, {
+      enabled,
+      agent_code: String(agentCode || ''),
+      display_name: String(displayName || ''),
+    }),
+
+  // 微信多账号绑定管理（增删改查）
+  listWeixinAccounts: async () => gatewayProxy('GET', '/channels/weixin/accounts'),
+  patchWeixinAccount: async (accountId, patch = {}) =>
+    gatewayProxy('PATCH', `/channels/weixin/accounts/${encodeURIComponent(String(accountId || ''))}`, {
+      display_name: patch.display_name ?? null,
+      enabled: patch.enabled ?? null,
+      agent_code: patch.agent_code ?? null,
+    }),
+  deleteWeixinAccount: async (accountId) =>
+    gatewayProxy('DELETE', `/channels/weixin/accounts/${encodeURIComponent(String(accountId || ''))}`),
+
+  // 智能体员工 · 微信 iLink 绑定（复用 begin/poll，apply 写入岗位）
+  applyRoleWeixinRegistration: async (agentCode, sessionId) =>
+    gatewayProxy(
+      'POST',
+      `/proactive/roles/${encodeURIComponent(String(agentCode || ''))}/weixin/registration/${encodeURIComponent(String(sessionId || ''))}/apply`,
+    ),
+  unbindRoleWeixin: async (agentCode) =>
+    gatewayProxy('DELETE', `/proactive/roles/${encodeURIComponent(String(agentCode || ''))}/weixin/binding`),
+  getRoleWeixinBinding: async (agentCode) =>
+    gatewayProxy('GET', `/proactive/roles/${encodeURIComponent(String(agentCode || ''))}/weixin/binding`),
   beginWecomRegistration: async () => gatewayProxy('POST', '/channels/wecom/registration/begin'),
   pollWecomRegistration: async (sessionId) =>
     gatewayProxy('GET', `/channels/wecom/registration/${sessionId}/poll`, null, null, {

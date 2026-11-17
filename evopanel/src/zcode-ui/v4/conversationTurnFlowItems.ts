@@ -19,9 +19,22 @@ function isUserInputRow(row: ConversationRow): row is UserInputRow {
   return row.kind === "userInput";
 }
 
-function isHiddenTaskNotificationUserInput(row: UserInputRow): boolean {
+function isHiddenProviderContextUserInput(row: UserInputRow): boolean {
   const text = String(row.text || "").trimStart();
+  if (!text) return false;
   if (text.startsWith("<task-notification>") || text.startsWith("<subagent-notification>")) {
+    return true;
+  }
+  const lower = text.toLowerCase();
+  if (lower.startsWith("[context compaction")) return true;
+  if (lower.startsWith("here is a summary of the conversation to date")) return true;
+  if (lower.startsWith("here's a summary of the conversation to date")) return true;
+  if (
+    text.startsWith("[上下文摘要") ||
+    text.startsWith("[深度压缩摘要") ||
+    text.startsWith("[tool:history]") ||
+    text.startsWith("[tool:summary]")
+  ) {
     return true;
   }
   const entityId = String(row.entityId || "").trim();
@@ -64,13 +77,12 @@ export function buildConversationFlowItems(options: {
   timelineOnly: boolean;
 }): ConversationTurnFlowItem[] {
   const historyRowIds = new Set(options.assistantHistoryRows.map((row) => row.rowId));
-  const followingRowIds = new Set(options.assistantFollowingRows.map((row) => row.rowId));
   const tailRowIds = new Set(options.assistantTailRows.map((row) => row.rowId));
   const items: ConversationTurnFlowItem[] = [];
 
   for (const row of options.orderedRows) {
     if (isUserInputRow(row)) {
-      if (isHiddenTaskNotificationUserInput(row)) continue;
+      if (isHiddenProviderContextUserInput(row)) continue;
       // Live mirror + transcript 偶发同文连写两条；折叠头两侧会看起来像「开场说了两遍」。
       const prev = items.at(-1);
       if (
@@ -87,11 +99,12 @@ export function buildConversationFlowItems(options: {
     // flowItems，renderer 会把它渲染在定时任务卡片、文件 summary 和消息操作栏之前。
     // 这里只保留真实 flow；boundary 由 TurnGroup 在全部 turn-local 附属 UI 之后统一收尾。
     if (tailRowIds.has(row.rowId)) continue;
+    // 折叠外正文只能是当前段 visible；禁止用「不在 history」兜底——漏进
+    // following / 软窗半截 turn 时会把中间 complete 再摊成多段结论。
     if (
       isAssistantTextRow(row) &&
-      (row.rowId === options.visibleAssistantTextRow?.rowId || !historyRowIds.has(row.rowId)) &&
-      !followingRowIds.has(row.rowId) &&
-      !tailRowIds.has(row.rowId) &&
+      options.visibleAssistantTextRow != null &&
+      row.rowId === options.visibleAssistantTextRow.rowId &&
       !options.timelineOnly
     ) {
       items.push({

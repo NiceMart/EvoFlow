@@ -101,7 +101,10 @@ _VAD_START_SECS = 0.2
 # 流式分句：强标点即整句；首句逗号快切；超长按软标点硬切
 _STREAM_SENT_END_RE = re.compile(r"[。！？!?；;…\n]")
 _STREAM_SOFT_END_RE = re.compile(r"[，,、：:\s]")
-_STREAM_HARD_CUT = 64
+_STREAM_HARD_CUT = 96
+# 仅「强句号切 + 够长」才中途送合成；短回复等 End 整段一次（18:47 第二轮
+# 到 56 字就吐半截，尾巴「要不要…」单独一段 → 必卡一下）。
+_STREAM_MIN_EMIT_CHARS = 100
 # 纯语气词/拟声：VAD 误触发或随口哼声，不值得一轮模型（完整句含这些字不受影响）
 _INTERJECTION_TOKENS = {
     "嗯", "嗯嗯", "嗯呐", "啊", "啊啊", "啊哈", "哦", "哦哦", "噢", "喔", "呃", "呃呃",
@@ -129,6 +132,93 @@ def _is_junk_turn(text: str) -> bool:
     if t in _INTERJECTION_TOKENS:
         return True
     return _readable_len(t) < 2 and len(t) <= 2
+
+
+_ASR_NOISE_RE = re.compile(r"[\s\u3000，。！？、,.!?;；：:\"\"''“”‘’（）()【】\[\]…—\-]+")
+_COMMITTED_TURNS_MAX = 16
+_SHORT_COMMIT_CHARS = 12
+
+
+def _norm_user_turn(text: str) -> str:
+    t = _ASR_NOISE_RE.sub("", str(text or ""))
+    return t.lower()
+
+
+_SENT_BOUNDARY_AFTER_RE = re.compile(r"^[，。！？、,.!?;；：:\s\u3000]+")
+
+
+def _peel_one_committed_prefix(text: str, prev: str) -> tuple[str, bool]:
+    """剥掉单条已发前缀。返回 (text, peeled)。"""
+    t = (text or "").strip()
+    p = (prev or "").strip()
+    if not t or not p:
+        return t, False
+    np = _norm_user_turn(p)
+    nt = _norm_user_turn(t)
+    if not np or not nt:
+        return t, False
+    if nt == np or (np.find(nt) >= 0 and 4 <= len(nt) <= len(np)):
+        return "", True
+    if not nt.startswith(np) or len(nt) <= len(np):
+        return t, False
+    ni = 0
+    i = 0
+    while i < len(t) and ni < len(np):
+        ch = t[i]
+        if _ASR_NOISE_RE.fullmatch(ch):
+            i += 1
+            continue
+        if ch.lower() == np[ni]:
+            i += 1
+            ni += 1
+            continue
+        break
+    if ni < max(1, int(len(np) * 0.85)):
+        return t, False
+    rest = t[i:]
+    # 短前缀后无标点句界 → 同句延长（「你还能」→「你还能干点什么」），勿剥
+    if (
+        len(np) < _SHORT_COMMIT_CHARS
+        and len(nt) > len(np) + 2
+        and not _SENT_BOUNDARY_AFTER_RE.match(rest)
+    ):
+        return t, False
+    t = rest.lstrip("，。！？、,.!?;；：: \t\n\r\u3000")
+    return t, True
+
+
+def _peel_committed_asr_prefix(text: str, committed: list[str]) -> str:
+    """火山同会话 ASR 常把多轮旧定稿粘在新结果前；对近几轮已发句反复剥。"""
+    t = (text or "").strip()
+    if not t or not committed:
+        return t
+    guard = 0
+    while guard < _COMMITTED_TURNS_MAX + 2:
+        guard += 1
+        candidates = sorted(committed, key=lambda s: len(_norm_user_turn(s)), reverse=True)
+        progressed = False
+        for prev in candidates:
+            nxt, peeled = _peel_one_committed_prefix(t, prev)
+            if peeled:
+                t = nxt
+                progressed = True
+                break
+        if not progressed or not t:
+            break
+    return t
+
+
+def _remember_committed_turn(host: "PipecatVoiceBridge", text: str) -> None:
+    t = (text or "").strip()
+    if not t:
+        return
+    turns = getattr(host, "_committed_turns", None)
+    if not isinstance(turns, list):
+        turns = []
+        host._committed_turns = turns
+    turns.append(t)
+    while len(turns) > _COMMITTED_TURNS_MAX:
+        turns.pop(0)
 
 
 # 厂商单次合成长度软上限；超过才按句号切开（仍避免逗号/36 字碎切）
@@ -243,7 +333,8 @@ def _build_user_turn_strategies(
     import os
 
     start = [_BotGatedVADStartStrategy(host, enable_interruptions=True)]
-    timeout_s = max(0.75, float(silence_s or 0.9))
+    # 中文口语短停顿易被 0.8s 切成半句；默认底线抬到 1.0s（仍可由 silence_ms 调）
+    timeout_s = max(1.0, float(silence_s or 1.1))
     use_smart = (os.getenv("EVOFLOW_VOICE_SMART_TURN") or "").strip().lower() in {
         "1",
         "true",
@@ -414,8 +505,15 @@ class _XiaomiHook(PipeFrameProcessor):
             return
 
         if isinstance(frame, PipeUserStoppedSpeakingFrame):
-            text = (self._last_text or "").strip()
+            raw = (self._last_text or "").strip()
             self._last_text = ""
+            committed = getattr(self._host, "_committed_turns", None) or []
+            text = _peel_committed_asr_prefix(raw, committed) if committed else raw
+            if text != raw and raw:
+                voice_log(
+                    "对话",
+                    f"ASR 粘连已剥前缀：「{raw[:40]}」→「{(text or '')[:40]}」",
+                )
             if self._speech_started_at:
                 _dur_ms = (time.monotonic() - self._speech_started_at) * 1000.0
                 self._speech_started_at = None
@@ -425,7 +523,7 @@ class _XiaomiHook(PipeFrameProcessor):
                 )
             if _is_junk_turn(text):
                 # 嗯/哦/哈哈 这类纯语气词：VAD 误触发常见，发进模型只会白耗一轮还答非所问
-                voice_log("对话", f"丢弃语气词回合：「{text}」（不进 agent）")
+                voice_log("对话", f"丢弃语气词回合：「{text or raw}」（不进 agent）")
                 await self.push_frame(frame, direction)
                 return
             if text:
@@ -433,16 +531,27 @@ class _XiaomiHook(PipeFrameProcessor):
                 self._host._turn += 1
                 turn = self._host._turn
                 self._host._turn_stopped_at = time.monotonic()
+                _remember_committed_turn(self._host, text)
                 voice_log("对话", f"用户输入（完整）：「{text}」 turn={turn}")
                 if self._auto_ack:
                     ack = random.choice(_ACK_POOL)
                     voice_log("播报", f"先播确认短句：「{ack}」")
                     await self.push_frame(PipeTTSSpeakFrame(text=ack))
+                # 切勿 await on_user_turn：其内若同步写 usage DB / WS 背压，会卡死整条
+                # Pipecat 管线 → 前端一直「聆听中」、ASR 等包超时（日志 19:01:43→19:02:59≈76s）。
                 if self._on_user_turn:
+                    handler = self._on_user_turn
+
+                    async def _fire_user_turn(t: str = text, h=handler) -> None:
+                        try:
+                            await h(t)
+                        except Exception as e:
+                            logger.warning("on_user_turn failed: %s", e)
+
                     try:
-                        await self._on_user_turn(text)
+                        asyncio.create_task(_fire_user_turn())
                     except Exception as e:
-                        logger.warning("on_user_turn failed: %s", e)
+                        logger.warning("schedule on_user_turn failed: %s", e)
                 # Surface turn text to Evo session (WS turn_end / final)
                 await self._host._out_q.put(("user_turn", text, turn))
             else:
@@ -469,7 +578,7 @@ class PipecatVoiceBridge(FrameProcessor):
         tts_provider: str | None = "volcengine",
         speaker: str | None = None,
         on_user_turn: TurnHandler | None = None,
-        silence_ms: float = 800.0,
+        silence_ms: float = 1100.0,
         auto_ack: bool = False,
     ) -> None:
         super().__init__(name="PipecatVoiceBridge")
@@ -479,6 +588,8 @@ class PipecatVoiceBridge(FrameProcessor):
         self._on_user_turn = on_user_turn
         self._silence_s = max(0.2, float(silence_ms) / 1000.0)
         self._auto_ack = auto_ack
+        # 近几轮已发用户句：火山同会话 ASR 粘连剥前缀用
+        self._committed_turns: list[str] = []
 
         self._stt: EvoSTTService | None = None
         self._tts: VolcengineTTSService | None = None
@@ -522,6 +633,10 @@ class PipecatVoiceBridge(FrameProcessor):
         )
         # 流式分句的未发送缓冲（仅流式模式使用）
         self._stream_buf = ""
+        # 短句合并缓冲：未达 _STREAM_MIN_EMIT_CHARS 先攒着，force/首句除外
+        self._stream_merge = ""
+        # 本轮是否已从流式分句推过至少一段（同步标记；勿依赖异步 on_tts_request）
+        self._stream_opened = False
         # 用户说完（turn 判定）的 monotonic 锚点；首句合成请求时打时延
         self._turn_stopped_at: float | None = None
         # 播报预算：本轮已播正文字数 / 是否已截断改播收尾提示
@@ -556,6 +671,8 @@ class PipecatVoiceBridge(FrameProcessor):
         self._ignore_assistant = False
         self._assistant_plain = ""
         self._stream_buf = ""
+        self._stream_merge = ""
+        self._stream_opened = False
         self._turn_tts_count = 0
         self._turn_spoken_texts = []
         self._turn_spoken_chars = 0
@@ -587,11 +704,13 @@ class PipecatVoiceBridge(FrameProcessor):
         if self._turn_trimmed:
             # 已截断：剩余正文只留日志，不再进 TTS
             self._stream_buf = ""
+            self._stream_merge = ""
             return
         if self._turn_spoken_chars >= _VOICE_SPEAK_MAX_CHARS:
             # 预算已用完且后面还有实质内容 → 截断 + 收尾提示
             self._turn_trimmed = True
             self._stream_buf = ""
+            self._stream_merge = ""
             dropped = len(_READABLE.findall(buf))
             voice_log(
                 "播报",
@@ -601,14 +720,17 @@ class PipecatVoiceBridge(FrameProcessor):
             await self._push_hold_body_to_tts(_VOICE_SPEAK_TRIM_NOTICE)
             return
         cut = -1
+        strong_cut = False
         for m in _STREAM_SENT_END_RE.finditer(buf):
             cut = m.end()
+            strong_cut = True
         if cut > 0 and _readable_len(buf[:cut]) >= (1 if force else 2):
             pass
         else:
             cut = -1
-            if self._turn_tts_count == 0:
-                # 首句快切：本轮还没出声，逗号/顿号就先发，用户第一时间听到第一个字
+            strong_cut = False
+            if not self._stream_opened:
+                # 首句软切只进合并缓冲，不单独送合成（避免「好，」开口再卡）
                 for m in _STREAM_SOFT_END_RE.finditer(buf):
                     cut = m.end()
                 if cut > 0 and (_readable_len(buf[:cut]) < 2 or len(buf[:cut].strip()) < 4):
@@ -628,13 +750,34 @@ class PipecatVoiceBridge(FrameProcessor):
         body = strip_markdown_light(chunk).strip()
         if not body or not _has_readable(body):
             return
+        # 合并：软切/硬切只攒字；中途送合成必须强句号且够长，否则等 End 整段一次。
+        pending = f"{self._stream_merge}{body}" if self._stream_merge else body
+        readable = _readable_len(pending)
+        should_emit = force or (
+            strong_cut and readable >= _STREAM_MIN_EMIT_CHARS
+        )
+        if not should_emit:
+            self._stream_merge = pending
+            voice_log(
+                "分句",
+                f"短句暂缓合并 turn={self._turn} add={len(body)} pending={readable}/"
+                f"{_STREAM_MIN_EMIT_CHARS}"
+                f"{'' if strong_cut else ' soft'}"
+                f"：「{body[:40]}」"
+                + ("…" if len(body) > 40 else ""),
+            )
+            return
+        self._stream_merge = ""
+        self._stream_opened = True
         voice_log(
             "分句",
-            f"流式切句 turn={self._turn} len={len(body)}：「{body[:60]}」"
-            + ("…" if len(body) > 60 else ""),
+            f"流式切句 turn={self._turn} len={len(pending)}："
+            f"「{pending[:60]}」"
+            + ("…" if len(pending) > 60 else "")
+            + ("" if pending == body else f"（合并自短句）"),
         )
-        await self._push_hold_body_to_tts(body)
-        self._turn_spoken_chars += len(body)
+        await self._push_hold_body_to_tts(pending)
+        self._turn_spoken_chars += len(pending)
 
     async def inject_assistant_end(self) -> None:
         plain = (self._assistant_plain or "").strip()
@@ -663,6 +806,18 @@ class PipecatVoiceBridge(FrameProcessor):
         # 流式：End = 确定性冲尾句（缓冲里剩下的不足一句的部分），无聚合器竞态
         if not self._ignore_assistant:
             await self._flush_stream_sentences(force=True)
+            # force 冲完 stream_buf 后，仍可能有未达阈值的 merge 残段
+            if self._stream_merge and _has_readable(self._stream_merge):
+                tail = self._stream_merge
+                self._stream_merge = ""
+                self._stream_opened = True
+                voice_log(
+                    "分句",
+                    f"冲刷合并残句 turn={self._turn} len={len(tail)}：「{tail[:60]}」"
+                    + ("…" if len(tail) > 60 else ""),
+                )
+                await self._push_hold_body_to_tts(tail)
+                self._turn_spoken_chars += len(tail)
         if self._turn_trimmed:
             tail = self._stream_buf
             if _has_readable(tail):
@@ -672,6 +827,7 @@ class PipecatVoiceBridge(FrameProcessor):
                 )
         self._assistant_plain = ""
         self._stream_buf = ""
+        self._stream_merge = ""
         await self._close_llm_turn_and_drop_residual(reason="assistant_end_stream")
 
     async def _push_hold_body_to_tts(self, body: str) -> None:

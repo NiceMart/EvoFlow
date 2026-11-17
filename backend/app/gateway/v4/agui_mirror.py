@@ -108,6 +108,28 @@ def _is_hidden_task_notification_user_text(text: object) -> bool:
     )
 
 
+def _is_hidden_context_compaction_user_text(text: object) -> bool:
+    """Compaction / tool-history injects must not become visible userInput."""
+    head = str(text or "").lstrip()
+    if not head:
+        return False
+    lower = head.lower()
+    if lower.startswith("[context compaction"):
+        return True
+    if lower.startswith("here is a summary of the conversation to date"):
+        return True
+    if lower.startswith("here's a summary of the conversation to date"):
+        return True
+    return head.startswith(
+        (
+            "[上下文摘要",
+            "[深度压缩摘要",
+            "[tool:history]",
+            "[tool:summary]",
+        )
+    )
+
+
 def _is_hidden_task_notification_message_id(message_id: object) -> bool:
     mid = str(message_id or "").strip()
     if not mid:
@@ -135,6 +157,11 @@ _WRITE_TOOL_NAMES = {
     "write", "write_file", "write_to_file", "edit", "edit_file",
     "replace", "str_replace", "replace_in_file", "multi_edit", "apply_patch",
 }
+
+# toolCall 行 output.text 预览上限（字符）：对齐旧链路 chat-normalize._UI_TOOL_OUTPUT_MAX。
+# 巨型工具结果（视频生成 base64 等）不进投影行——快照字节预算收缩与 renderer OOM 的根因；
+# 全文走 /tool-results 按需拉取（hydration 同阈值）。
+_TOOL_OUTPUT_ROW_PREVIEW_MAX = 12_000
 
 _DIFF_MAX_LINES = 800
 
@@ -688,6 +715,19 @@ class _MirrorState:
 
     终态帧通常不带这些字段，而 v4 upsert 是整行替换——不记账会把 Agent 卡上的
     类型徽标清成 general、摘要清空。"""
+    turn_usage: dict[str, int] | None = None
+    """最近一轮的累计 token usage（CUSTOM name="usage" 的六字段 wire 三元组）。
+
+    跨轮保留——早封路径（thread_state/usage 先于 run_end）里 RUN_FINISHED 先到、
+    usage 事件同批后到，reset 后仍要盖到轮尾正文行上；RUN_STARTED 开新轮时清零。"""
+    last_text_row_id: int = 0
+    """最近一条 assistantText 行 rowId（TEXT_MESSAGE_START 记录，跨轮保留）。
+    usage 盖章目标：轮累计只盖轮尾正文行（V4 面板在轮尾动作行显示）。"""
+    last_turn_success: bool = False
+    """最近一轮是否成功收尾（RUN_FINISHED=True / RUN_ERROR=False）。failed 轮不盖 usage。"""
+    usage_bumped: bool = False
+    """本轮累计 usage 是否已并入会话级 usage_state。usage 事件是轮累计（非增量），
+    RUN_FINISHED 与迟到事件只允许并入一次，防双计。"""
 
 
 def _running_control(
@@ -729,7 +769,11 @@ class V4Mirror:
         return st
 
     def _patch_control(self, tid: str, control: dict[str, Any]) -> None:
-        self._hub.author_state_patch(tid, {"control": control})
+        # 经 hub 唯一入口写 control：override 落会话态，快照重建（刷新重订阅 /
+        # recovery / 订阅者溢出转 snapshot）与在线 delta 同源——不再被
+        # _minimal_control(sess.phase) 重算覆盖（主聊 sess.phase 停在 draft，
+        # 刷新后 control 永远 draft+canStop:false 的根因）。
+        self._hub.set_control_override(tid, control)
 
     def _clear_api_retry(self, tid: str, st: _MirrorState, *, now_ms: int) -> None:
         """Drop retry banner while keeping the turn running (e.g. model resumed)."""
@@ -779,6 +823,43 @@ class V4Mirror:
                     "createdAt": st.turn_started_at_ms or now_ms,
                     "createdAtSeq": self._seq_now(tid),
                     "entityId": mid,
+                    "endedAt": now_ms,
+                },
+            )
+
+    def _seal_streaming_reasoning(
+        self, tid: str, st: _MirrorState, *, now_ms: int, state: str = "interrupted"
+    ) -> None:
+        """停/顶轮时封掉仍 streaming 的思考行，否则 timelineBusy 钉死、画面像卡住。"""
+        if not st.reasoning_row_ids:
+            return
+        seal = str(state or "interrupted").strip() or "interrupted"
+        for mid, rid in list(st.reasoning_row_ids.items()):
+            sess = self._hub.get_session(tid)
+            existing = sess.rows.get(int(rid)) if sess is not None else None
+            cur_state = (
+                str(existing.get("state") or "").strip()
+                if isinstance(existing, dict)
+                else ""
+            )
+            if cur_state and cur_state != "streaming":
+                continue
+            self._hub.author_upsert_row(
+                tid,
+                {
+                    "rowId": rid,
+                    "turnId": st.turn_id,
+                    "kind": "reasoning",
+                    "state": seal,
+                    "text": str(st.reasoning_acc.get(mid) or ""),
+                    "createdAt": (
+                        int(existing.get("createdAt") or 0)
+                        if isinstance(existing, dict)
+                        else now_ms
+                    )
+                    or now_ms,
+                    "createdAtSeq": self._seq_now(tid),
+                    "assistantResponseId": mid,
                     "endedAt": now_ms,
                 },
             )
@@ -871,6 +952,68 @@ class V4Mirror:
                 },
             )
 
+    def _bump_session_usage_state(self, tid: str, st: _MirrorState) -> None:
+        """把本轮累计 usage 并入会话级 usage_state，并发 usage state 增量。
+
+        基线 = 快照路径（``_build_session_usage``）写的 ``sess.usage_state``（DB
+        rollup 真值）；本进程还没建过快照就跳过，下个快照自带真值。usage 事件是
+        轮累计（非逐次增量），RUN_FINISHED 与迟到事件靠 ``usage_bumped`` 只并一次。
+        DB 累计由 transcript 落库路径（add_session_token_usage）另行维护，不在这里读库。
+        """
+        usage = st.turn_usage
+        if not usage or st.usage_bumped:
+            return
+        sess = self._hub.get_session(tid)
+        base = getattr(sess, "usage_state", None) if sess is not None else None
+        if not isinstance(base, dict) or not isinstance(base.get("cumulative"), dict):
+            return
+        cum = dict(base["cumulative"])
+
+        def _add(key: str, raw: str) -> None:
+            cum[key] = int(cum.get(key) or 0) + int(usage.get(raw) or 0)
+
+        _add("inputTokens", "input_tokens")
+        _add("outputTokens", "output_tokens")
+        _add("cacheReadTokens", "cache_read_tokens")
+        _add("cacheWriteTokens", "cache_creation_tokens")
+        _add("totalTokens", "total_tokens")
+        _add("cacheMissTokens", "cache_miss_tokens")
+        patched = {**base, "cumulative": cum}
+        sess.usage_state = patched
+        st.usage_bumped = True
+        self._hub.author_state_patch(tid, {"usage": patched})
+
+    def _stamp_turn_usage(self, tid: str, st: _MirrorState) -> None:
+        """把轮累计 usage 盖到最近一条 assistantText 行上（V4 轮尾动作行显示）。
+
+        author_upsert_row 是整行替换：必须从 sess.rows 取现值带全量字段，只追加
+        usage 键。行仍在 streaming / 已被换 kind 时不盖（终态帧会再盖）。
+        """
+        usage = st.turn_usage
+        rid = int(st.last_text_row_id or 0)
+        if not usage or rid <= 0:
+            return
+        sess = self._hub.get_session(tid)
+        existing = sess.rows.get(rid) if sess is not None else None
+        if not isinstance(existing, dict) or str(existing.get("kind") or "") != "assistantText":
+            return
+        if str(existing.get("state") or "") != "complete":
+            return
+        row_usage: dict[str, int] = {
+            "inputTokens": int(usage.get("input_tokens") or 0),
+            "outputTokens": int(usage.get("output_tokens") or 0),
+            "totalTokens": int(usage.get("total_tokens") or 0),
+        }
+        cache_read = int(usage.get("cache_read_tokens") or 0)
+        cache_write = int(usage.get("cache_creation_tokens") or 0)
+        if cache_read > 0:
+            row_usage["cacheReadTokens"] = cache_read
+        if cache_write > 0:
+            row_usage["cacheWriteTokens"] = cache_write
+        if not any(row_usage.values()):
+            return
+        self._hub.author_upsert_row(tid, {**existing, "usage": row_usage})
+
     def _on_activity_snapshot(self, tid: str, st: _MirrorState, ev: dict[str, Any], *, now_ms: int) -> None:
         """Project ACTIVITY_SNAPSHOT retrying/model_error into V4 control + optional text."""
         if not st.run_started:
@@ -962,6 +1105,9 @@ class V4Mirror:
             (raw and _is_hidden_task_notification_user_text(raw))
             or _is_hidden_task_notification_message_id(message_id)
         ):
+            return
+        # 上下文压缩摘要：同理，勿落可见气泡。
+        if raw and _is_hidden_context_compaction_user_text(raw) and not atts:
             return
         st = self._state(tid)
         st.user_text = raw
@@ -1135,6 +1281,10 @@ class V4Mirror:
                     prev_turn_id,
                     new_turn_id,
                 )
+                # 先封未收口工具/流式正文/思考，再 reset ephemeral——否则行永久 running/streaming。
+                self._seal_open_tool_calls(tid, st, now_ms=now_ms, status="cancelled")
+                self._mark_assistant_text_interrupted(tid, st, now_ms=now_ms)
+                self._seal_streaming_reasoning(tid, st, now_ms=now_ms, state="interrupted")
                 self._fail_open_turn_header(
                     tid,
                     st,
@@ -1147,6 +1297,11 @@ class V4Mirror:
             st.last_turn_id = new_turn_id
             st.turn_started_at_ms = now_ms
             st.turn_file_changes = {}
+            # 新一轮：上一轮的 usage 盖章上下文作废（上一轮若已盖完就定格在原行）。
+            st.turn_usage = None
+            st.last_text_row_id = 0
+            st.last_turn_success = False
+            st.usage_bumped = False
             rid = self._next_row_id(tid)
             st.turn_header_row_id = rid
             self._hub.author_append_row(
@@ -1183,6 +1338,7 @@ class V4Mirror:
                             _is_hidden_tool_approval_user_text(user_text)
                             or _is_hidden_duty_brief_user_text(user_text)
                             or _is_hidden_task_notification_user_text(user_text)
+                            or _is_hidden_context_compaction_user_text(user_text)
                         )
                     )
                     or _is_hidden_task_notification_message_id(user_mid)
@@ -1246,6 +1402,8 @@ class V4Mirror:
             rid = self._next_row_id(tid)
             st.text_row_ids[mid] = rid
             st.text_acc[mid] = ""
+            # 轮尾正文行记账：usage 盖章目标（同轮多次模型调用时自然是最后一条）。
+            st.last_text_row_id = rid
             self._hub.author_append_row(
                 tid,
                 {
@@ -1438,7 +1596,17 @@ class V4Mirror:
                 wechat_brief = _wechat_summary(content)
                 if wechat_brief:
                     content = wechat_brief
-            tool_output: dict[str, Any] = {"text": content}
+            # 行内 output.text 只留预览（对齐旧链路 _UI_TOOL_OUTPUT_MAX=12000）：
+            # 视频生成等工具结果曾单条 10MB 进投影行，快照字节预算被压到 20 行
+            # （「前面轮次/最新用户消息看不到」实锤），也是 WebView2 OOM 主因。
+            # 全文不丢——工具卡展开走 /tool-results 按需拉取。
+            output_text = content
+            if len(output_text) > _TOOL_OUTPUT_ROW_PREVIEW_MAX:
+                output_text = (
+                    output_text[:_TOOL_OUTPUT_ROW_PREVIEW_MAX]
+                    + "\n…（已截断，完整内容点开工具卡查看）"
+                )
+            tool_output: dict[str, Any] = {"text": output_text}
             # platform_ui（绑渠道二维码等）：与 cua_display 同级上浮，供 V4 PlatformToolCallBlock 出码。
             platform_ui_block: dict[str, Any] | None = None
             raw_platform_ui = ev.get("platform_ui")
@@ -1608,6 +1776,7 @@ class V4Mirror:
                     last_error = None
                     st.sticky_run_error = None
                     self._mark_assistant_text_interrupted(tid, st, now_ms=now_ms)
+                    self._seal_streaming_reasoning(tid, st, now_ms=now_ms, state="interrupted")
                 else:
                     last_error = _run_error_info(ev, now_ms=now_ms)
                     st.sticky_run_error = dict(last_error)
@@ -1639,7 +1808,8 @@ class V4Mirror:
             if et == "RUN_FINISHED" and produced_text:
                 phase = "completedSuccess"
             ctrl = _minimal_control(phase)
-            ctrl["sessionEnded"] = True
+            # sessionEnded 由 _minimal_control 按终态派生（成功/中断=True；
+            # error 可重试=False，对齐 ZCode onTurnError 语义），不再无条件 True。
             ctrl["canStop"] = False
             ctrl["stopState"] = "idle"
             ctrl["activeWorks"] = []
@@ -1652,9 +1822,19 @@ class V4Mirror:
                 self._seal_open_tool_calls(tid, st, now_ms=now_ms, status="cancelled")
             elif et == "RUN_ERROR":
                 self._seal_open_tool_calls(tid, st, now_ms=now_ms, status="error")
+                self._seal_streaming_reasoning(tid, st, now_ms=now_ms, state="interrupted")
             else:
                 self._seal_open_tool_calls(tid, st, now_ms=now_ms, status="cancelled")
                 self._seal_streaming_assistant_text(tid, st, now_ms=now_ms, state="complete")
+                self._seal_streaming_reasoning(tid, st, now_ms=now_ms, state="complete")
+            # 轮累计 usage 盖轮尾正文行：必须在 seal 之后（行已 complete，否则被整行替换清掉）。
+            # failed / 用户停止轮不盖（V4 动作行只渲染 complete 正文，轮尾也不展示失败用量）。
+            st.last_turn_success = et == "RUN_FINISHED"
+            if et == "RUN_FINISHED" and produced_text:
+                self._stamp_turn_usage(tid, st)
+            # 会话总计：成功轮的用量并入 sess.usage_state 并发 usage 增量（面板总计条）。
+            if et == "RUN_FINISHED":
+                self._bump_session_usage_state(tid, st)
             # 重置：允许下一轮 RUN_STARTED 再开 running turnHeader。
             self._reset_turn_ephemeral(st)
             return
@@ -1664,6 +1844,37 @@ class V4Mirror:
             return
 
         # 其余事件不投影——ACTIVITY_SNAPSHOT / CUSTOM 已在上方处理。
+
+    def _on_usage_custom(self, tid: str, st: _MirrorState, value: Any) -> None:
+        """CUSTOM(name="usage") → 轮累计 token usage 并盖到轮尾正文行。
+
+        事件形态（两种同构）：sse_ui_normalize 的 ``{"type":"usage","usage":六字段}``
+        与 _seal_agui_run 的终态包层。早封路径里它跟 RUN_FINISHED 同批但排在其后
+        （agui_stream_normalizer 先 seal 再 append usage）——轮已 reset，靠跨轮保留的
+        last_text_row_id / last_turn_success 兜住这次迟到盖章；轮进行中只记账不盖章
+        （正文行还是 streaming，盖了也会被 TEXT_MESSAGE_END 整行替换清掉）。
+        """
+        payload = value if isinstance(value, dict) else {}
+        usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else payload
+        triplet = {
+            key: int(usage.get(key) or 0)
+            for key in (
+                "input_tokens",
+                "output_tokens",
+                "total_tokens",
+                "cache_read_tokens",
+                "cache_creation_tokens",
+                "cache_miss_tokens",
+            )
+        }
+        if not any(triplet.values()):
+            return
+        st.turn_usage = triplet
+        if not st.run_started and st.last_turn_success:
+            self._stamp_turn_usage(tid, st)
+            # 早封路径：RUN_FINISHED 先到（当时 turn_usage 还是 None，没并入过）
+            # → 迟到的这份累计就是本轮终值，在此补并入会话总计（usage_bumped 防双计）。
+            self._bump_session_usage_state(tid, st)
 
     # -- task_*（subagent）事件 → subagent 行 ---------------------------------
     #
@@ -1683,6 +1894,9 @@ class V4Mirror:
     def _on_custom(self, tid: str, st: _MirrorState, ev: dict[str, Any], *, now_ms: int) -> None:
         name = str(ev.get("name") or "").strip()
         value = ev.get("value")
+        if name == "usage":
+            self._on_usage_custom(tid, st, value)
+            return
         if name != "custom" or not isinstance(value, dict):
             return
         chunk = value.get("chunk") if isinstance(value.get("chunk"), dict) else value
@@ -1803,6 +2017,89 @@ def mirror_note_user_input(
         )
     except Exception:
         logger.exception("[v4-mirror] note_user_input failed thread=%s", thread_id)
+
+
+def mirror_ensure_transcript_user_input(
+    thread_id: str,
+    text: str,
+    *,
+    message_id: str | None = None,
+    origin: str = "realUser",
+) -> bool:
+    """Transcript POST 已落库时，立刻在 V4 投影补一条可见 userInput。
+
+    正常流式会由 ``note_user_input`` + RUN_STARTED 落行；若 POST /runs/stream
+    在 RUN_STARTED 前 503（LG unreachable），投影永远没有气泡，前端再清乐观
+    行就会「消息消失」。本函数在 append 成功后兜底，按 message_id / 尾部同文
+    去重，避免与随后 RUN_STARTED 双写。
+    """
+    if _MIRROR_DISABLED:
+        return False
+    tid = str(thread_id or "").strip()
+    raw = str(text or "").strip()
+    mid = str(message_id or "").strip()
+    if not tid or not raw:
+        return False
+    if _is_hidden_tool_approval_user_text(raw):
+        return False
+    if _is_hidden_duty_brief_user_text(raw):
+        return False
+    if _is_hidden_task_notification_user_text(raw) or _is_hidden_task_notification_message_id(mid):
+        return False
+    if _is_hidden_context_compaction_user_text(raw):
+        return False
+    try:
+        mirror = _get_mirror()
+        # Seed pending so a later RUN_STARTED can reuse (message_id) instead of double-append.
+        mirror.note_user_input(tid, raw, message_id=mid or None, origin=origin)
+        reusable = mirror._find_reusable_user_input_row(  # noqa: SLF001 — same-module helper
+            tid,
+            user_mid=mid,
+            user_text=raw,
+            prev_turn_id="",
+        )
+        if reusable is None:
+            # Tail same-text check (prev_turn_id empty skips text match in reusable helper).
+            sess = mirror._hub.get_session(tid)  # noqa: SLF001
+            if sess is not None and sess.rows:
+                for row in sorted(
+                    (r for r in sess.rows.values() if isinstance(r, dict)),
+                    key=lambda r: int(r.get("rowId") or 0),
+                    reverse=True,
+                ):
+                    if str(row.get("kind") or "") != "userInput":
+                        continue
+                    if str(row.get("origin") or "") not in ("", "realUser", "goalContinuation"):
+                        continue
+                    if mid and str(row.get("entityId") or "").strip() == mid:
+                        reusable = row
+                        break
+                    if str(row.get("text") or "").strip() == raw:
+                        reusable = row
+                        break
+                    # Only scan recent tail userInputs.
+                    break
+        if reusable is not None:
+            return False
+        now_ms = int(time.time() * 1000)
+        user_origin = origin if origin in ("realUser", "goalContinuation") else "realUser"
+        user_row: dict[str, Any] = {
+            "rowId": mirror._next_row_id(tid),  # noqa: SLF001
+            "turnId": f"transcript-{now_ms}",
+            "kind": "userInput",
+            "text": raw,
+            "origin": user_origin,
+            "createdAt": now_ms,
+            "createdAtSeq": mirror._seq_now(tid),  # noqa: SLF001
+            "actions": {"canEdit": True},
+        }
+        if mid:
+            user_row["entityId"] = mid
+        mirror._hub.author_append_row(tid, user_row)  # noqa: SLF001
+        return True
+    except Exception:
+        logger.exception("[v4-mirror] ensure_transcript_user_input failed thread=%s", tid)
+        return False
 
 
 def mirror_feed_agui_wire(thread_id: str, frames: list[bytes] | list[str]) -> int:
@@ -2047,6 +2344,38 @@ def mirror_channel_sync_lg_messages(
         logger.debug("[v4-mirror] channel_sync_lg_messages skipped thread=%s", tid, exc_info=True)
 
 
+def mirror_seal_user_stop(thread_id: str) -> None:
+    """用户点停：在掐断 stream proxy 之前立刻封 V4 投影。
+
+    ``stop_session_execution`` 会先 ``unregister_active_stream_proxy``，若只靠
+    在途 AG-UI 的 RUN_ERROR 收口，事件常已断流 → 工具卡/思考永久 streaming，
+    下一轮糊糊在旧 turn 上（停后再发「显示错乱」）。
+    """
+    if _MIRROR_DISABLED:
+        return
+    tid = str(thread_id or "").strip()
+    if not tid:
+        return
+    try:
+        mirror = _get_mirror()
+        st = mirror._states.get(tid)  # noqa: SLF001
+        if not st or not st.run_started:
+            return
+        mirror.feed_events(
+            tid,
+            [
+                {
+                    "type": "RUN_ERROR",
+                    "code": "USER_INTERRUPT",
+                    "message": "user_interrupt",
+                    "threadId": tid,
+                }
+            ],
+        )
+    except Exception:
+        logger.debug("[v4-mirror] seal_user_stop failed thread=%s", tid, exc_info=True)
+
+
 def mirror_channel_run_finished(thread_id: str, *, error: bool = False) -> None:
     """IM 流结束：结算 turnHeader。"""
     if _MIRROR_DISABLED:
@@ -2071,9 +2400,11 @@ def mirror_channel_run_finished(thread_id: str, *, error: bool = False) -> None:
 __all__ = [
     "V4Mirror",
     "mirror_note_user_input",
+    "mirror_ensure_transcript_user_input",
     "mirror_feed_agui_wire",
     "mirror_reset_thread",
     "mirror_thread_is_live",
+    "mirror_seal_user_stop",
     "mirror_channel_run_started",
     "mirror_channel_assistant_text",
     "mirror_channel_sync_lg_messages",

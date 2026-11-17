@@ -53,7 +53,7 @@ PLATFORM_DOMAINS = (
 DOMAIN_GUIDES: dict[str, dict[str, str]] = {
     "knowledge": {
         "title": "知识库",
-        "when": "查/建/管平台自有知识库、语义检索文档、读写或删除笔记时（Obsidian Vault 为遗留接入）",
+        "when": "查/建/管平台自有知识库、语义检索文档、读写或删除笔记时",
         "not": "对话内临时 checklist 用 todo；岗位开单推进用 tasks 工具",
     },
     "workflow": {
@@ -105,6 +105,7 @@ DOMAIN_GUIDES: dict[str, dict[str, str]] = {
         "title": "智能体员工岗位",
         "when": (
             "看名册汇总/跨岗看板/单岗近况（org_status、board_overview、brief）、"
+            "列部门目录（departments）、"
             "雇佣/暂停/恢复/唤醒/派新活/删除员工、改心跳、看工作日志、迁移旧事项到 Task、"
             "为岗位扫码绑飞书/企微（绑定本岗 AI 员工）时；新建优先 capability_pack=duty。"
             "新目标用 employees.dispatch；已有 Task / 卡住用 employees.wake；"
@@ -308,10 +309,9 @@ def _build_registry() -> dict[str, PlatformAction]:
     items: list[PlatformAction] = [
         # knowledge
         _A("knowledge.list", "knowledge", "列出平台自有知识库", "read", "无", H.knowledge_list, "有哪些知识库"),
-        _A("knowledge.search", "knowledge", "检索自有知识库（默认 hybrid 多库扇出）", "read", "query, vaultId?/kbId?, top_k?, mode?", H.knowledge_search, "怎么配置 MCP"),
+        _A("knowledge.search", "knowledge", "检索自有知识库（默认 hybrid 多库扇出）", "read", "query, vaultId?/kbId?, top_k?, mode?, category?", H.knowledge_search, "怎么配置 MCP"),
         _A("knowledge.create", "knowledge", "新建平台自有知识库", "write", "name, description?, embeddingModelRef?", H.knowledge_create, "建个英语单词库"),
-        _A("knowledge.enable", "knowledge", "启用/停用 Obsidian Vault（遗留）", "write", "vaultId, enabled", H.knowledge_enable, "关掉某 Vault"),
-        _A("knowledge.ingest", "knowledge", "写入一篇笔记", "write", "title, content, vaultId?/kbId?, summary?, tags?", H.knowledge_ingest, "把大纲写进库"),
+        _A("knowledge.ingest", "knowledge", "写入一篇笔记", "write", "title, content, vaultId?/kbId?, inboxPath?", H.knowledge_ingest, "把大纲写进库"),
         _A("knowledge.notes", "knowledge", "列出库内笔记", "read", "vaultId?/kbId?, prefix?, limit?", H.knowledge_notes, "英语库里有哪些笔记"),
         _A("knowledge.note_get", "knowledge", "读取一篇笔记", "read", "path, vaultId?/kbId?", H.knowledge_note_get, "打开某篇笔记"),
         _A("knowledge.note_delete", "knowledge", "删除一篇笔记", "destructive", "path, vaultId?/kbId?", H.knowledge_note_delete, "删掉这篇笔记"),
@@ -348,7 +348,7 @@ def _build_registry() -> dict[str, PlatformAction]:
         _A("workflow.delete", "workflow", "删除工作流", "destructive", "appId", H.workflow_delete, "删掉这个应用"),
         _A("workflow.revisions", "workflow", "查看历史版本", "read", "appId, limit?", H.workflow_revisions, "这个应用改过几版"),
         _A("workflow.restore_revision", "workflow", "从历史版本恢复", "write", "appId, version, as_draft?", H.workflow_restore_revision, "恢复到上一版"),
-        _A("workflow.run", "workflow", "启动一次运行", "write", "appId, parameters?", H.workflow_run, "跑一下拆解流程"),
+        _A("workflow.run", "workflow", "启动一次运行", "write", "appId, parameters?, run_kind?", H.workflow_run, "跑一下拆解流程"),
         _A("workflow.stop", "workflow", "取消或暂停运行", "write", "runId, reason?, pause?", H.workflow_stop, "停掉刚才的运行"),
         _A("workflow.resume", "workflow", "恢复已暂停运行", "write", "runId", H.workflow_resume, "继续刚才暂停的运行"),
         _A(
@@ -612,7 +612,15 @@ def _build_registry() -> dict[str, PlatformAction]:
             H.agents_create,
             "建个文案助手用 capability_pack=writer",
         ),
-        _A("agents.update", "agents", "更新智能体配置", "write", "name + 要改的字段", H.agents_update, "给文案助手换模型"),
+        _A(
+            "agents.update",
+            "agents",
+            "更新智能体配置",
+            "write",
+            "name + 要改的字段（含 tts_speaker / tts_speech_rate 声线）",
+            H.agents_update,
+            "给文案助手换模型；或改 tts_speaker / tts_speech_rate",
+        ),
         _A(
             "agents.delete",
             "agents",
@@ -625,9 +633,20 @@ def _build_registry() -> dict[str, PlatformAction]:
         # employees
         _A("employees.list", "employees", "列出智能体员工岗位", "read", "status?", H.employees_list, "现在有哪些员工"),
         _A(
+            "employees.departments",
+            "employees",
+            "列出部门目录（名称、人数、负责人、成员 agent_code）",
+            "read",
+            "无",
+            H.employees_departments,
+            "现在有哪些部门",
+            "部门列表",
+            "组织架构有几个部门",
+        ),
+        _A(
             "employees.org_status",
             "employees",
-            "名册汇总：人数、忙闲、待审批（不含小V自身）",
+            "名册汇总：人数、忙闲、待审批（不含小V自身）；附带部门目录摘要",
             "read",
             "无",
             H.employees_org_status,
@@ -792,7 +811,7 @@ def _build_registry() -> dict[str, PlatformAction]:
             "tasks",
             "列出协作 Task 台账（行政视角；默认不含子任务，limit 默认 50、上限 200）",
             "read",
-            "status?, assignee?, role?, source?, limit?, offset?, include_subtasks?",
+            "status?, assignee?, role?, source?, main_task_id?, limit?, offset?, include_subtasks?",
             H.tasks_list,
             "未结任务有哪些",
             "最近 5 条主任务",
@@ -812,7 +831,7 @@ def _build_registry() -> dict[str, PlatformAction]:
             "tasks",
             "行政侧创建 Task（值班开单/progress/handlers 结案优先用专用工具 tasks）",
             "write",
-            "name, description?, assignee?, role?…",
+            "name, description?, assignee?, role?/assigned_role?, main_task_id?, status?, source?, source_ref?, raised_by?, risk_level?, action_type?, round_id?, parent_task_id?",
             H.tasks_create,
             "建个待办给前端岗",
         ),
@@ -821,7 +840,7 @@ def _build_registry() -> dict[str, PlatformAction]:
             "tasks",
             "行政侧变更 Task 状态（合法流转：pending→executing→completed 等；非法时错误含 next_states）",
             "write",
-            "task_id, state=pending|planned|executing|waiting_user|awaiting_close|completed|failed|cancelled|…, summary?",
+            "task_id, state=pending|planned|executing|waiting_user|awaiting_close|completed|failed|cancelled|…, summary?, outputs?, handlers?, handlers_empty_reason?, subtask_id?",
             H.tasks_set_state,
             "把这单标完成",
             "先改成 executing 再 completed",
@@ -1552,10 +1571,19 @@ def build_help(topic: str | None = None) -> dict[str, Any]:
         return build_catalog(domain=t, detailed=True)
 
     sug = [name for name in reg if t in name or name.startswith(t)]
+    # 【self-evolution-bot · 2026-11-16 · 第20轮】与 dispatch 的 unknown action 同型缺陷：
+    # 上面两句只在 t 是「域」或「完整动作名」时命中；t='assets.search' 这类
+    # 「域.动作」拼错时 sug 为空，原实现回退 list(reg.keys())[:16] = 恒 knowledge.*，
+    # 于是 help 给出的建议与问的域无关。改为按域回填。
+    if not sug:
+        raw_dom = t.split(".", 1)[0].strip().lower() if "." in t else ""
+        if raw_dom:
+            sug = [n for n in reg if n.split(".", 1)[0].lower() == raw_dom]
     return {
         "ok": False,
         "error": f"unknown help topic: {t}",
         "suggestions": sug[:16] or list(reg.keys())[:16],
+        "suggestions_scoped": bool(sug),
         "domains": list(PLATFORM_DOMAINS),
         "guides": [domain_guide(d) for d in PLATFORM_DOMAINS],
         "hint": "先 action=catalog 看目录（含每域 when + 功能清单）。",
@@ -1644,14 +1672,43 @@ def dispatch_platform_action(
     if entry is None and "." not in act and domain:
         entry = reg.get(f"{str(domain).strip()}.{act}")
     if entry is None:
-        matches = [n for n in reg if n.endswith("." + act) or act in n]
-        return {
+        # 【self-evolution-bot · 2026-11-16 · 第20轮】原实现 miss 后回退 list(reg.keys())[:16]，
+        # 而注册表前 16 个键恒为 knowledge.* / workflow.*，于是任何未知 action（assets.search /
+        # employees.status / agents.catalog / settings.catalog / tasks.comment …）都拿到同一串与
+        # 调用域无关的「建议」——不是「不点名」，是**确定地指错**（现网 obs 实测 7 次，横跨
+        # main / xiaomi / fullstack-dev 三岗，每次都按它再绕一步）。改为按域/动作名取建议，
+        # 且当域不存在时明说「域不存在 + 平台只有这些域」，不再给与输入无关的假建议。
+        raw_dom = act.split(".", 1)[0].strip().lower() if "." in act else ""
+        leaf = act.split(".", 1)[1].strip().lower() if "." in act else key
+        known_domains = {d.lower() for d in PLATFORM_DOMAINS}
+        matches: list[str] = []
+        basis = "无相近动作"
+        if raw_dom and raw_dom in known_domains:
+            matches = [n for n in reg if n.split(".", 1)[0].lower() == raw_dom]
+            basis = f"域 {raw_dom!r} 下的已注册动作（域存在，但没有 {leaf!r}）"
+            # leaf 的近邻排前：employees.status → employees.org_status 才该被第一眼看到。
+            if leaf:
+                matches.sort(key=lambda n: (leaf not in n.split(".", 1)[-1].lower(), n))
+        if not matches and leaf:
+            matches = [n for n in reg if leaf in n.split(".", 1)[-1].lower()]
+            if matches:
+                basis = f"动作名包含 {leaf!r}"
+        payload: dict[str, Any] = {
             "ok": False,
             "error": f"unknown action: {act}",
-            "suggestions": matches[:12] or list(reg.keys())[:16],
+            "suggestions": matches[:12],
+            "suggestion_basis": basis,
             "domains": list(PLATFORM_DOMAINS),
             "catalog_hint": "先调用 action=catalog 或 help。",
         }
+        if raw_dom and raw_dom not in known_domains:
+            payload["domain_exists"] = False
+            payload["hint"] = (
+                f"域 {raw_dom!r} 不存在；平台域只有 {', '.join(PLATFORM_DOMAINS)} 这 {len(PLATFORM_DOMAINS)} 个。"
+            )
+        elif raw_dom:
+            payload["domain_exists"] = True
+        return payload
 
     try:
         args = _parse_args(args_json)

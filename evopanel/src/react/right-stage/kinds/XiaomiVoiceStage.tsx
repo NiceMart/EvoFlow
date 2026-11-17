@@ -34,7 +34,9 @@ import {
 } from '../../../lib/xw-voice-mode.js'
 import { XiaomiV4Timeline } from '../../components/XiaomiV4Timeline.js'
 import { VoicePlaybackDiagnostics } from '../../components/VoicePlaybackDiagnostics.js'
+import { VoiceThinkingDiagnostics } from '../../components/VoiceThinkingDiagnostics.js'
 import { XiaoxiStagePet, type PetMode } from '../../components/XiaoxiStagePet.js'
+import { apiUrl } from '../../../lib/api-client.js'
 import './xiaomi-voice-stage.css'
 
 /** 舞台只暴露三态：跟流式/播报接口对齐，别再拆「待命/识别/占用」。 */
@@ -50,7 +52,7 @@ type RecentPanelSize = 'open' | 'hidden'
 const STATE_LABEL: Record<StageState, string> = {
   listen: '聆听',
   // 勿写成「思考」：会和设置里「关思考」(模型推理) 撞名；本态只是等模型出字。
-  think: '处理中',
+  think: '生成中',
   speak: '播报',
 }
 
@@ -88,6 +90,16 @@ export function XiaomiVoiceStage() {
   const [rightStageOpen, setRightStageOpen] = useState(() => rightStageStore.isOpen)
   /** P2 播报台账诊断面板 */
   const [ledgerOpen, setLedgerOpen] = useState(false)
+  /** 思考 wire / 网关守卫调试 */
+  const [thinkingDbgOpen, setThinkingDbgOpen] = useState(false)
+  /** null=未知 false=关 true=开（最近一次厂商请求） */
+  const [modelThinkingOn, setModelThinkingOn] = useState<boolean | null>(null)
+  const [gatewayMode, setGatewayMode] = useState('')
+  /** 当前会话模型（语音排查：GLM-5.3 强制思考等） */
+  const [sessionModelId, setSessionModelId] = useState('')
+  const [sessionModelLabel, setSessionModelLabel] = useState('')
+  const [thinkingAlwaysOn, setThinkingAlwaysOn] = useState(false)
+  const [wireModelId, setWireModelId] = useState('')
 
   const liveRef = useRef({
     session: false,
@@ -106,13 +118,118 @@ export function XiaomiVoiceStage() {
     stateRef.current = state
     stateSinceRef.current = Date.now()
     if (!visible) return
-    // 舞台可见态变化 → 前端日志（聆听/播报/处理中… + 时间点）
+    // 舞台可见态变化 → 前端日志（聆听/播报/生成中… + 时间点）
     void import('../../../lib/xiaomi-voice/voice-file-log.js')
       .then(({ noteVoiceUiState }) => {
         noteVoiceUiState(state, { source: '语音舞台' })
       })
       .catch(() => {})
   }, [state, visible])
+
+  // 会话模型：小V session context → 无则 primary；给语音面板一眼看清「在用谁」
+  useEffect(() => {
+    if (!visible) return
+    let cancelled = false
+    const syncModel = async () => {
+      try {
+        const { wsClient } = await import('../../../lib/ws-client.js')
+        const sk = String(sessionKey || '').trim()
+        const ctx = sk ? wsClient.getSessionContext?.(sk) || {} : {}
+        let mid = String(
+          (ctx as { modelName?: string; model_name?: string }).modelName ||
+            (ctx as { model_name?: string }).model_name ||
+            '',
+        ).trim()
+        if (!mid) {
+          try {
+            const { getPanelSettingsSync } = await import('../../../lib/panel-settings.js')
+            const ps = getPanelSettingsSync?.() || {}
+            mid = String(
+              (ps as { lastSelectedModel?: string }).lastSelectedModel || '',
+            ).trim()
+          } catch {
+            /* ignore */
+          }
+        }
+        if (!mid) {
+          try {
+            const url = import.meta.env?.DEV
+              ? '/api/models/primary'
+              : apiUrl('/models/primary')
+            const res = await fetch(url, { credentials: 'same-origin' })
+            if (res.ok) {
+              const j = (await res.json()) as { primary_model?: string; name?: string }
+              mid = String(j?.primary_model || j?.name || '').trim()
+            }
+          } catch {
+            /* ignore */
+          }
+        }
+        if (!cancelled) setSessionModelId(mid)
+      } catch {
+        /* ignore */
+      }
+    }
+    void syncModel()
+    const t = window.setInterval(() => void syncModel(), 4000)
+    return () => {
+      cancelled = true
+      window.clearInterval(t)
+    }
+  }, [visible, sessionKey])
+
+  // 轮询：关思考守卫 + wire + 模型是否「强制开思考」
+  useEffect(() => {
+    if (!visible) return
+    let cancelled = false
+    const tick = async () => {
+      try {
+        const q = sessionModelId
+          ? `?limit=3&model=${encodeURIComponent(sessionModelId)}`
+          : '?limit=3'
+        const url = import.meta.env?.DEV
+          ? `/api/speech/thinking-debug${q}`
+          : apiUrl(`/speech/thinking-debug${q}`)
+        const res = await fetch(url, { credentials: 'same-origin' })
+        if (!res.ok || cancelled) return
+        const data = (await res.json()) as {
+          model_thinking_on?: boolean | null
+          probe?: { gateway_mode?: string; has_thinking_off_guard?: boolean }
+          last?: { model?: string } | null
+          model?: {
+            display_name?: string
+            id?: string
+            thinking_always_on?: boolean
+            thinking_default_mode?: string
+            can_disable_thinking?: boolean
+          } | null
+          ui_note?: string
+        }
+        if (cancelled) return
+        setModelThinkingOn(
+          typeof data.model_thinking_on === 'boolean' ? data.model_thinking_on : null,
+        )
+        const mode = String(data.probe?.gateway_mode || '')
+        const guard = data.probe?.has_thinking_off_guard === true
+        setGatewayMode(guard ? mode || 'source' : mode === 'packaged' ? 'packaged·无守卫' : mode || '未知')
+        const mi = data.model
+        if (mi?.display_name || mi?.id) {
+          setSessionModelLabel(String(mi.display_name || mi.id || ''))
+          setThinkingAlwaysOn(mi.thinking_always_on === true)
+        }
+        const wm = String(data.last?.model || '').trim()
+        if (wm) setWireModelId(wm)
+      } catch {
+        /* ignore */
+      }
+    }
+    void tick()
+    const t = window.setInterval(() => void tick(), 3000)
+    return () => {
+      cancelled = true
+      window.clearInterval(t)
+    }
+  }, [visible, sessionModelId])
 
   const derive = useCallback(() => {
     const l = liveRef.current
@@ -515,16 +632,89 @@ export function XiaomiVoiceStage() {
         <button
           type="button"
           className={`xws-ledger${ledgerOpen ? ' is-on' : ''}`}
-          onClick={() => setLedgerOpen((v) => !v)}
+          onClick={() => {
+            setThinkingDbgOpen(false)
+            setLedgerOpen((v) => !v)
+          }}
           aria-label="播报台账"
           title="播报台账：按 TRACE 看每句合成/播放状态"
           aria-pressed={ledgerOpen}
         >
           台账
         </button>
+        <button
+          type="button"
+          className={`xws-ledger xws-thinking-btn${thinkingDbgOpen ? ' is-on' : ''}${
+            modelThinkingOn === true || String(gatewayMode).includes('无守卫') ? ' is-warn' : ''
+          }`}
+          onClick={() => {
+            setLedgerOpen(false)
+            setThinkingDbgOpen((v) => !v)
+          }}
+          aria-label="思考调试"
+          title="思考调试：网关守卫 + 厂商 wire（处理中≠模型思考）"
+          aria-pressed={thinkingDbgOpen}
+        >
+          思考
+        </button>
+        {/*
+          语音会话信息条：从底部焦点区（xws-focus）上移到顶部带，与退出/放大/台账/思考同一行。
+          单行不换行、超长截断；session_key 太长不再占正文位，收进 hover title。
+          底部只保留大号状态词 + 实时用户/AI 文本，不再重复模型/会话信息。
+        */}
+        <div
+          className={`xws-session-meta${thinkingAlwaysOn ? ' is-warn' : ''}`}
+          title={[
+            '当前语音会话用的模型；GLM-5.3 等强制思考模型关不掉思考',
+            thinkingAlwaysOn
+              ? '此模型 default_mode=enabled，语音关思考无效——请换可关思考的模型'
+              : gatewayMode
+                ? `网关=${gatewayMode}；舞台态≠设置里的思考模式`
+                : '点左上「思考」看厂商 wire',
+            sessionKey ? `session_key：${sessionKey}` : '',
+          ]
+            .filter(Boolean)
+            .join('\n')}
+        >
+          <span className="xws-session-meta-k">小V</span>
+          <span className="xws-session-meta-v">
+            {sessionModelLabel || sessionModelId || '模型…'}
+            {sessionModelId && sessionModelLabel && sessionModelLabel !== sessionModelId
+              ? ` (${sessionModelId})`
+              : ''}
+          </span>
+          <span className="xws-session-meta-sep is-aux">·</span>
+          <span
+            className={`xws-session-meta-v is-aux xws-session-meta-think${
+              thinkingAlwaysOn || modelThinkingOn === true
+                ? ' is-warn'
+                : modelThinkingOn === false
+                  ? ' is-off'
+                  : ''
+            }`}
+          >
+            {thinkingAlwaysOn
+              ? '思考关不掉'
+              : modelThinkingOn === true
+                ? '思考开'
+                : modelThinkingOn === false
+                  ? '思考关'
+                  : '思考…'}
+            {gatewayMode ? ` · ${gatewayMode}` : ''}
+          </span>
+          {wireModelId && wireModelId !== sessionModelId ? (
+            <>
+              <span className="xws-session-meta-sep is-aux">·</span>
+              <span className="xws-session-meta-v is-aux" title="最近一次实际打到厂商的模型 id">
+                wire:{wireModelId}
+              </span>
+            </>
+          ) : null}
+        </div>
       </div>
 
       <VoicePlaybackDiagnostics open={ledgerOpen} onClose={() => setLedgerOpen(false)} />
+      <VoiceThinkingDiagnostics open={thinkingDbgOpen} onClose={() => setThinkingDbgOpen(false)} />
 
       {/*
         右上角「对话」区 = V4 时间线。
@@ -585,6 +775,7 @@ export function XiaomiVoiceStage() {
         <XiaoxiStagePet mode={petMode} />
       </div>
 
+      {/* 底部焦点区：只留大号状态词 + 实时用户/AI 文本；「思考开/关」只在顶部带，不压人偶 */}
       <div className="xws-focus" data-tauri-no-drag="">
         <div className={`xws-status${state === 'listen' ? ' is-live' : ''}`} aria-live="polite">
           {state === 'listen' ? <span className="xws-state-dot" aria-hidden="true" /> : null}

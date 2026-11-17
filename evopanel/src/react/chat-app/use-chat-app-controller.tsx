@@ -1054,6 +1054,15 @@ export function useChatAppController() {
       /* ignore */
     }
   }, [selectedSessionKey, selectedThreadId])
+  // 运维浮窗读取当前会话（Perf HUD 对话链路区）
+  useEffect(() => {
+    try {
+      ;(window as Window & { __evoflowSelectedSessionKey?: string }).__evoflowSelectedSessionKey =
+        String(selectedSessionKey || '').trim()
+    } catch {
+      /* ignore */
+    }
+  }, [selectedSessionKey])
   // 已选会话但还没有 threadId：主动 ensure，否则 V4 会停在 no-thread→「加载中…」
   // 部门群聊是本地 IM 面（dept:{id}:chat），不要 ensure-thread / 建假会话，否则会卡住导航。
   useEffect(() => {
@@ -1152,13 +1161,18 @@ export function useChatAppController() {
     subscribeExecutingListRuntime,
     getExecutingListRuntimeEpoch,
   )
+  const v4TimelineBusyEpochForList = useSyncExternalStore(
+    subscribeV4TimelineBusy,
+    getV4TimelineBusyEpoch,
+  )
   const executionProbeEpoch = useSessionExecutionProbes(sessions, selectedSessionKey)
   /** 来自 session-execution 统一判定（侧栏 / Composer / 停止按钮同源） */
   const executingSessionKeys = useMemo(() => {
     void executingListEpoch
     void executionProbeEpoch
+    void v4TimelineBusyEpochForList
     return collectExecutingSessionKeys(sessions)
-  }, [sessions, executingListEpoch, executionProbeEpoch])
+  }, [sessions, executingListEpoch, executionProbeEpoch, v4TimelineBusyEpochForList])
   const runningSummaryKeys = useMemo(() => Array.from(executingSessionKeys), [executingSessionKeys])
   const { runningSessionMap } = useRunningSessionSummaries(runningSummaryKeys, selectedSessionKey)
   const executingSessionKeysRef = useRef(executingSessionKeys)
@@ -1183,6 +1197,11 @@ export function useChatAppController() {
       ...recentV4ThreadIdsRef.current.filter((x) => x !== tid),
     ].slice(0, 4)
   }, [selectedSessionKey])
+  // executingSessionKeys 是新 Set 引用；用签名稳住 pin sync，避免 epoch 抖动反复撕订。
+  const executingPinSig = useMemo(
+    () => Array.from(executingSessionKeys).sort().join('\0'),
+    [executingSessionKeys],
+  )
   useEffect(() => {
     if (!isEvoflowChatV4Enabled()) return
     const resolveTid = (sk: string) =>
@@ -1191,24 +1210,31 @@ export function useChatAppController() {
           wsClient?.getSessionThreadId?.(sk) ||
           '',
       ).trim()
-    const ordered: string[] = []
+    const ordered: Array<{ threadId: string; sessionKey?: string }> = []
     const seen = new Set<string>()
-    const pushTid = (tid: string) => {
+    const pushTarget = (sk: string, tid: string) => {
       const id = String(tid || '').trim()
       if (!id || seen.has(id)) return
       seen.add(id)
-      ordered.push(id)
+      ordered.push({ threadId: id, sessionKey: sk || undefined })
     }
     const selected = String(selectedSessionKey || '').trim()
-    if (selected) pushTid(resolveTid(selected))
-    for (const sk of executingSessionKeys) {
+    if (selected) pushTarget(selected, resolveTid(selected))
+    for (const sk of executingPinSig ? executingPinSig.split('\0') : []) {
       const key = String(sk || '').trim()
       if (!key || key === selected) continue
-      pushTid(resolveTid(key))
+      pushTarget(key, resolveTid(key))
     }
-    for (const tid of recentV4ThreadIdsRef.current) pushTid(tid)
+    for (const tid of recentV4ThreadIdsRef.current) {
+      const id = String(tid || '').trim()
+      if (!id || seen.has(id)) continue
+      const sk =
+        sessionsRef.current.find((s) => String(s.threadId || '').trim() === id)?.sessionKey ||
+        ''
+      pushTarget(String(sk || '').trim(), id)
+    }
     syncEvoflowV4PinnedSessions(ordered)
-  }, [executingSessionKeys, selectedSessionKey, sessions])
+  }, [executingPinSig, selectedSessionKey, sessions])
 
   const seenRunIdsRef = useRef(new Set<string>())
   const activeChatRunIdRef = useRef<string | null>(null)
@@ -2349,10 +2375,16 @@ export function useChatAppController() {
     subscribeV4TimelineBusy,
     getV4TimelineBusyEpoch,
   )
-  const displayTurnBusy = useMemo(
-    () => selectedTurnBusy || getV4TimelineBusy(selectedSessionKey),
-    [selectedTurnBusy, selectedSessionKey, v4TimelineBusyEpoch],
-  )
+  const displayTurnBusy = useMemo(() => {
+    if (selectedTurnBusy) return true
+    const sk = String(selectedSessionKey || '').trim()
+    // 用户刚停：侧栏已灭（isSessionExecuting 尊重冷却），Composer 停止/齿轮必须同源熄灭，
+    // 不能再被滞后的 V4 canStop / running 工具卡钉住。
+    if (!sk || isSessionRecoveryCooldownActive(sk)) return false
+    const rt = getSessionRuntime(sk)
+    if (rt.uiTurnSettled) return false
+    return getV4TimelineBusy(sk)
+  }, [selectedTurnBusy, selectedSessionKey, v4TimelineBusyEpoch, executingListEpoch])
   const [memoryRecallRefreshKey, setMemoryRecallRefreshKey] = useState(0)
   const prevTurnBusyForRecallRef = useRef(false)
   useEffect(() => {
@@ -3115,57 +3147,6 @@ export function useChatAppController() {
     [currentRoleCodeForUi, agents],
   )
 
-  /** 当前会话绑定智能体的默认模型（空 = 跟全局 primary） */
-  const agentDefaultModelName = useMemo(
-    () =>
-      resolveAgentDefaultModelName({
-        currentRoleCodeForUi,
-        agents,
-      }),
-    [currentRoleCodeForUi, agents],
-  )
-
-  const {
-    modelCatalog,
-    primaryModelName,
-    modelName,
-    setModelName,
-    modelsLoading,
-    modelConnNameMap,
-    loadModelCatalog,
-    followResolvedModelName,
-    effectiveModelName,
-    modelPillLabel,
-    syncModelSessionPrevKeyRef,
-  } = useComposerModelCatalog({
-    selectedSessionKey,
-    sessions,
-    listLoading,
-    agentDefaultModelName,
-    roleUiNonce,
-    bottomModelOpen,
-    setSessions,
-    sessionsRef,
-  })
-  setModelNameRef.current = setModelName
-
-  const currentRoleAgent = useMemo(() => {
-    const code = currentRoleCodeForUi
-    return agents.find((a) => String(a?.agent_code || '').trim().toLowerCase() === code) ?? { agent_code: code }
-  }, [currentRoleCodeForUi, agents])
-
-  const currentAgentCapabilities = useMemo(
-    () =>
-      resolveCurrentAgentCapabilities({
-        agentCapabilitySummary,
-        currentRoleAgent,
-        selectedSkills,
-      }),
-    [currentRoleAgent, selectedSkills],
-  )
-
-  const [capabilityPatchBusy, setCapabilityPatchBusy] = useState(false)
-
   /** 智能体员工会话：侧栏选会话；底栏与普通对话一致 */
   const isProactiveEmployeeSession = useMemo(
     () => isProactiveSessionKey(selectedSessionKey),
@@ -3208,6 +3189,99 @@ export function useChatAppController() {
       setMemoryEnabled,
     })
   }, [employeeSessionAgentCode, selectedSessionAgentId, selectedSessionKey, roleUiNonce])
+
+  /** 当前会话默认模型：员工岗位 model_name 优先，否则绑定智能体，空 = 跟全局 primary */
+  const agentDefaultModelName = useMemo(
+    () =>
+      resolveAgentDefaultModelName({
+        currentRoleCodeForUi,
+        agents,
+        employeeRoleModelName: employeeRoleDetail?.modelName,
+        employeeRoleAgentCode: employeeRoleDetail?.agentCode,
+      }),
+    [currentRoleCodeForUi, agents, employeeRoleDetail?.modelName, employeeRoleDetail?.agentCode],
+  )
+
+  const {
+    modelCatalog,
+    primaryModelName,
+    modelName,
+    setModelName,
+    modelsLoading,
+    modelConnNameMap,
+    loadModelCatalog,
+    followResolvedModelName,
+    sessionModelPinned,
+    effectiveModelName,
+    modelPillLabel,
+    syncModelSessionPrevKeyRef,
+  } = useComposerModelCatalog({
+    selectedSessionKey,
+    sessions,
+    listLoading,
+    agentDefaultModelName,
+    roleUiNonce,
+    bottomModelOpen,
+    setSessions,
+    sessionsRef,
+  })
+  setModelNameRef.current = setModelName
+
+  /** 药丸菜单「跟随中」来源说明：岗位工作模型 > 智能体默认 > 全局主模型（与 docs/design/model-resolution.md 阶梯一致） */
+  const followSourceLabel = useMemo(() => {
+    const roleModel = String(employeeRoleDetail?.modelName || '').trim()
+    const roleCode = String(employeeRoleDetail?.agentCode || '').trim().toLowerCase()
+    if (roleModel && (!roleCode || roleCode === String(currentRoleCodeForUi || '').trim().toLowerCase())) {
+      return `岗位工作模型 · ${roleModel}`
+    }
+    const code = String(currentRoleCodeForUi || '').trim().toLowerCase()
+    const agentRow = agents.find((a) => String(a?.agent_code || '').trim().toLowerCase() === code)
+    const agentModel = String(agentRow?.model || '').trim()
+    if (agentModel) return `智能体默认 · ${agentModel}`
+    return primaryModelName ? `全局主模型 · ${primaryModelName}` : ''
+  }, [employeeRoleDetail?.modelName, employeeRoleDetail?.agentCode, currentRoleCodeForUi, agents, primaryModelName])
+
+  /** 恢复跟随：清会话 pin（model_name + model_pinned 一并清），UI 回到跟随展示 */
+  const handleFollowAgentModel = useCallback(async () => {
+    const sk = String(selectedSessionKey || sessionRef.current || '').trim()
+    if (!sk) return
+    try {
+      await wsClient.updateSessionContext(sk, { model_name: '', model_pinned: false })
+      setSessions((prev) =>
+        prev.map((s) =>
+          String(s.sessionKey || '') === sk ? { ...s, modelName: '', modelPinned: false } : s,
+        ),
+      )
+      setRoleUiNonce((n) => n + 1)
+      setRows((prev) => [
+        ...(Array.isArray(prev) ? prev : []),
+        {
+          role: 'system' as const,
+          text: '已恢复跟随智能体默认模型',
+          timestamp: Date.now(),
+        } as DisplayRow,
+      ])
+    } catch {
+      /* ignore */
+    }
+  }, [selectedSessionKey, setSessions, setRoleUiNonce, setRows])
+
+  const currentRoleAgent = useMemo(() => {
+    const code = currentRoleCodeForUi
+    return agents.find((a) => String(a?.agent_code || '').trim().toLowerCase() === code) ?? { agent_code: code }
+  }, [currentRoleCodeForUi, agents])
+
+  const currentAgentCapabilities = useMemo(
+    () =>
+      resolveCurrentAgentCapabilities({
+        agentCapabilitySummary,
+        currentRoleAgent,
+        selectedSkills,
+      }),
+    [currentRoleAgent, selectedSkills],
+  )
+
+  const [capabilityPatchBusy, setCapabilityPatchBusy] = useState(false)
 
   /** 进入员工会话时按 session_key 同步 workspace_kind，不再用底栏「只聊天/派任务」模式条 */
   useEffect(() => {
@@ -4410,7 +4484,7 @@ export function useChatAppController() {
     )
   }
 
-  /** F5 刷新页面：会话列表就绪后若 DB 仍 running，改为 history-watch（拉 messages）直至结束 */
+  /** 冷开/F5：列表就绪后若 DB 仍 running → 停止，禁止自动续跑打断过的交互回合 */
   useEffect(() => {
     runPageLoadResumeEffect({
       listLoading,
@@ -4462,7 +4536,8 @@ export function useChatAppController() {
       refreshSessions: false,
       observerCatchup: true,
     })
-  }, [listLoading, selectedSessionKey, sessions, executingSessionKeys])
+    // executingPinSig：与 V4 pin sync 同源，避免 Set 新引用每拍重跑 gate。
+  }, [listLoading, selectedSessionKey, sessions, executingPinSig])
 
   /**
    * visibilitychange / online: 后台切回前台或网络恢复后自动 reattach 活跃 run。
@@ -6663,6 +6738,9 @@ export function useChatAppController() {
     modelConnNameMap,
     modelPillLabel,
     modelsLoading,
+    followSourceLabel,
+    handleFollowAgentModel,
+    sessionModelPinned,
     modeMenuOpen,
     moreMenuKey,
     moreSubOpen,

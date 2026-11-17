@@ -202,10 +202,16 @@ CHANNEL_CAPABILITIES = {
     "dingtalk": {"supports_streaming": False},
 }
 IM_CHANNEL_NAMES = frozenset({"feishu", "slack", "telegram", "weixin", "wecom", "dingtalk"})
-# Channels that support per-employee bot binding via channels.<name>.accounts[<agent_code>].session.
-# Each employee-bound bot is routed to its own custom agent (default assistant_id = account_id)
-# instead of the channel-wide default. Add new channels here once they adopt the accounts schema.
-PER_EMPLOYEE_ACCOUNT_CHANNELS = frozenset({"feishu", "wecom"})
+# Channels that support per-account bot binding via ``evoflow_bot_bindings`` +
+# ``channels.<name>.accounts``. Each account is expanded into its own channel
+# instance and (when bound to an employee) routed to that agent instead of the
+# channel-wide default. Add new channels here once they adopt the accounts schema.
+# Slot-id difference: feishu/wecom slots are keyed by ``agent_code`` (accounts
+# dict key == employee code), while weixin slots are keyed by the iLink
+# ``account_id`` (many bindings may share the empty agent_code = 主智能体), so
+# weixin resolves the employee via the binding row's ``agent_code`` column —
+# see ``_weixin_binding_agent_code``.
+PER_EMPLOYEE_ACCOUNT_CHANNELS = frozenset({"feishu", "wecom", "weixin"})
 
 _CHANNEL_SESSION_TITLE_LABEL: dict[str, str] = {
     "feishu": "飞书",
@@ -304,7 +310,7 @@ def _persist_channel_session_index(
             ctx["topic_id"] = str(msg.topic_id)
         if msg.user_id:
             ctx["user_id"] = str(msg.user_id)
-        account_id = str(meta.get("account_id") or "").strip()
+        account_id = ChannelManager._inbound_account_id(msg) or str(meta.get("account_id") or "").strip()
         if account_id:
             ctx["account_id"] = account_id
         row_title = ""
@@ -318,6 +324,25 @@ def _persist_channel_session_index(
             updated_at_ms=now_ms,
             context=ctx,
         )
+        # Own the IM session like desktop create_new_session so later runs can
+        # resolve principal_id → assets/users/<pid> without waiting for Panel open.
+        try:
+            from evoflow.authz.principals import get_or_create_local_admin
+            from evoflow.authz.runtime_identity import identity_from_principal_id, stamp_session_from_identity
+
+            owner = get_or_create_local_admin()
+            pid = str(owner.get("principal_id") or "").strip()
+            if pid:
+                stamp_session_from_identity(
+                    sk,
+                    identity_from_principal_id(pid, org_id=str(owner.get("org_id") or "") or None),
+                )
+        except Exception:
+            logger.debug(
+                "[Manager] stamp channel session ownership skipped session_key=%s",
+                sk,
+                exc_info=True,
+            )
     except Exception:
         logger.warning(
             "[Manager] persist evoflow_chat_sessions failed session_key=%s thread_id=%s",
@@ -487,6 +512,55 @@ def _finalize_channel_transcript_turn(session_key: str, thread_id: str) -> None:
         )
 
 
+def _stamp_channel_run_identity(run_context: dict[str, Any], session_key: str) -> None:
+    """Anchor IM runs to the same Asset Center bucket as desktop chatSend.
+
+    Desktop JWT stamping puts ``principal_id=admin`` on the run so
+    ``<user_profile>`` / ``<memory_assets>`` read ``assets/users/<pid>/``.
+    Channel inbound historically omitted identity → MemoryLiveFooter saw an
+    empty principal and either skipped live injection or fell onto the shared
+    ``users/user`` scaffold, while Panel chats kept injecting the real 画像.
+    """
+    sk = str(session_key or "").strip()
+    if sk:
+        run_context["session_key"] = sk
+    try:
+        from evoflow.authz.runtime_identity import enrich_run_context_identity
+
+        enriched = enrich_run_context_identity(run_context)
+        run_context.clear()
+        run_context.update(enriched)
+    except Exception:
+        logger.debug("[Manager] enrich_run_context_identity skipped", exc_info=True)
+
+    pid = str(run_context.get("principal_id") or run_context.get("created_by") or "").strip()
+    if pid:
+        # Match desktop default: IM sessions often have memory_enabled=NULL;
+        # leave an explicit True so the live footer / assets tool stay on.
+        run_context.setdefault("memory_enabled", True)
+        return
+
+    try:
+        from evoflow.authz.principals import get_or_create_local_admin
+        from evoflow.authz.runtime_identity import identity_from_principal_id, stamp_session_from_identity
+
+        owner = get_or_create_local_admin()
+        pid = str(owner.get("principal_id") or "").strip()
+        if not pid:
+            return
+        filled = identity_from_principal_id(pid, org_id=str(owner.get("org_id") or "") or None)
+        for key, value in filled.items():
+            if value and not str(run_context.get(key) or "").strip():
+                run_context[key] = value
+        run_context.setdefault("principal_id", pid)
+        run_context.setdefault("created_by", pid)
+        run_context.setdefault("memory_enabled", True)
+        if sk:
+            stamp_session_from_identity(sk, filled)
+    except Exception:
+        logger.debug("[Manager] channel local-admin identity stamp skipped", exc_info=True)
+
+
 def _enrich_channel_run_context(
     run_context: dict[str, Any],
     session_key: str,
@@ -513,14 +587,14 @@ def _enrich_channel_run_context(
     topic_id = str(msg.topic_id or "").strip()
     if topic_id:
         run_context["topic_id"] = topic_id
-    meta = msg.metadata if isinstance(msg.metadata, dict) else {}
-    account_id = str(meta.get("account_id") or "").strip()
+    account_id = ChannelManager._inbound_account_id(msg)
     if account_id:
         run_context["account_id"] = account_id
     body = str(msg.text or "").strip()
     if body:
         run_context.setdefault("evf_user_question", body)
         run_context.setdefault("user_message", body)
+    _stamp_channel_run_identity(run_context, sk)
 
 
 def _channel_image_entries(files: list[Any]) -> list[dict[str, Any]]:
@@ -758,8 +832,8 @@ def _release_channel_owned_paths(msg: InboundMessage) -> None:
     release until the manager is done — this function is called from the
     ``finally`` of ``_handle_message``.
 
-    Channels that never cache inbound media (e.g. weixin today) are a no-op
-    here; Feishu/WeCom implement ``release_owned_temp_paths``.
+    Feishu / WeCom / Weixin implement ``release_owned_temp_paths``; channels
+    that never cache inbound media are a no-op here.
     """
     meta = msg.metadata if isinstance(msg.metadata, dict) else {}
     raw_paths = meta.get("_owned_temp_paths")
@@ -2068,6 +2142,41 @@ class ChannelManager:
         return channel_layer, user_layer
 
     @staticmethod
+    def _weixin_binding_agent_code(account_id: str) -> str:
+        """Resolve the employee ``agent_code`` behind a weixin account slot.
+
+        weixin slots are keyed by the iLink ``account_id`` (= ``bot_id``), and
+        many bindings may intentionally carry an empty ``agent_code`` (= route
+        to the channel-wide default, i.e. the 主智能体). Returns "" for those.
+        """
+        aid = str(account_id or "").strip()
+        if not aid:
+            return ""
+        try:
+            from evoflow.persistence.config_repositories import get_bot_binding
+
+            binding = get_bot_binding("weixin", aid)
+            if binding:
+                return str(binding.get("agent_code") or "").strip()
+        except Exception:
+            logger.debug("[Manager] weixin binding lookup failed aid=%s", aid, exc_info=True)
+        # Legacy fallback: channels.weixin.accounts[<account_id>].agent_code
+        try:
+            from app.channels.service import get_channel_service
+
+            service = get_channel_service()
+            if service is not None:
+                ch_cfg = service._config.get("weixin") if isinstance(service._config, dict) else None
+                accounts = ch_cfg.get("accounts") if isinstance(ch_cfg, dict) else None
+                if isinstance(accounts, dict):
+                    acc = accounts.get(aid)
+                    if isinstance(acc, dict):
+                        return str(acc.get("agent_code") or "").strip()
+        except Exception:
+            logger.debug("[Manager] weixin legacy account lookup failed aid=%s", aid, exc_info=True)
+        return ""
+
+    @staticmethod
     def _account_session(channel_name: str, account_id: str) -> dict[str, Any]:
         """Load session overrides for an IM employee account.
 
@@ -2082,6 +2191,15 @@ class ChannelManager:
         aid = str(account_id or "").strip()
         if not cn or not aid:
             return {}
+
+        # weixin slot id is the iLink account_id, not the employee code — remap
+        # via the binding row first. Empty agent_code = 主智能体 binding: fall
+        # through to the channel-wide default (lead_agent) unchanged.
+        legacy_accounts_key = aid
+        if cn == "weixin":
+            aid = ChannelManager._weixin_binding_agent_code(aid)
+            if not aid:
+                return {}
 
         # New path: read directly from the flat table.
         try:
@@ -2109,7 +2227,7 @@ class ChannelManager:
             accounts = ch_cfg.get("accounts")
             if not isinstance(accounts, dict):
                 return {}
-            acc = accounts.get(aid)
+            acc = accounts.get(legacy_accounts_key if cn == "weixin" else aid)
             if not isinstance(acc, dict):
                 return {}
             session = _as_dict(acc.get("session"))
@@ -2156,15 +2274,36 @@ class ChannelManager:
         return str((msg.metadata or {}).get("account_id") or "").strip()
 
     @classmethod
+    def _inbound_proactive_agent_code(cls, msg: InboundMessage) -> str:
+        """Employee ``agent_code`` driving per-employee routing for this inbound.
+
+        feishu/wecom slots are keyed by the employee code, so the account_id
+        already is the code. weixin slots are keyed by the iLink account_id —
+        resolve the code from the ``evoflow_bot_bindings`` row instead; returns
+        "" for 主智能体 bindings (empty agent_code) so those fall through to the
+        channel-wide default.
+        """
+        account_id = cls._inbound_account_id(msg)
+        if not account_id or msg.channel_name not in PER_EMPLOYEE_ACCOUNT_CHANNELS:
+            return ""
+        if msg.channel_name != "weixin":
+            return account_id
+        return cls._weixin_binding_agent_code(account_id)
+
+    @classmethod
     def _channel_store_topic(cls, msg: InboundMessage) -> str | None:
-        """Per-bot Feishu bindings: same group must not share one LangGraph thread.
+        """Per-bot Feishu/Weixin bindings: same chat must not share one LangGraph thread.
 
         Encoded as synthetic topic ``acct:<account_id>`` (or ``acct:<id>:<feishu_topic>``)
-        so ChannelStore keys stay ``channel:chat:topic`` compatible.
+        so ChannelStore keys stay ``channel:chat:topic`` compatible. weixin DM chat_id
+        is the peer's WeChat user id — the same person chatting two different bots
+        yields the same chat_id, so weixin needs the account prefix unconditionally.
+        Legacy (pre-multi-account) threads were stored bare; ``_lookup_bound_thread_id``
+        falls back to the bare key for channels other than feishu.
         """
         topic = str(msg.topic_id or "").strip() or None
         account_id = cls._inbound_account_id(msg)
-        if msg.channel_name == "feishu" and account_id:
+        if msg.channel_name in ("feishu", "weixin") and account_id:
             return f"acct:{account_id}:{topic}" if topic else f"acct:{account_id}"
         return topic
 
@@ -2272,15 +2411,13 @@ class ChannelManager:
         if msg.topic_id:
             parts.append(str(msg.topic_id))
         tail = ":".join(parts)
-        account_id = self._inbound_account_id(msg)
         # Dedicated employee bots (Feishu/WeCom accounts[<agent_code>]) belong with
         # the employee. Primary slot (empty account_id) stays on the task list.
-        if (
-            account_id
-            and account_id not in {"main", "lead_agent"}
-            and msg.channel_name in PER_EMPLOYEE_ACCOUNT_CHANNELS
-        ):
-            code = account_id
+        # weixin: account_id is the iLink bot id, not a code — resolve the
+        # employee from the binding row; 主智能体 bindings (empty code) keep the
+        # legacy ``agent:{main}:weixin:{chat_id}`` task-tab key unchanged.
+        code = self._inbound_proactive_agent_code(msg)
+        if code and code not in {"main", "lead_agent"}:
             # Prefer resolved agent_name when it matches the account slot.
             if agent_name and agent_name not in {"main", "lead_agent"}:
                 code = agent_name

@@ -74,8 +74,9 @@ class SpeechSession:
         self._default_speaker: str | None = None
         self._asr_provider = "volcengine"
         self._tts_provider = "volcengine"
-        # 判停静默窗口（ms）；可由 start 载荷覆盖（前端 localStorage）。800=短问句少等 100ms，犹豫语速仍安全。
-        self._silence_ms = 800.0
+        # 判停静默窗口（ms）；可由 start 载荷覆盖（前端 localStorage）。
+        # 1100：连续说时短停顿少切成「你还能」半句；仍可被 FE 覆盖。
+        self._silence_ms = 1100.0
         # 用量入账：PCM 累计字节（ASR 秒数按 turn 结算）+ TTS 按句字数
         self._pcm_bytes_total = 0
         self._pcm_bytes_billed = 0
@@ -266,9 +267,10 @@ class SpeechSession:
         async def on_user_turn(text: str) -> None:
             # Client still owns Xiaomi agent; we only signal turn_end.
             # 用户说完即开新 TRACE（若前端稍后 assistant_begin 带自己的 id 会覆盖对齐）
+            # 必须先发 turn_end 再记账：同步 SQLite 入账若被双 gateway 锁住，
+            # 会把「聆听中→处理中」拖成几十秒（前端一直显示聆听中）。
             tid = new_voice_trace("vt")
             self._bind_trace(tid)
-            self._record_asr_usage()
             voice_log("对话", f"用户输入 → turn_end：「{text}」 TRACE={tid}")
             try:
                 await self._ws.send_json(
@@ -276,6 +278,13 @@ class SpeechSession:
                 )
             except Exception:
                 pass
+            try:
+                await asyncio.to_thread(self._record_asr_usage)
+            except Exception:
+                try:
+                    self._record_asr_usage()
+                except Exception:
+                    pass
 
         pipe, bridge, asr, vad = build_xiaomi_voice_pipeline(
             asr_provider=self._asr_provider,

@@ -71,6 +71,7 @@ import {
   ShellChevronIcon,
   ShellFolderPlusIcon,
   ShellRefreshIcon,
+  ShellStopIcon,
   ShellWorkspaceIcon,
   ShellHashIcon,
   ShellFolderIcon,
@@ -80,6 +81,9 @@ import {
 import {
   deptChatSessionKey,
   deptIdFromSessionKey,
+  getCachedDeptList,
+  loadDeptChatList,
+  prefetchDeptChatList,
   getDeptChatMeta,
   isDeptChatSessionKey,
   rememberDeptChatMeta,
@@ -352,6 +356,8 @@ export function ShellSessionList({
   const [titleEditKey, setTitleEditKey] = useState('')
   /** 点击「刷新会话列表」按钮后的刷新中状态（列表未变化时给可见反馈） */
   const [refreshing, setRefreshing] = useState(false)
+  /** 员工组头「刷新」进行中的 agent_code（小写） */
+  const [employeeRefreshingLc, setEmployeeRefreshingLc] = useState('')
   const [wsMenuOpen, setWsMenuOpen] = useState(false)
   /** chats = 普通对话；employees = 智能体员工；depts = 部门群聊 */
   const [listTab, setListTab] = useState<'chats' | 'employees' | 'depts'>(() => {
@@ -364,8 +370,10 @@ export function ShellSessionList({
   const [viewMode, setViewMode] = useState<'grouped' | 'project' | 'depts'>(() =>
     loadShellSidebarViewMode(),
   )
-  const [deptRows, setDeptRows] = useState<DeptChatMeta[]>([])
+  const [deptRows, setDeptRows] = useState<DeptChatMeta[]>(() => getCachedDeptList() || [])
   const [deptLoading, setDeptLoading] = useState(false)
+  const deptRowsRef = useRef(deptRows)
+  deptRowsRef.current = deptRows
 
   // viewMode 和 listTab 联动；持久化跨刷新对齐上次关闭态
   useEffect(() => {
@@ -386,6 +394,8 @@ export function ShellSessionList({
   /** 部门下拉内的模糊搜索词 */
   const [deptMenuQuery, setDeptMenuQuery] = useState('')
   const [dutyFoldOpen, setDutyFoldOpen] = useState(false)
+  /** 分组模式下：按员工展开「更早值班」；扁平/单人筛选仍用 dutyFoldOpen */
+  const [dutyFoldOpenKeys, setDutyFoldOpenKeys] = useState<Set<string>>(() => new Set())
   const [pinnedWorkspaceKeys, setPinnedWorkspaceKeys] = useState<string[]>(() =>
     loadPinnedWorkspaceKeys(),
   )
@@ -438,93 +448,36 @@ export function ShellSessionList({
   const isEmployeesTab = listTab === 'employees'
   const isDeptsTab = listTab === 'depts'
 
-  const employeeRolesRef = useRef(employeeRoles)
-  employeeRolesRef.current = employeeRoles
+  /** 侧栏挂载后闲时预热部门列表，第一次点「部门」尽量不空转 */
+  useEffect(() => {
+    const t = window.setTimeout(() => prefetchDeptChatList(), 1200)
+    return () => window.clearTimeout(t)
+  }, [])
 
-  /** 部门 Tab：拉部门 + 角色，组装群聊入口（可复用已有花名册，失败重试，不清空旧数据） */
+  /**
+   * 部门 Tab：只打 `/proactive/departments`（已含 members）。
+   * 有缓存 / 旧列表时静默刷新，不再每次切 Tab 先亮「加载中…」再等 roles（Best-effort 易 503）。
+   */
   useEffect(() => {
     if (!isDeptsTab) return
     let cancelled = false
-    setDeptLoading(true)
-    ;(async () => {
-      const { api } = await import('../../lib/tauri-api.js')
-      const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
-      const fetchWithRetry = async <T,>(fn: () => Promise<T>, tries = 3): Promise<T> => {
-        let last: unknown
-        for (let i = 0; i < tries; i++) {
-          try {
-            return await fn()
-          } catch (e) {
-            last = e
-            // roles 在 Gateway Best-effort 车道，platform 忙时会 503 shed
-            if (i < tries - 1) await sleep(350 * (i + 1))
-          }
-        }
-        throw last
-      }
-      try {
-        const cachedRoles = employeeRolesRef.current
-        const hasCached = Array.isArray(cachedRoles) && cachedRoles.length > 0
-        const [deptRes, roleRes] = await Promise.all([
-          fetchWithRetry(() => api.proactiveListDepartments()),
-          hasCached
-            ? Promise.resolve({ roles: cachedRoles })
-            : fetchWithRetry(() => api.proactiveListRoles('active')),
-        ])
+    const warm = getCachedDeptList()
+    if (warm?.length && deptRowsRef.current.length === 0) {
+      setDeptRows(warm)
+    }
+    const showSpinner = deptRowsRef.current.length === 0 && !(warm && warm.length)
+    if (showSpinner) setDeptLoading(true)
+    void loadDeptChatList({ force: true })
+      .then((rows) => {
         if (cancelled) return
-        const departments = Array.isArray(deptRes?.departments)
-          ? deptRes.departments
-          : Array.isArray(deptRes)
-            ? deptRes
-            : []
-        const roles = Array.isArray(roleRes?.roles)
-          ? roleRes.roles
-          : Array.isArray(roleRes)
-            ? roleRes
-            : []
-        const byDept = new Map<string, DeptChatMeta['members']>()
-        for (const r of roles) {
-          const code = String(r?.agent_code || r?.code || '').trim()
-          if (!code || code === 'main') continue
-          const deptName = String(r?.department || r?.config?.department || '').trim()
-          if (!deptName) continue
-          if (!byDept.has(deptName)) byDept.set(deptName, [])
-          byDept.get(deptName)!.push({
-            agent_code: code,
-            role_name: String(r?.role_name || r?.display_name || code).trim() || code,
-            department: deptName,
-            reports_to: String(r?.reports_to || r?.config?.reports_to || '').trim(),
-            status: String(r?.status || 'active').trim() || 'active',
-            busy: false,
-          })
-        }
-        const accents = ['lead', 'commerce', 'content', 'opensource', 'knowledge', 'assistant']
-        const rows: DeptChatMeta[] = []
-        let ai = 0
-        for (const d of departments) {
-          const id = String(d?.id || '').trim()
-          const name = String(d?.name || '').trim()
-          if (!id || !name) continue
-          const members = byDept.get(name) || []
-          if (!members.length) continue
-          rows.push({
-            id,
-            name,
-            head_agent_code: String(d?.head_agent_code || '').trim(),
-            head_role_name: String(d?.head_role_name || '').trim(),
-            accent: accents[ai % accents.length],
-            members,
-          })
-          ai += 1
-        }
         setDeptRows(rows)
-      } catch (e) {
+      })
+      .catch((e) => {
         console.warn('[shell] dept tab load failed', e)
-        // 保留上一轮 rows，避免 503 时把列表刷成「暂无」
-      } finally {
+      })
+      .finally(() => {
         if (!cancelled) setDeptLoading(false)
-      }
-    })()
+      })
     return () => {
       cancelled = true
     }
@@ -1133,8 +1086,15 @@ export function ShellSessionList({
     if (archivedKeys.size === 0) return [] as ShellSidebarSyncRow[]
     return rows
       .filter((r) => archivedKeys.has(String(r.sessionKey || '')))
+      // 任务 Tab 归档区同样不掺部门群 / 员工岗（BOT Tab 用 employeeSessionRows，不走这里）
+      .filter((r) => {
+        if (isEmployeesTab) return true
+        if (r.workspaceKey === WORKSPACE_GROUP_PROACTIVE) return false
+        if (isDeptChatSessionKey(r.sessionKey)) return false
+        return true
+      })
       .sort((a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0))
-  }, [rows, archivedKeys])
+  }, [rows, archivedKeys, isEmployeesTab])
 
   /** 「移到顶部」排序位次：sessionKey → 标记顺序 */
   const toppedRankMap = useMemo(() => {
@@ -1220,6 +1180,54 @@ export function ShellSessionList({
       onSelectSession(sk)
     },
     [onSelectSession],
+  )
+
+  /** 刷新某员工：花名册 + 会话列表；若当前正打开其会话则一并刷历史 */
+  const refreshEmployeeGroup = useCallback(
+    async (agentCode: string, rows: ShellSidebarSyncRow[]) => {
+      const code = String(agentCode || '').trim()
+      if (!code) return
+      const lc = code.toLowerCase()
+      if (employeeRefreshingLc === lc) return
+      setEmployeeRefreshingLc(lc)
+      try {
+        await Promise.all([
+          Promise.resolve(onRefreshEmployeeRoles?.()).catch(() => {}),
+          Promise.resolve(onRefreshSessionList()).catch(() => {}),
+        ])
+        const selected = String(selectedSessionKey || '').trim()
+        if (!selected) return
+        const ownsSelected =
+          rows.some((r) => String(r.sessionKey || '') === selected) ||
+          employeeOwnerCodeFromSession({ sessionKey: selected } as ShellSidebarSyncRow)
+            .toLowerCase() === lc ||
+          proactiveAgentCodeFromSessionKey(selected).toLowerCase() === lc
+        if (ownsSelected) onRefreshSession(selected)
+      } finally {
+        setEmployeeRefreshingLc((prev) => (prev === lc ? '' : prev))
+      }
+    },
+    [
+      employeeRefreshingLc,
+      onRefreshEmployeeRoles,
+      onRefreshSessionList,
+      onRefreshSession,
+      selectedSessionKey,
+    ],
+  )
+
+  const stopEmployeeGroup = useCallback(
+    (rows: ShellSidebarSyncRow[]) => {
+      const keys = new Set<string>()
+      for (const row of rows) {
+        const sk = String(row.sessionKey || '').trim()
+        if (!sk) continue
+        if (row.executing || runningSessionMap?.[sk]) keys.add(sk)
+      }
+      for (const sk of keys) onStopSession(sk)
+      if (keys.size) toast(`已请求停止 ${keys.size} 个会话`, 'info')
+    },
+    [onStopSession, runningSessionMap],
   )
 
   /** 员工 Tab：会话 ∪ 雇佣花名册；默认编制序，拖拽偏好覆盖 */
@@ -1327,6 +1335,13 @@ export function ShellSessionList({
     return employeeGroups.flatMap((g) => g.sessions)
   }, [isEmployeesTab, employeeGroups, focusedEmployeeCode])
 
+  /** 「任务」Tab 不展示员工岗 / 部门群（后两者各自有 BOT、部门 Tab） */
+  const isChatsTabListRow = useCallback((r: ShellSidebarSyncRow) => {
+    if (r.workspaceKey === WORKSPACE_GROUP_PROACTIVE) return false
+    if (isDeptChatSessionKey(r.sessionKey)) return false
+    return true
+  }, [])
+
   const pinnedRows = useMemo(() => {
     if (isEmployeesTab) {
       return employeeSessionRows
@@ -1344,13 +1359,19 @@ export function ShellSessionList({
         if (po !== 0) return po
         return Number(b.updatedAt || 0) - Number(a.updatedAt || 0)
       })
-    list = list.filter((r) => r.workspaceKey !== WORKSPACE_GROUP_PROACTIVE)
+    list = list.filter(isChatsTabListRow)
     if (focusedWorkspaceKey) {
       const nk = normalizePinKey(focusedWorkspaceKey)
       list = list.filter((r) => normalizePinKey(r.workspaceKey) === nk)
     }
     return list
-  }, [nonArchivedRows, focusedWorkspaceKey, isEmployeesTab, employeeSessionRows])
+  }, [
+    nonArchivedRows,
+    focusedWorkspaceKey,
+    isEmployeesTab,
+    employeeSessionRows,
+    isChatsTabListRow,
+  ])
 
   const pinnedKeySet = useMemo(
     () => new Set(pinnedRows.map((r) => String(r.sessionKey || ''))),
@@ -1368,13 +1389,21 @@ export function ShellSessionList({
       )
     }
     let list = nonArchivedRows.filter((r) => !pinnedKeySet.has(String(r.sessionKey || '')))
-    list = list.filter((r) => r.workspaceKey !== WORKSPACE_GROUP_PROACTIVE)
+    list = list.filter(isChatsTabListRow)
     if (focusedWorkspaceKey) {
       const nk = normalizePinKey(focusedWorkspaceKey)
       list = list.filter((r) => normalizePinKey(r.workspaceKey) === nk)
     }
     return [...list].sort(byToppedThenUpdated)
-  }, [nonArchivedRows, pinnedKeySet, focusedWorkspaceKey, isEmployeesTab, employeeSessionRows, byToppedThenUpdated])
+  }, [
+    nonArchivedRows,
+    pinnedKeySet,
+    focusedWorkspaceKey,
+    isEmployeesTab,
+    employeeSessionRows,
+    byToppedThenUpdated,
+    isChatsTabListRow,
+  ])
 
   const selectEmployeeFilter = useCallback((code: string | null) => {
     const next = code ? String(code).trim() || null : null
@@ -1383,6 +1412,7 @@ export function ShellSessionList({
     setEmpMenuQuery('')
     setEmpMenuOpen(false)
     setDutyFoldOpen(false)
+    setDutyFoldOpenKeys(new Set())
   }, [])
 
   const employeeDutySplit = useMemo(() => {
@@ -1398,6 +1428,21 @@ export function ShellSessionList({
   const foldedDutyRows = employeeDutySplit.folded
   const showDutyFold = isEmployeesTab && !isSearching && foldedDutyRows.length > 0
 
+  /** 分组树内按员工挂「更早值班」，避免整表底部一条「还有 N 条」对不上名字 */
+  const foldedDutyByEmployee = useMemo(() => {
+    const map = new Map<string, ShellSidebarSyncRow[]>()
+    for (const row of foldedDutyRows) {
+      const code = normalizeEmployeeCodeKey(
+        employeeOwnerCodeFromSession(row) || proactiveAgentCodeFromSessionKey(row.sessionKey),
+      )
+      if (!code) continue
+      const list = map.get(code) || []
+      list.push(row)
+      map.set(code, list)
+    }
+    return map
+  }, [foldedDutyRows])
+
   // 工作区分组树（对齐 ZCode WorkspaceSidebar）：多工作区时 recent 列表按组折叠显示，
   // 组头 = 图标 + 组名（员工 tab 用头像 + 员工名）+ 会话数；单组/聚焦组不折叠（保持原行为）。
   const [collapsedGroupKeys, setCollapsedGroupKeys] = useState<Set<string>>(() => new Set())
@@ -1405,7 +1450,10 @@ export function ShellSessionList({
     if (isEmployeesTab && focusedEmployeeCode) return null
     if (isEmployeesTab) {
       // 员工 tab：按 agent_code 分组，组头 = 员工头像 + 员工名
-      const byCode = new Map<string, { label: string; rows: ShellSidebarSyncRow[] }>()
+      const byCode = new Map<
+        string,
+        { label: string; rows: ShellSidebarSyncRow[]; avatarAgentCode: string }
+      >()
       for (const row of recentVisibleRows) {
         const code =
           employeeOwnerCodeFromSession(row) ||
@@ -1445,6 +1493,23 @@ export function ShellSessionList({
     isSearching,
     employeeGroupOrder,
   ])
+
+  const loadMoreWorkspaceKey = isEmployeesTab
+    ? WORKSPACE_GROUP_PROACTIVE
+    : focusedWorkspaceKey
+      ? focusedGroup?.workspaceKey || focusedWorkspaceKey
+      : '__global__'
+
+  const toggleEmployeeDutyFold = useCallback((employeeKey: string) => {
+    const key = normalizeEmployeeCodeKey(employeeKey)
+    if (!key) return
+    setDutyFoldOpenKeys((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }, [])
 
   /** 只有「空工作区分组」需要展示（尚无任何会话）——此时不能走「暂无会话」空态 */
   const showEmptyWorkspaceSections = !!groupedRecentSections && recentVisibleRows.length === 0
@@ -1535,6 +1600,16 @@ export function ShellSessionList({
     : focusedWorkspaceKey
       ? !!focusedGroup?.loadingSessions
       : globalLoading
+
+  /**
+   * BOT Tab：有更多 `__proactive__` 页时主动翻页（不靠滚动）。
+   * 多人成组后列表往往不够高、sentinel 进不了视口；若不翻页，每人只剩首页那一条。
+   */
+  useEffect(() => {
+    if (!isEmployeesTab) return
+    if (!flatHasMore || flatLoading) return
+    triggerLoadMore(WORKSPACE_GROUP_PROACTIVE)
+  }, [isEmployeesTab, flatHasMore, flatLoading, triggerLoadMore])
 
   /** 工作区 / BOT 分组头拖拽换序。
    *  与置顶行拖拽同款 pointer 拖拽：按下移动 >5px 视为拖拽，落到目标组头换序；
@@ -1720,15 +1795,8 @@ export function ShellSessionList({
               aria-selected={viewMode === 'depts'}
               className={`shell-view-tab${viewMode === 'depts' ? ' is-active' : ''}`}
               onPointerEnter={() => {
-                // 悬停预热：departments 很快；roles 常被 Best-effort 503，提前拉降低点进空转
-                void import('../../lib/tauri-api.js')
-                  .then(({ api }) =>
-                    Promise.all([
-                      api.proactiveListDepartments().catch(() => null),
-                      api.proactiveListRoles('active').catch(() => null),
-                    ]),
-                  )
-                  .catch(() => {})
+                // 悬停写入模块缓存，点进 Tab 可直接画列表
+                prefetchDeptChatList()
               }}
               onClick={() => setViewMode('depts')}
             >
@@ -2230,7 +2298,83 @@ export function ShellSessionList({
                             <span className='react-chat-session-ws-group-label min-w-0 flex-1 truncate'>
                               {section.label}
                             </span>
+                            {(() => {
+                              const foldedN =
+                                isEmployeesTab
+                                  ? foldedDutyByEmployee.get(normalizeEmployeeCodeKey(section.key))
+                                      ?.length || 0
+                                  : 0
+                              const totalN = section.rows.length + foldedN
+                              if (totalN <= 0) return null
+                              return (
+                                <span
+                                  className="react-chat-session-ws-group-count"
+                                  title={
+                                    foldedN > 0
+                                      ? `${section.rows.length} 条可见 · ${foldedN} 条更早值班`
+                                      : `${totalN} 条对话`
+                                  }
+                                >
+                                  {totalN}
+                                </span>
+                              )
+                            })()}
                             <span className='hidden shrink-0 items-center gap-1 group-hover/ws:flex'>
+                              {isEmployeesTab ? (
+                                <>
+                                  {(() => {
+                                    const empCode = String(
+                                      section.avatarAgentCode || section.key || '',
+                                    ).trim()
+                                    const empLc = empCode.toLowerCase()
+                                    const empRefreshing = employeeRefreshingLc === empLc
+                                    const empBusy = section.rows.some(
+                                      (r) =>
+                                        !!r.executing ||
+                                        !!runningSessionMap?.[String(r.sessionKey || '')],
+                                    )
+                                    return (
+                                      <>
+                                        <button
+                                          type="button"
+                                          className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-md border-transparent bg-transparent text-foreground-subtle transition-colors hover:bg-surface-hover hover:text-foreground${
+                                            empRefreshing ? ' is-refreshing' : ''
+                                          }`}
+                                          title={empRefreshing ? '正在刷新…' : '刷新此 BOT 会话'}
+                                          aria-label={empRefreshing ? '正在刷新…' : '刷新此 BOT 会话'}
+                                          disabled={empRefreshing || !empCode}
+                                          onMouseDown={(e) => e.stopPropagation()}
+                                          onClick={(e) => {
+                                            e.stopPropagation()
+                                            if (!empCode) return
+                                            void refreshEmployeeGroup(empCode, section.rows)
+                                          }}
+                                        >
+                                          <ShellRefreshIcon
+                                            size={12}
+                                            className={empRefreshing ? 'animate-spin' : undefined}
+                                          />
+                                        </button>
+                                        {empBusy ? (
+                                          <button
+                                            type="button"
+                                            className="flex h-5 w-5 shrink-0 items-center justify-center rounded-md border-transparent bg-transparent text-foreground-subtle transition-colors hover:bg-surface-hover hover:text-foreground"
+                                            title="停止此 BOT 执行中的会话"
+                                            aria-label="停止此 BOT 执行中的会话"
+                                            onMouseDown={(e) => e.stopPropagation()}
+                                            onClick={(e) => {
+                                              e.stopPropagation()
+                                              stopEmployeeGroup(section.rows)
+                                            }}
+                                          >
+                                            <ShellStopIcon size={11} />
+                                          </button>
+                                        ) : null}
+                                      </>
+                                    )
+                                  })()}
+                                </>
+                              ) : null}
                               <button
                                 type='button'
                                 className='flex h-5 w-5 shrink-0 items-center justify-center rounded-md border-transparent bg-transparent text-foreground-subtle transition-colors hover:bg-surface-hover hover:text-foreground'
@@ -2305,64 +2449,106 @@ export function ShellSessionList({
                                     暂无会话
                                   </li>
                                 )}
+                                {(() => {
+                                  if (!isEmployeesTab) return null
+                                  const empKey = normalizeEmployeeCodeKey(section.key)
+                                  const folded = foldedDutyByEmployee.get(empKey) || []
+                                  if (!folded.length) return null
+                                  const open = dutyFoldOpenKeys.has(empKey)
+                                  return (
+                                    <>
+                                      <li className="react-chat-session-duty-fold" key={`duty-fold-${empKey}`}>
+                                        <button
+                                          type="button"
+                                          className={`react-chat-session-duty-fold-btn${open ? ' is-open' : ''}`}
+                                          aria-expanded={open}
+                                          onClick={() => toggleEmployeeDutyFold(empKey)}
+                                        >
+                                          <ShellChevronIcon
+                                            size={12}
+                                            className={`react-chat-session-duty-fold-chevron${open ? ' is-open' : ''}`}
+                                          />
+                                          <span>
+                                            {open
+                                              ? '收起更早的值班记录'
+                                              : `值班记录 · 还有 ${folded.length} 条`}
+                                          </span>
+                                        </button>
+                                      </li>
+                                      {open
+                                        ? folded.map((row) => (
+                                            <Fragment key={`duty-${row.sessionKey}`}>
+                                              {renderSessionRow(row)}
+                                            </Fragment>
+                                          ))
+                                        : null}
+                                    </>
+                                  )
+                                })()}
                               </ul>
                             ) : null}
                         </li>
                       )
                     })
-                  : [
-                        recentVisibleRows.map((row) => renderSessionRow(row)),
-                        showDutyFold ? (
-                          <li className="react-chat-session-duty-fold" key="duty-fold">
-                            <button
-                              type="button"
-                              className={`react-chat-session-duty-fold-btn${dutyFoldOpen ? ' is-open' : ''}`}
-                              aria-expanded={dutyFoldOpen}
-                              onClick={() => setDutyFoldOpen((v) => !v)}
-                            >
-                              <ShellChevronIcon
-                                size={12}
-                                className={`react-chat-session-duty-fold-chevron${dutyFoldOpen ? ' is-open' : ''}`}
-                              />
-                              <span>
-                                {dutyFoldOpen
-                                  ? '收起更早的值班记录'
-                                  : `值班记录 · 还有 ${foldedDutyRows.length} 条`}
-                              </span>
-                            </button>
-                          </li>
-                        ) : null,
-                        showDutyFold && dutyFoldOpen
-                          ? foldedDutyRows.map((row) => (
-                              <Fragment key={`duty-${row.sessionKey}`}>
-                                {renderSessionRow(row)}
-                              </Fragment>
-                            ))
-                          : null,
-                        flatLoading && !flatHasMore ? (
-                          <li className="react-chat-muted react-chat-session-workspace-loading" key="loading">
-                            加载中…
-                          </li>
-                        ) : null,
-                        flatHasMore ? (
-                          <li
-                            className="react-chat-session-workspace-load-more-sentinel"
-                            key="load-more"
-                            data-load-more-sentinel=""
-                            data-workspace-key={
-                              isEmployeesTab
-                                ? WORKSPACE_GROUP_PROACTIVE
-                                : focusedWorkspaceKey
-                                  ? focusedGroup?.workspaceKey || focusedWorkspaceKey
-                                  : '__global__'
-                            }
-                          >
-                            {flatLoading ? (
-                              <span className="react-chat-session-workspace-load-spinner" />
-                            ) : null}
-                          </li>
-                        ) : null,
-                      ]}
+                  : recentVisibleRows.map((row) => renderSessionRow(row))}
+                {/* 扁平/单人筛选：值班折叠挂在列表底部（分组模式已按员工挂在组内） */}
+                {!groupedRecentSections && showDutyFold ? (
+                  <li className="react-chat-session-duty-fold" key="duty-fold">
+                    <button
+                      type="button"
+                      className={`react-chat-session-duty-fold-btn${dutyFoldOpen ? ' is-open' : ''}`}
+                      aria-expanded={dutyFoldOpen}
+                      onClick={() => setDutyFoldOpen((v) => !v)}
+                    >
+                      <ShellChevronIcon
+                        size={12}
+                        className={`react-chat-session-duty-fold-chevron${dutyFoldOpen ? ' is-open' : ''}`}
+                      />
+                      <span>
+                        {dutyFoldOpen
+                          ? '收起更早的值班记录'
+                          : `值班记录 · 还有 ${foldedDutyRows.length} 条`}
+                      </span>
+                    </button>
+                  </li>
+                ) : null}
+                {!groupedRecentSections && showDutyFold && dutyFoldOpen
+                  ? foldedDutyRows.map((row) => (
+                      <Fragment key={`duty-${row.sessionKey}`}>
+                        {renderSessionRow(row)}
+                      </Fragment>
+                    ))
+                  : null}
+                {flatLoading && !flatHasMore ? (
+                  <li className="react-chat-muted react-chat-session-workspace-loading" key="loading">
+                    加载中…
+                  </li>
+                ) : null}
+                {/* 可见「加载更多」：改造后曾只留 height:0 sentinel，分组树里还一度没挂 → 用户看不到入口 */}
+                {flatHasMore ? (
+                  <li
+                    className="react-chat-session-workspace-load-more"
+                    key="load-more"
+                    data-load-more-sentinel=""
+                    data-workspace-key={loadMoreWorkspaceKey}
+                  >
+                    <button
+                      type="button"
+                      className="react-chat-session-workspace-load-more-btn"
+                      disabled={flatLoading}
+                      onClick={() => triggerLoadMore(loadMoreWorkspaceKey)}
+                    >
+                      {flatLoading ? (
+                        <>
+                          <span className="react-chat-session-workspace-load-spinner" />
+                          <span>加载中…</span>
+                        </>
+                      ) : (
+                        <span>加载更多对话</span>
+                      )}
+                    </button>
+                  </li>
+                ) : null}
               </ul>
             </li>
           ) : null}
@@ -2474,6 +2660,17 @@ export function ShellSessionList({
           !!focusedEmployeeCode &&
           focusedEmployeeCode.toLowerCase() === employeeContextMenu.agentCode.toLowerCase()
         }
+        canStop={(() => {
+          const code = String(employeeContextMenu?.agentCode || '')
+            .trim()
+            .toLowerCase()
+          if (!code) return false
+          const g = employeeGroups.find((x) => x.agentCode.toLowerCase() === code)
+          const rows = g?.sessions || []
+          return rows.some(
+            (r) => !!r.executing || !!runningSessionMap?.[String(r.sessionKey || '')],
+          )
+        })()}
         onClose={() => setEmployeeContextMenu(null)}
         onFocusOnly={() => {
           const code = employeeContextMenu?.agentCode
@@ -2491,6 +2688,24 @@ export function ShellSessionList({
             if (!isChatHashRoute()) navigate('/chat')
             openNewEmployeeChat(code)
           }
+        }}
+        onRefresh={() => {
+          const code = employeeContextMenu?.agentCode
+          setEmployeeContextMenu(null)
+          if (!code) return
+          const g = employeeGroups.find(
+            (x) => x.agentCode.toLowerCase() === code.toLowerCase(),
+          )
+          void refreshEmployeeGroup(code, g?.sessions || [])
+        }}
+        onStop={() => {
+          const code = employeeContextMenu?.agentCode
+          setEmployeeContextMenu(null)
+          if (!code) return
+          const g = employeeGroups.find(
+            (x) => x.agentCode.toLowerCase() === code.toLowerCase(),
+          )
+          stopEmployeeGroup(g?.sessions || [])
         }}
         onOpenEmployeePage={() => {
           const code = employeeContextMenu?.agentCode

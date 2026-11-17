@@ -84,7 +84,6 @@ def _workflow_app_result(data: dict[str, Any]) -> dict[str, Any]:
 def knowledge_list(_args: dict[str, Any]) -> dict[str, Any]:
     from evoflow.admin import knowledge as kn
 
-    # Primary: platform-owned KB. Legacy Obsidian vaults remain available via CLI vaults.
     data = kn.list_bases()
     return {"ok": True, **data}
 
@@ -101,7 +100,8 @@ def knowledge_search(args: dict[str, Any]) -> dict[str, Any]:
     limit = int(args.get("top_k") or args.get("limit") or 8)
     # 默认 hybrid：与前小V专用检索一致（多库扇出 + 语义/关键词）；无向量时 recall 侧会退化
     mode = _arg_str(args, "mode") or "hybrid"
-    data = kn.recall(query, kb_id=kb_id, limit=limit, mode=mode)
+    category = _arg_str(args, "category") or None
+    data = kn.recall(query, kb_id=kb_id, category=category, limit=limit, mode=mode)
     entries = data.get("entries") or data.get("results") or data.get("hits") or []
     if not isinstance(entries, list):
         entries = []
@@ -121,8 +121,8 @@ def knowledge_create(args: dict[str, Any]) -> dict[str, Any]:
     name = _arg_str(args, "name", "title")
     if not name:
         raise ValidationError("name is required")
-    # Platform knowledge = owned KB. Obsidian vaultPath / accessMode are ignored
-    # (legacy vault create remains on CLI: knowledge create --legacy-vault).
+    # Platform knowledge = owned KB. Legacy Obsidian vault APIs (vaultPath /
+    # accessMode / legacy-vault create) were removed with the knowledge merge.
     data = kn.create_owned_base(
         name=name,
         description=_arg_str(args, "description", "desc"),
@@ -135,18 +135,6 @@ def knowledge_create(args: dict[str, Any]) -> dict[str, Any]:
     }
     out["assistant_guide"] = build_knowledge_create_assistant_guide(out)
     return out
-
-
-def knowledge_enable(args: dict[str, Any]) -> dict[str, Any]:
-    from evoflow.admin import knowledge as kn
-
-    vault_id = _arg_str(args, "vaultId", "vault_id", "kbId", "kb_id")
-    if not vault_id:
-        raise ValidationError("vaultId is required")
-    if vault_id.startswith("kb_"):
-        raise ValidationError("自有知识库无需启用/停用；删除请在面板「知识库」操作，或继续用 knowledge.ingest / search。")
-    data = kn.set_vault_enabled(vault_id, _arg_bool(args, "enabled", True))
-    return {"ok": True, **data}
 
 
 def knowledge_reindex(args: dict[str, Any]) -> dict[str, Any]:
@@ -194,9 +182,7 @@ def knowledge_ingest(args: dict[str, Any]) -> dict[str, Any]:
     payload = {
         "title": title,
         "content": content,
-        "summary": _arg_str(args, "summary"),
-        "source": _arg_str(args, "source") or "platform",
-        "tags": list(args.get("tags") or []),
+        "inboxPath": _arg_str(args, "inboxPath", "inbox_path") or None,
     }
     data = kn.remember(payload, vault_id=vault_id)
     nested = data.get("result") if isinstance(data.get("result"), dict) else {}
@@ -1071,6 +1057,40 @@ def employees_list(args: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, **data, "employees": roles, "items": roles}
 
 
+def employees_departments(_args: dict[str, Any]) -> dict[str, Any]:
+    """部门目录：名称、人数、负责人、成员（与 Panel GET /api/proactive/departments 同源）。"""
+    from evoflow.proactive.departments import DepartmentRepository
+
+    DepartmentRepository.ensure_from_roles()
+    items = DepartmentRepository.list_departments(with_members=True)
+    slim: list[dict[str, Any]] = []
+    for d in items or []:
+        if not isinstance(d, dict):
+            continue
+        members = d.get("members") if isinstance(d.get("members"), list) else []
+        member_codes = [
+            str(m.get("agent_code") or "").strip()
+            for m in members
+            if isinstance(m, dict) and str(m.get("agent_code") or "").strip()
+        ]
+        slim.append(
+            {
+                "id": d.get("id"),
+                "name": d.get("name"),
+                "member_count": int(d.get("member_count") or len(member_codes) or 0),
+                "head_agent_code": str(d.get("head_agent_code") or "").strip(),
+                "head_name": str(d.get("head_name") or d.get("head_role_name") or "").strip(),
+                "members": member_codes,
+            }
+        )
+    return {
+        "ok": True,
+        "departments": slim,
+        "count": len(slim),
+        "hint": "雇佣/改岗时 department 填这里的 name；要看成员忙闲再用 employees.org_status / employees.list。",
+    }
+
+
 def employees_org_status(_args: dict[str, Any]) -> dict[str, Any]:
     """名册汇总：人数 / 忙闲 / 待审批（原 xiaomi_org_status）。"""
     from evoflow.admin.employee_front_desk import org_status
@@ -1490,6 +1510,11 @@ def employees_bind_channel_poll(args: dict[str, Any]) -> dict[str, Any]:
                 val = getattr(session, key, None)
                 if val:
                     out[key] = val
+        elif channel == "weixin":
+            for key in ("account_id",):
+                val = getattr(session, key, None)
+                if val:
+                    out[key] = val
     if status in {"failed", "expired"}:
         out["error"] = getattr(session, "error", None) or status
         out["ok"] = False
@@ -1503,7 +1528,7 @@ def _employee_bind_apply_via_gateway(agent_code: str, channel: str, session_id: 
     from evoflow.admin.proactive_http import resolve_proactive_api_base
 
     ch = channel.strip().lower()
-    if ch not in {"feishu", "wecom"}:
+    if ch not in {"feishu", "wecom", "weixin"}:
         raise ValidationError(f"unsupported employee bind channel via Gateway: {channel}")
     base = resolve_proactive_api_base().rstrip("/")
     url = f"{base}/roles/{agent_code}/{ch}/registration/{session_id}/apply"
@@ -1571,7 +1596,7 @@ def employees_bind_channel_apply(args: dict[str, Any]) -> dict[str, Any]:
                     open_id=open_id,
                 )
             )
-        else:
+        elif channel == "wecom":
             bot_id = str(getattr(session, "bot_id", None) or "").strip()
             secret = str(getattr(session, "secret", None) or "").strip()
             if not bot_id or not secret:
@@ -1585,6 +1610,23 @@ def employees_bind_channel_apply(args: dict[str, Any]) -> dict[str, Any]:
                     secret=secret,
                 )
             )
+        elif channel == "weixin":
+            account_id = str(getattr(session, "account_id", None) or "").strip()
+            token = str(getattr(session, "token", None) or "").strip()
+            if not account_id or not token:
+                raise ValidationError("Registration completed but WeChat credentials are missing")
+            from evoflow.proactive.weixin_binding import apply_registration_to_role
+
+            data = _run_coro_sync(
+                apply_registration_to_role(
+                    code,
+                    account_id=account_id,
+                    token=token,
+                    base_url=str(getattr(session, "confirmed_base_url", "") or ""),
+                )
+            )
+        else:
+            raise ValidationError(f"unsupported employee bind channel: {channel}")
 
     out = {
         "ok": True,
@@ -1593,11 +1635,15 @@ def employees_bind_channel_apply(args: dict[str, Any]) -> dict[str, Any]:
         "role_name": role_name,
         "channel": channel,
         "session_id": session_id,
-        "hint": f"已绑定本岗 AI 员工到{('飞书' if channel == 'feishu' else '企微')}；拉进群即可 @{role_name}",
+        "hint": (
+            f"已绑定本岗 AI 员工到{('飞书' if channel == 'feishu' else '企微' if channel == 'wecom' else '微信')}；"
+            f"拉进群即可 @{role_name}"
+        ),
         "assistant_guide": {
             "status": "bind_applied",
             "say_to_user": (
-                f"「{role_name}」本岗 AI 员工已绑定{('飞书' if channel == 'feishu' else '企微')}。"
+                f"「{role_name}」本岗 AI 员工已绑定"
+                f"{('飞书' if channel == 'feishu' else '企微' if channel == 'wecom' else '微信')}。"
                 f"把他拉进同事所在群，@{role_name} 即可协作。"
             ),
             "next_steps": ["把 say_to_user 告诉用户", "可选：employees.get 确认 binding 状态"],
@@ -1636,6 +1682,7 @@ def tasks_list(args: dict[str, Any]) -> dict[str, Any]:
             assignee=_arg_str(args, "assignee", "agent_code", "agentCode") or None,
             role=_arg_str(args, "role", "role_name") or None,
             source=_arg_str(args, "source") or None,
+            main_task_id=_arg_str(args, "main_task_id", "mainTaskId") or None,
             include_subtasks=_arg_bool(args, "include_subtasks", False),
             limit=limit,
             offset=offset,
@@ -1737,28 +1784,56 @@ def tasks_execution_trail(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _resolve_tasks_raised_by(args: dict[str, Any]) -> str:
+    """Explicit raised_by wins; else ambient invoker; else xiaomi (platform chat default).
+
+    CLI ``tasks create`` passes ``raised_by=user`` explicitly so ops stay attributed
+    to the human operator — same field, context-appropriate default.
+    """
+    explicit = _arg_str(args, "raised_by")
+    if explicit:
+        return explicit
+    try:
+        from evoflow.authz.agent_actor import resolve_invoker_stamp
+
+        stamped = str(resolve_invoker_stamp().get("raised_by") or "").strip()
+        if stamped:
+            return stamped
+    except Exception:
+        pass
+    return "xiaomi"
+
+
 def tasks_create(args: dict[str, Any]) -> dict[str, Any]:
     from evoflow.admin import tasks as tasks_admin
 
     name = _arg_str(args, "name", "title")
     if not name:
         raise ValidationError("name is required")
+    # Role → assignee resolution mirrors CLI `tasks create --role` (same helper).
+    role_name = _arg_str(args, "assigned_role", "role", "role_name") or None
+    assignee = _arg_str(args, "assignee", "assigned_to", "agent_code", "agentCode") or None
+    if role_name:
+        role_name, resolved_code = tasks_admin.resolve_role_assignee(role_name)
+        if not assignee:
+            assignee = resolved_code
     return {
         "ok": True,
         **tasks_admin.create_task(
             name=name,
             description=_arg_str(args, "description", "desc"),
-            # Accept assigned_to as alias of assignee (CORE-TASK-03).
-            assignee=_arg_str(args, "assignee", "assigned_to", "agent_code", "agentCode") or None,
-            assigned_role=_arg_str(args, "assigned_role", "role", "role_name") or None,
+            assignee=assignee,
+            assigned_role=role_name,
             main_task_id=_arg_str(args, "main_task_id", "mainTaskId") or None,
             initial_status=_arg_str(args, "status", "initial_status") or "pending",
             result=_arg_str(args, "result") or None,
             source=_arg_str(args, "source") or None,
-            raised_by=_arg_str(args, "raised_by") or "xiaomi",
+            source_ref=_arg_str(args, "source_ref", "sourceRef") or None,
+            raised_by=_resolve_tasks_raised_by(args),
             risk_level=_arg_str(args, "risk_level", "riskLevel") or None,
             action_type=_arg_str(args, "action_type", "actionType") or None,
             round_id=_arg_str(args, "round_id", "roundId") or None,
+            parent_task_id=_arg_str(args, "parent_task_id", "parentTaskId") or None,
         ),
     }
 
@@ -1770,6 +1845,20 @@ def tasks_set_state(args: dict[str, Any]) -> dict[str, Any]:
     state = _arg_str(args, "state", "status", "target")
     if not tid or not state:
         raise ValidationError("task_id and state are required")
+    # 交工派下游与 CLI `tasks state` 同一链路：outputs/handlers 结构化后透传服务层
+    # （completed+handlers→awaiting_close、按条建下游 Task 并 wake）。
+    outputs = None
+    handlers = None
+    outputs_raw = _arg_json_value(args, "outputs")
+    handlers_raw = _arg_json_value(args, "handlers")
+    if outputs_raw:
+        from evoflow.collab.task_outputs import normalize_task_outputs
+
+        outputs = normalize_task_outputs(outputs_raw)
+    if handlers_raw:
+        from evoflow.collab.task_handlers import normalize_task_handlers
+
+        handlers = normalize_task_handlers(handlers_raw)
     return {
         "ok": True,
         **tasks_admin.set_task_state(
@@ -1777,6 +1866,9 @@ def tasks_set_state(args: dict[str, Any]) -> dict[str, Any]:
             state,
             subtask_id=_arg_str(args, "subtask_id", "subtaskId") or None,
             summary=_arg_str(args, "summary", "result") or None,
+            outputs=outputs,
+            handlers=handlers,
+            handlers_empty_reason=_arg_str(args, "handlers_empty_reason", "handlersEmptyReason") or None,
         ),
     }
 
@@ -3385,52 +3477,29 @@ def org_export(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def org_market_catalog(_args: dict[str, Any]) -> dict[str, Any]:
-    import urllib.request
-
-    from evoflow.organizations.fetch import market_catalog_url
-
-    url = market_catalog_url()
-    empty = {
-        "ok": True,
-        "schema": 1,
-        "marketId": "evoflow-resource-market",
-        "packs": [],
-        "configured": bool(url),
-        "source": url or None,
-    }
-    if not url:
-        return empty
-
-    def _fetch() -> dict[str, Any]:
-        with urllib.request.urlopen(url, timeout=15) as resp:  # noqa: S310
-            data = json.loads(resp.read().decode("utf-8", errors="replace"))
-        if not isinstance(data, dict):
-            raise ValidationError("catalog must be a JSON object")
-        data.setdefault("schema", 1)
-        data["source"] = url
-        data["configured"] = True
-        if not isinstance(data.get("packs"), list):
-            data["packs"] = []
-        return data
+    from evoflow.organizations.market_sources import fetch_merged_catalog
 
     try:
-        return {"ok": True, **_fetch()}
-    except ValidationError:
-        raise
+        data = fetch_merged_catalog(force=bool(_args.get("force")))
+        return {"ok": True, **data}
     except Exception as exc:
         raise ValidationError(f"Failed to fetch market catalog: {exc}") from exc
 
 
 def org_market_install(args: dict[str, Any]) -> dict[str, Any]:
+    zip_url = _arg_str(args, "zip_url", "download_url", "url")
     path = _arg_str(args, "path", "pack_path")
-    if not path:
-        raise ValidationError("path is required（市场内相对路径，如 packs/foo）")
     merged = dict(args)
-    merged["source"] = {
-        "type": "market_path",
-        "path": path,
-        "repo": _arg_str(args, "repo") or None,
-    }
+    if zip_url:
+        merged["source"] = {"type": "zip_url", "url": zip_url}
+    elif path:
+        merged["source"] = {
+            "type": "market_path",
+            "path": path,
+            "repo": _arg_str(args, "repo") or None,
+        }
+    else:
+        raise ValidationError("path（市场相对路径）或 zip_url 必填其一")
     if "conflict" not in merged and "conflict_policy" not in merged:
         merged["conflict"] = "fail"
     return org_install(merged)

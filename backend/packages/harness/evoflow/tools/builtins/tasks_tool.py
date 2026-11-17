@@ -199,6 +199,36 @@ def _resolve_employee_by_code(agent_code: str) -> tuple[str, str] | None:
     return name, code
 
 
+def _resolve_create_description(description: str, content: str) -> tuple[str, str]:
+    """create 的描述取值：接住误传到 ``content`` 的正文，并给出该在回执里说的话。
+
+    【fullstack-dev · 2026-11-15 · 第13轮】新建。
+    为什么：本岗 10:38 建交接单 2611151038_93ae 时把正文传给了 ``content``
+      （那是 ``handlers[]`` 项的字段名，见 ``TaskHandlerItem.content`` L120），
+      ``create`` 只认 ``description`` → 框架按签名丢弃未知 kw，回执照样 ``ok:true`` /
+      ``auto_woke:true``，但 ``tasks get`` 回来 ``description:""`` —— 下游被叫醒却
+      看不到文件清单和验收命令。**"回执成功但数据丢了"** 是本岗判据里最坏的一类
+      （与第12轮 note 整篇覆盖同型）。
+    为什么不硬拒：小V / 编排层代用户建单常常只给标题，报错就变成"拦住别人正常动作"的守卫
+      （第12轮我刚把这类守卫立成缺陷，不能自己再造一个）。所以：能兜回来就兜，兜不回来
+      只在回执明写 warning —— 静默丢弃才是问题，描述为空本身只是"信息少"。
+    边界：两者都给时以 ``description`` 为准（不覆盖显式意图）；只服务 create。
+    """
+    desc = str(description or "").strip()
+    if desc:
+        return desc, ""
+    alias = str(content or "").strip()
+    if alias:
+        return alias, (
+            "正文取自 content（create 的正规字段是 description），已按 description 落库；"
+            "content 只在 handlers[] 里表示移交说明"
+        )
+    return "", (
+        "description 为空：下游被叫醒时看不到文件清单与验收要求；"
+        "派单/交接请在 description 写清改了什么、涉及哪些文件、如何验收"
+    )
+
+
 def _bind_actor_from_runtime(runtime: ToolRuntime[ContextT, dict] | None) -> str:
     """Resolve ambient agent actor from ToolRuntime (model never passes this)."""
     from evoflow.authz.agent_actor import agent_actor_from_runtime, set_current_agent_actor
@@ -364,6 +394,13 @@ def tasks_tool(
     task_id: str = "",
     subtask_id: str = "",
     status: str = "",
+    # 【self-evolution-bot · 2026-11-16 · 第19轮】新增 state 作为 status 的别名（见 state 分支）。
+    # 为什么：本 action 名就叫 "state"，状态值却要传给 status。观测库实测这类错
+    # error_message='status is required' 已发生 3 次（11-15 08:02 / 15:02 / 19:32），
+    # 19:32 那次就在我把报错文案改得更明确之后 —— 说明"改文案"只缓解不解决。
+    # 照 _resolve_create_description 的先例：能兜回来就兜（两者都给时以 status 为准），
+    # 兜回来时在回执里明写 warning，不静默丢弃。
+    state: str = "",
     summary: str = "",
     progress: int | None = None,
     outputs: OutputsArg = None,
@@ -371,6 +408,8 @@ def tasks_tool(
     handlers_empty_reason: str = "",
     name: str = "",
     description: str = "",
+    # 【fullstack-dev · 2026-11-15 · 第13轮】新增 content 作为 description 的别名（见 create 分支）。
+    content: str = "",
     assignee: str = "",
     role: str = "",
     main_task_id: str = "",
@@ -448,10 +487,24 @@ def tasks_tool(
         if act == "state":
             tid = str(task_id or "").strip()
             st = str(status or "").strip()
+            st_alias_used = False
             if not tid:
                 return _err(act, "task_id is required")
             if not st:
-                return _err(act, "status is required")
+                # 【self-evolution-bot · 2026-11-16 · 第19轮】state 别名兜底。
+                # 依据：obs 实测 "status is required" 已发生 3 次（11-15 08:02/15:02/19:32），
+                # 最后一次发生在我把文案改明确之后 —— 文案救不了，得让参数能接住。
+                st_alias = str(state or "").strip()
+                if st_alias:
+                    st = st_alias
+                    st_alias_used = True
+                else:
+                    # 文案仍保留：真没给值时得指方向。
+                    return _err(
+                        act,
+                        "status is required（参数名是 status 或别名 state，"
+                        "不是 action 名；取值 completed/failed/cancelled）",
+                    )
             try:
                 data = tasks_admin.set_task_state(
                     tid,
@@ -507,7 +560,16 @@ def tasks_tool(
                         }
                 else:
                     raise
-            return _ok({"action": act, "result": data})
+            payload: dict[str, Any] = {"action": act, "result": data}
+            # 【self-evolution-bot · 2026-11-16 · 第19轮】别名被接住时明写 warning。
+            # 判据同 _resolve_create_description：能兜回来就兜，但**不许静默** ——
+            # 静默会让"我传对了参数"的错觉一直留着，下次照错写。
+            if st_alias_used:
+                payload["warning"] = (
+                    "状态值取自参数 state（别名）；本 action 的规范参数名是 status。"
+                    "两者都给时以 status 为准。"
+                )
+            return _ok(payload)
 
         if act == "delete":
             tid = str(task_id or "").strip()
@@ -522,6 +584,16 @@ def tasks_tool(
         nm = str(name or "").strip()
         if not nm:
             return _err(act, "name is required")
+        # 【fullstack-dev · 2026-11-15 · 第13轮】改：接住误传到 content 的正文，缺描述时在回执里点名。
+        # 为什么：本岗 10:38 建交接单 2611151038_93ae 时把正文传给了 content（handlers[] 项的字段名，
+        #   与 create 的 description 串位），框架按签名丢弃未知 kw → 回执 ok:true、auto_woke:true，
+        #   但 tasks get 回来 description:"" —— 下游被叫醒时看不到任何文件清单与验收命令。
+        #   这属于"回执成功但数据丢了"（第12轮 note 覆盖同型），必须修。
+        # **但不硬拒**：小V/编排层代用户建单常常只给标题，报错会变成拦住别人正常动作的守卫
+        #   （本岗第12轮刚把这类守卫立成缺陷，不能自己再造一个）。所以：能救的救回来，救不了的在
+        #   回执明写 warning，让人看见 —— 静默丢弃才是问题，空描述本身只是"信息少"。
+        # 边界：两者都给时以 description 为准（不覆盖显式意图）；只影响 create，其余 action 不动。
+        desc_v, desc_warning = _resolve_create_description(description, content)
         assignee_norm, role_name, src, raised, assignee_is_fallback = _infer_duty_create_defaults(
             name=nm,
             assignee=str(assignee or "").strip() or None,
@@ -540,7 +612,7 @@ def tasks_tool(
         round_v = str(round_id or "").strip() or None
         data = tasks_admin.create_task(
             name=nm,
-            description=str(description or "").strip(),
+            description=desc_v,  # 【fullstack-dev · 2026-11-15 · 第13轮】改用含 content 别名的取值
             assignee=assignee_norm,
             assigned_role=role_name,
             main_task_id=str(main_task_id or "").strip() or None,
@@ -556,6 +628,13 @@ def tasks_tool(
             # Do not wake the system front desk for a shell task nobody asked for.
             start=bool(start) and not assignee_is_fallback,
         )
+        # 【fullstack-dev · 2026-11-15 · 第13轮】建单成功但描述有问题时，在回执点名。
+        # 为什么：10:38 我建的交接单正文传给了 content（与 create 的 description 串位），
+        #   框架静默丢弃未知 kw → 回执 ok:true / auto_woke:true，但 description 实际为空，
+        #   下游被叫醒却看不到文件清单与验收要求。不硬拒（小V 代用户建单常只给标题，
+        #   报错会变成拦住别人正常动作的守卫），改为「能兜回来就兜 + 兜不回就明写 warning」。
+        if desc_warning:
+            return _ok({"action": act, "result": data, "warning": desc_warning})
         return _ok({"action": act, "result": data})
 
     except (ValidationError, NotFoundError) as e:
