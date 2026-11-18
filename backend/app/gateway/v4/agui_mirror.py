@@ -30,6 +30,12 @@ logger = logging.getLogger(__name__)
 
 _MIRROR_DISABLED = os.getenv("EVOFLOW_V4_MIRROR", "1").strip().lower() in {"0", "false", "off", "no"}
 
+# 空流 / 过早 RUN_FINISHED / 历史仅 user 轮：与 hydration 共用文案，避免 live 与 remint 口径分裂。
+EMPTY_RUN_NOTICE_TEXT = (
+    "本轮未产出可见回复（空流或过早收尾）。"
+    "若随后仍有模型输出，会继续挂在本轮；也可再发一条重试。"
+)
+
 _AGUI_TO_TOOL_STATUS: dict[str, str] = {
     "inputstreaming": "inputStreaming",
     # AG-UI / sse_ui_normalize 发的是 pending_approval（带下划线）；
@@ -162,6 +168,55 @@ _WRITE_TOOL_NAMES = {
 # 巨型工具结果（视频生成 base64 等）不进投影行——快照字节预算收缩与 renderer OOM 的根因；
 # 全文走 /tool-results 按需拉取（hydration 同阈值）。
 _TOOL_OUTPUT_ROW_PREVIEW_MAX = 12_000
+
+
+def _preview_tool_output_text(content: str) -> str:
+    text = str(content or "")
+    if len(text) <= _TOOL_OUTPUT_ROW_PREVIEW_MAX:
+        return text
+    return (
+        text[:_TOOL_OUTPUT_ROW_PREVIEW_MAX]
+        + "\n…（已截断，完整内容点开工具卡查看）"
+    )
+
+
+def _transcript_tool_result_text(
+    thread_id: str, tool_call_id: str
+) -> tuple[str, str] | None:
+    """从 ``evoflow_chat_messages`` 取已落库的 tool 正文。
+
+    TranscriptMiddleware 在工具返回前就会 await 落库；AG-UI ``TOOL_CALL_RESULT``
+    却可能晚于 ``RUN_FINISHED`` 或在 SSE 层被丢掉。seal 时回填，避免 V4 卡永久
+    ``cancelled``、展开无结果（search_code_index 时效性行也一起看不见）。
+    """
+    tid = str(thread_id or "").strip()
+    tcid = str(tool_call_id or "").strip()
+    if not tid or not tcid:
+        return None
+    try:
+        from evoflow.persistence.session_repositories import find_session_key_by_thread_id
+        from evoflow.persistence.chat_message_repositories import get_tool_result_for_display
+
+        sk = find_session_key_by_thread_id(tid)
+        if not sk:
+            return None
+        payload = get_tool_result_for_display(sk, tcid)
+    except Exception:
+        logger.debug(
+            "[v4-mirror] transcript tool lookup failed thread=%s tcid=%s",
+            tid,
+            tcid,
+            exc_info=True,
+        )
+        return None
+    if not isinstance(payload, dict):
+        return None
+    body = str(payload.get("content") or "")
+    if not body.strip():
+        return None
+    name = str(payload.get("toolName") or "").strip() or "tool"
+    return name, body
+
 
 _DIFF_MAX_LINES = 800
 
@@ -807,11 +862,128 @@ class V4Mirror:
             },
         )
 
+    def _turn_has_assistant_work(self, tid: str, turn_id: str) -> bool:
+        """Hub 上该轮是否已有可见助手产物（正文/思考/工具），不只看 text_acc。"""
+        want = str(turn_id or "").strip()
+        if not want:
+            return False
+        sess = self._hub.get_session(tid)
+        if sess is None or not sess.rows:
+            return False
+        for row in sess.rows.values():
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("turnId") or "").strip() != want:
+                continue
+            kind = str(row.get("kind") or "")
+            if kind in ("assistantText", "reasoning", "toolCall", "subagent"):
+                # 空跑占位本身不算「有产出」
+                eid = str(row.get("entityId") or "")
+                if eid.startswith("empty-run-"):
+                    continue
+                if kind == "assistantText" and not str(row.get("text") or "").strip():
+                    continue
+                return True
+        return False
+
+    def _upsert_empty_run_notice(self, tid: str, st: _MirrorState, *, now_ms: int) -> None:
+        """空流 / 过早 RUN_FINISHED：写一条可见占位，避免用户轮只剩气泡像「已完成却没回复」。"""
+        turn_id = str(st.turn_id or "").strip()
+        if not turn_id or not st.run_started:
+            return
+        if self._turn_has_assistant_work(tid, turn_id):
+            return
+        mid = f"empty-run-{turn_id}"
+        sess = self._hub.get_session(tid)
+        if sess is not None:
+            for row in sess.rows.values():
+                if (
+                    isinstance(row, dict)
+                    and str(row.get("entityId") or "") == mid
+                    and str(row.get("turnId") or "").strip() == turn_id
+                ):
+                    return
+        rid = self._next_row_id(tid)
+        st.text_row_ids[mid] = rid
+        st.text_acc[mid] = EMPTY_RUN_NOTICE_TEXT
+        self._hub.author_append_row(
+            tid,
+            {
+                "rowId": rid,
+                "turnId": turn_id,
+                "kind": "assistantText",
+                "text": st.text_acc[mid],
+                "state": "complete",
+                "createdAt": now_ms,
+                "createdAtSeq": self._seq_now(tid),
+                "entityId": mid,
+            },
+        )
+
+    def _clear_empty_run_notices(self, tid: str, st: _MirrorState) -> None:
+        """真实正文/工具开始后，撤掉空跑占位，避免和真回复叠两条。"""
+        turn_id = str(st.turn_id or "").strip()
+        if not turn_id:
+            return
+        sess = self._hub.get_session(tid)
+        if sess is None or not sess.rows:
+            return
+        drop: list[int] = []
+        for rid, row in list(sess.rows.items()):
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("turnId") or "").strip() != turn_id:
+                continue
+            eid = str(row.get("entityId") or "")
+            if eid.startswith("empty-run-"):
+                drop.append(int(rid))
+                st.text_row_ids.pop(eid, None)
+                st.text_acc.pop(eid, None)
+        if not drop:
+            return
+        remove = getattr(self._hub, "author_remove_rows", None) or getattr(
+            self._hub, "remove_rows", None
+        )
+        if callable(remove):
+            try:
+                remove(tid, drop)
+                return
+            except Exception:
+                logger.debug(
+                    "[v4-mirror] clear empty-run notice via remove failed thread=%s",
+                    tid,
+                    exc_info=True,
+                )
+        # hub 无删行 API 时：把占位文案清空并标 interrupted，前端折叠健康会弱化空壳。
+        for rid in drop:
+            self._hub.author_upsert_row(
+                tid,
+                {
+                    "rowId": rid,
+                    "turnId": turn_id,
+                    "kind": "assistantText",
+                    "text": "",
+                    "state": "interrupted",
+                    "createdAt": _now_ms(),
+                    "createdAtSeq": self._seq_now(tid),
+                    "entityId": f"empty-run-cleared-{rid}",
+                },
+            )
+
     def _mark_assistant_text_interrupted(self, tid: str, st: _MirrorState, *, now_ms: int) -> None:
         """Seal in-flight assistantText rows as interrupted after user stop."""
         if not st.text_row_ids:
             return
         for mid, rid in list(st.text_row_ids.items()):
+            sess = self._hub.get_session(tid)
+            existing = sess.rows.get(int(rid)) if sess is not None else None
+            # 保留 TEXT_MESSAGE_START 写入的 createdAt——勿盖成 turn_started，
+            # 否则同轮多段正文共用一个时间戳，前端 created_at_regression。
+            created_at = (
+                int(existing.get("createdAt") or 0)
+                if isinstance(existing, dict)
+                else 0
+            ) or now_ms
             self._hub.author_upsert_row(
                 tid,
                 {
@@ -820,7 +992,7 @@ class V4Mirror:
                     "kind": "assistantText",
                     "text": str(st.text_acc.get(mid) or ""),
                     "state": "interrupted",
-                    "createdAt": st.turn_started_at_ms or now_ms,
+                    "createdAt": created_at,
                     "createdAtSeq": self._seq_now(tid),
                     "entityId": mid,
                     "endedAt": now_ms,
@@ -844,25 +1016,27 @@ class V4Mirror:
             )
             if cur_state and cur_state != "streaming":
                 continue
-            self._hub.author_upsert_row(
-                tid,
-                {
-                    "rowId": rid,
-                    "turnId": st.turn_id,
-                    "kind": "reasoning",
-                    "state": seal,
-                    "text": str(st.reasoning_acc.get(mid) or ""),
-                    "createdAt": (
-                        int(existing.get("createdAt") or 0)
-                        if isinstance(existing, dict)
-                        else now_ms
-                    )
-                    or now_ms,
-                    "createdAtSeq": self._seq_now(tid),
-                    "assistantResponseId": mid,
-                    "endedAt": now_ms,
-                },
+            created_at, started_at = self._preserve_tool_timestamps(
+                existing if isinstance(existing, dict) else None, now_ms=now_ms
             )
+            duration_ms = self._reasoning_duration_ms(
+                existing if isinstance(existing, dict) else None, now_ms=now_ms
+            )
+            seal_row: dict[str, Any] = {
+                "rowId": rid,
+                "turnId": st.turn_id,
+                "kind": "reasoning",
+                "state": seal,
+                "text": str(st.reasoning_acc.get(mid) or ""),
+                "createdAt": created_at,
+                "createdAtSeq": self._seq_now(tid),
+                "assistantResponseId": mid,
+                "startedAt": started_at,
+                "endedAt": now_ms,
+            }
+            if duration_ms is not None:
+                seal_row["durationMs"] = duration_ms
+            self._hub.author_upsert_row(tid, seal_row)
 
     _OPEN_TOOL_STATUSES = frozenset(
         {"", "inputStreaming", "pendingApproval", "running", "in_progress"}
@@ -876,6 +1050,9 @@ class V4Mirror:
         TOOL_CALL_END 会把 status 写成 running；若随后 RUN_FINISHED 而 RESULT 迟到，
         ``_reset_turn_ephemeral`` 已清 ``tool_row_ids``，迟到 RESULT 再也写不进行 →
         工具卡永久 running，前端 timelineBusy 与侧栏 idle 打架（切回话一直转圈）。
+
+        正常 FINISHED 且 wire RESULT 丢失时：Transcript 往往已有 ToolMessage
+        （middleware 先落库）。此时不要硬盖 cancelled——回填 success+output。
         """
         if not st.tool_row_ids:
             return
@@ -894,32 +1071,38 @@ class V4Mirror:
             )
             if cur and cur not in self._OPEN_TOOL_STATUSES:
                 continue
-            self._hub.author_upsert_row(
-                tid,
-                {
-                    "rowId": row_id,
-                    "turnId": st.turn_id,
-                    "kind": "toolCall",
-                    "toolCallId": tcid,
-                    "toolName": self._tool_name(st, tcid, {}),
-                    "status": seal,
-                    "inputText": st.tool_acc.get(tcid, ""),
-                    "createdAt": (
-                        int(existing.get("createdAt") or 0)
-                        if isinstance(existing, dict)
-                        else now_ms
-                    )
-                    or now_ms,
-                    "createdAtSeq": self._seq_now(tid),
-                    "startedAt": (
-                        int(existing.get("startedAt") or 0)
-                        if isinstance(existing, dict)
-                        else now_ms
-                    )
-                    or now_ms,
-                    "endedAt": now_ms,
-                },
+            created_at, started_at = self._preserve_tool_timestamps(
+                existing if isinstance(existing, dict) else None, now_ms=now_ms
             )
+            input_text = st.tool_acc.get(tcid, "") or (
+                str(existing.get("inputText") or "") if isinstance(existing, dict) else ""
+            )
+            tool_name = self._tool_name(st, tcid, {})
+            row_out: dict[str, Any] = {
+                "rowId": row_id,
+                "turnId": st.turn_id,
+                "kind": "toolCall",
+                "toolCallId": tcid,
+                "toolName": tool_name,
+                "status": seal,
+                "inputText": input_text,
+                "createdAt": created_at,
+                "createdAtSeq": self._seq_now(tid),
+                "startedAt": started_at,
+                "endedAt": now_ms,
+            }
+            # 仅「正常收尾却缺 RESULT」走回填；用户停止 / RUN_ERROR 仍按 seal 语义。
+            if seal == "cancelled":
+                backfill = _transcript_tool_result_text(tid, tcid)
+                if backfill is not None:
+                    bf_name, bf_body = backfill
+                    if bf_name and bf_name != "tool":
+                        row_out["toolName"] = bf_name
+                        if tcid not in st.tool_names:
+                            st.tool_names[tcid] = bf_name
+                    row_out["status"] = "success"
+                    row_out["output"] = {"text": _preview_tool_output_text(bf_body)}
+            self._hub.author_upsert_row(tid, row_out)
 
     def _seal_streaming_assistant_text(
         self, tid: str, st: _MirrorState, *, now_ms: int, state: str = "complete"
@@ -937,6 +1120,11 @@ class V4Mirror:
             )
             if cur_state and cur_state != "streaming":
                 continue
+            created_at = (
+                int(existing.get("createdAt") or 0)
+                if isinstance(existing, dict)
+                else 0
+            ) or now_ms
             self._hub.author_upsert_row(
                 tid,
                 {
@@ -945,7 +1133,7 @@ class V4Mirror:
                     "kind": "assistantText",
                     "text": str(st.text_acc.get(mid) or ""),
                     "state": state,
-                    "createdAt": st.turn_started_at_ms or now_ms,
+                    "createdAt": created_at,
                     "createdAtSeq": self._seq_now(tid),
                     "entityId": mid,
                     "endedAt": now_ms,
@@ -1162,6 +1350,16 @@ class V4Mirror:
         sess = self._hub.get_session(tid)
         return int(sess.seq) if sess is not None else 0
 
+    def _clear_stream_row_maps(self, st: _MirrorState) -> None:
+        """只清正文/思考/工具流式映射；保留 turnHeader / turnId / fileChanges。"""
+        st.text_row_ids.clear()
+        st.text_acc.clear()
+        st.reasoning_row_ids.clear()
+        st.reasoning_acc.clear()
+        st.tool_row_ids.clear()
+        st.tool_acc.clear()
+        st.tool_names.clear()
+
     def _reset_turn_ephemeral(self, st: _MirrorState) -> None:
         """清掉本轮翻译缓存，保留 ``user_text``（下一轮 note_user_input 可能已写入）。
 
@@ -1173,13 +1371,7 @@ class V4Mirror:
         st.turn_header_row_id = 0
         st.turn_id = ""
         st.turn_started_at_ms = 0
-        st.text_row_ids.clear()
-        st.text_acc.clear()
-        st.reasoning_row_ids.clear()
-        st.reasoning_acc.clear()
-        st.tool_row_ids.clear()
-        st.tool_acc.clear()
-        st.tool_names.clear()
+        self._clear_stream_row_maps(st)
         st.turn_file_changes.clear()
 
     def _tool_name(self, st: _MirrorState, tcid: str, ev: dict[str, Any]) -> str:
@@ -1191,6 +1383,98 @@ class V4Mirror:
             or "tool"
         )
 
+    def _lookup_tool_row(
+        self, tid: str, tcid: str
+    ) -> tuple[int, dict[str, Any]] | tuple[None, None]:
+        """按 toolCallId 找回已落盘的工具行（不依赖 ephemeral ``tool_row_ids``）。
+
+        RUN_FINISHED 会 seal 未 RESULT 的工具并 ``_reset_turn_ephemeral`` 清 map；
+        迟到的 TOOL_CALL_RESULT 若仍只查 map，会直接丢弃 → 卡面永久 cancelled、无 output
+       （V4 上 search_code_index 展开空白、索引时效性行也看不见的现场）。
+        """
+        want = str(tcid or "").strip()
+        if not want:
+            return None, None
+        sess = self._hub.get_session(tid)
+        if sess is None or not sess.rows:
+            return None, None
+        best: tuple[int, dict[str, Any]] | None = None
+        for row in sess.rows.values():
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("kind") or "") != "toolCall":
+                continue
+            if str(row.get("toolCallId") or "").strip() != want:
+                continue
+            try:
+                rid = int(row.get("rowId") or 0)
+            except (TypeError, ValueError):
+                continue
+            if rid <= 0:
+                continue
+            if best is None or rid > best[0]:
+                best = (rid, row)
+        return best if best is not None else (None, None)
+
+    def _resolve_tool_row_id(
+        self, tid: str, st: _MirrorState, tcid: str
+    ) -> tuple[int | None, dict[str, Any] | None]:
+        """先查本轮 map，miss 再扫会话行并回填 map，供 ARGS/END/RESULT 共用。"""
+        want = str(tcid or "").strip()
+        if not want:
+            return None, None
+        rid = st.tool_row_ids.get(want)
+        if rid is not None:
+            sess = self._hub.get_session(tid)
+            existing = (
+                sess.rows.get(int(rid))
+                if sess is not None and isinstance(sess.rows.get(int(rid)), dict)
+                else None
+            )
+            return int(rid), existing if isinstance(existing, dict) else None
+        found_rid, found_row = self._lookup_tool_row(tid, want)
+        if found_rid is None or found_row is None:
+            return None, None
+        st.tool_row_ids[want] = int(found_rid)
+        name = str(found_row.get("toolName") or "").strip()
+        if name and want not in st.tool_names:
+            st.tool_names[want] = name
+        if want not in st.tool_acc:
+            st.tool_acc[want] = str(found_row.get("inputText") or "")
+        return int(found_rid), found_row
+
+    @staticmethod
+    def _preserve_tool_timestamps(
+        existing: dict[str, Any] | None, *, now_ms: int
+    ) -> tuple[int, int]:
+        """Retain original createdAt/startedAt so duration survives END/RESULT upserts."""
+        created_at = now_ms
+        started_at = now_ms
+        if isinstance(existing, dict):
+            try:
+                created_at = int(existing.get("createdAt") or 0) or now_ms
+            except (TypeError, ValueError):
+                created_at = now_ms
+            try:
+                started_at = int(existing.get("startedAt") or 0) or created_at
+            except (TypeError, ValueError):
+                started_at = created_at
+        return created_at, started_at
+
+    @staticmethod
+    def _reasoning_duration_ms(
+        existing: dict[str, Any] | None, *, now_ms: int
+    ) -> int | None:
+        if not isinstance(existing, dict):
+            return None
+        try:
+            started = int(existing.get("startedAt") or existing.get("createdAt") or 0)
+        except (TypeError, ValueError):
+            return None
+        if started <= 0:
+            return None
+        return max(0, int(now_ms) - started)
+
     def _fail_open_turn_header(
         self, tid: str, st: _MirrorState, *, now_ms: int, reason: str
     ) -> None:
@@ -1199,6 +1483,13 @@ class V4Mirror:
         turn_id = str(st.turn_id or "").strip()
         if header_rid <= 0 or not turn_id:
             return
+        header_origin = "userInput"
+        sess = self._hub.get_session(tid)
+        existing = sess.rows.get(header_rid) if sess is not None else None
+        if isinstance(existing, dict):
+            prev_origin = str(existing.get("origin") or "").strip()
+            if prev_origin:
+                header_origin = prev_origin
         self._hub.author_upsert_row(
             tid,
             {
@@ -1206,7 +1497,7 @@ class V4Mirror:
                 "turnId": turn_id,
                 "entityId": turn_id,
                 "kind": "turnHeader",
-                "origin": "userInput",
+                "origin": header_origin,
                 "state": "failed",
                 "startedAt": st.turn_started_at_ms or now_ms,
                 "endedAt": now_ms,
@@ -1218,6 +1509,137 @@ class V4Mirror:
                 },
             },
         )
+
+    def _lookup_turn_header(
+        self, tid: str, turn_id: str
+    ) -> tuple[int, int, str]:
+        """Return (header_row_id, started_at_ms, origin) for a product turn."""
+        want = str(turn_id or "").strip()
+        if not want:
+            return 0, 0, "userInput"
+        sess = self._hub.get_session(tid)
+        if sess is None:
+            return 0, 0, "userInput"
+        best: dict[str, Any] | None = None
+        for row in sess.rows.values():
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("kind") or "") != "turnHeader":
+                continue
+            if str(row.get("turnId") or "").strip() != want:
+                continue
+            if best is None or int(row.get("rowId") or 0) >= int(best.get("rowId") or 0):
+                best = row
+        if best is None:
+            return 0, 0, "userInput"
+        origin = str(best.get("origin") or "").strip() or "userInput"
+        return (
+            int(best.get("rowId") or 0),
+            int(best.get("startedAt") or 0),
+            origin,
+        )
+
+    def _latest_product_turn_id(self, tid: str) -> str:
+        """Hub 投影里最近一条 turnHeader 的 turnId（mirror_reset 后 last_turn_id 会丢）。"""
+        sess = self._hub.get_session(tid)
+        if sess is None or not sess.rows:
+            return ""
+        best: dict[str, Any] | None = None
+        for row in sess.rows.values():
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("kind") or "") != "turnHeader":
+                continue
+            if best is None or int(row.get("rowId") or 0) >= int(best.get("rowId") or 0):
+                best = row
+        if best is None:
+            return ""
+        return str(best.get("turnId") or "").strip()
+
+    def _reuse_product_turn(
+        self,
+        tid: str,
+        st: _MirrorState,
+        *,
+        turn_id: str,
+        header_rid: int,
+        started_at: int,
+        header_origin: str,
+        next_run_id: str,
+        now_ms: int,
+        reason: str = "RUN_STARTED continuation without userInput",
+        clear_stream_maps: bool = True,
+    ) -> None:
+        """无新用户输入的内部续跑：挂回上一 product turn，避免左栏 AI 回复被劈成两截。"""
+        logger.warning(
+            "[v4-mirror] %s; reuse turn thread=%s turn=%s next_run=%s",
+            reason,
+            tid,
+            turn_id,
+            next_run_id,
+        )
+        if clear_stream_maps:
+            self._clear_stream_row_maps(st)
+        st.run_started = True
+        st.turn_id = turn_id
+        st.last_turn_id = turn_id
+        st.turn_header_row_id = header_rid
+        st.turn_started_at_ms = started_at or now_ms
+        st.turn_usage = None
+        st.last_text_row_id = 0
+        st.last_turn_success = False
+        st.usage_bumped = False
+        origin = str(header_origin or "").strip() or "userInput"
+        self._hub.author_upsert_row(
+            tid,
+            {
+                "rowId": header_rid,
+                "turnId": turn_id,
+                "entityId": turn_id,
+                "kind": "turnHeader",
+                "origin": origin,
+                "state": "running",
+                "startedAt": started_at or now_ms,
+                "createdAt": started_at or now_ms,
+                "createdAtSeq": self._seq_now(tid),
+            },
+        )
+        self._patch_control(
+            tid,
+            _running_control(now_ms=now_ms, last_error=st.sticky_run_error),
+        )
+
+    def _ensure_active_turn_for_stream(
+        self, tid: str, st: _MirrorState, *, now_ms: int, via: str
+    ) -> bool:
+        """保证流式正文/工具有可挂的 product turn。
+
+        工具循环中间的 RUN_FINISHED 会 ``_reset_turn_ephemeral`` 清掉 ``turn_id``；
+        若随后 TEXT_*/TOOL_* 仍按空 turnId 落行，助手气泡会成孤儿——用户轮只剩
+        turnHeader(completedSuccess)+userInput，浮层/页面都看不到 AI 回复。
+        """
+        if st.run_started and str(st.turn_id or "").strip() and int(st.turn_header_row_id or 0) > 0:
+            return True
+        cont_tid = str(st.last_turn_id or "").strip() or self._latest_product_turn_id(tid)
+        if not cont_tid:
+            return False
+        cont_rid, cont_started, cont_origin = self._lookup_turn_header(tid, cont_tid)
+        if cont_rid <= 0:
+            return False
+        self._reuse_product_turn(
+            tid,
+            st,
+            turn_id=cont_tid,
+            header_rid=cont_rid,
+            started_at=cont_started,
+            header_origin=cont_origin,
+            next_run_id=f"late-stream:{via}",
+            now_ms=now_ms,
+            reason=f"late {via} after turn sealed",
+            # 迟到 START 时 map 本就空；勿清掉同帧已写入的 mid（防御性）。
+            clear_stream_maps=False,
+        )
+        return bool(str(st.turn_id or "").strip())
 
     def _find_reusable_user_input_row(
         self,
@@ -1269,22 +1691,44 @@ class V4Mirror:
             )
             prior_reset = False
             prev_turn_id = ""
+            prev_header_rid = 0
+            prev_started_at = 0
+            pending_user = bool(str(st.user_text or "").strip() or st.user_attachments)
             if st.run_started:
-                # 同 runId 重复 START：去重。不同 runId：上一轮 FINISHED 漏清闩锁，强制开新轮。
+                # 同 runId 重复 START：去重。不同 runId：上一轮 FINISHED 漏清闩锁。
                 if new_turn_id == st.turn_id:
                     return
                 prior_reset = True
                 prev_turn_id = str(st.turn_id or "").strip()
+                prev_header_rid = int(st.turn_header_row_id or 0)
+                prev_started_at = int(st.turn_started_at_ms or 0)
                 logger.warning(
                     "[v4-mirror] RUN_STARTED while prior turn open; reset thread=%s prev=%s next=%s",
                     tid,
                     prev_turn_id,
                     new_turn_id,
                 )
-                # 先封未收口工具/流式正文/思考，再 reset ephemeral——否则行永久 running/streaming。
+                # 先封未收口工具/流式正文/思考——否则行永久 running/streaming。
                 self._seal_open_tool_calls(tid, st, now_ms=now_ms, status="cancelled")
                 self._mark_assistant_text_interrupted(tid, st, now_ms=now_ms)
                 self._seal_streaming_reasoning(tid, st, now_ms=now_ms, state="interrupted")
+
+                if prev_turn_id and prev_header_rid > 0 and not pending_user:
+                    # 无新用户输入的「假新轮」（漏 FINISHED / 内部续跑）：续挂上一 product turn。
+                    _, _, prev_origin = self._lookup_turn_header(tid, prev_turn_id)
+                    self._reuse_product_turn(
+                        tid,
+                        st,
+                        turn_id=prev_turn_id,
+                        header_rid=prev_header_rid,
+                        started_at=prev_started_at,
+                        header_origin=prev_origin,
+                        next_run_id=new_turn_id,
+                        now_ms=now_ms,
+                    )
+                    return
+
+                # 有新用户输入：旧头收成 failed，再开真正的新轮。
                 self._fail_open_turn_header(
                     tid,
                     st,
@@ -1292,6 +1736,31 @@ class V4Mirror:
                     reason=f"superseded by {new_turn_id}",
                 )
                 self._reset_turn_ephemeral(st)
+
+            # FINISHED 已清闩锁 / mirror_reset 后的内部续跑：没有 note_user_input →
+            # 仍挂回上一轮。否则右栏会出现 goalContinuation 假新轮，左栏 AI 回复劈成两截
+            # （浮层 #N userInput + #N+1 无气泡，正是用户贴的那种）。
+            if not pending_user:
+                cont_tid = str(st.last_turn_id or "").strip() or self._latest_product_turn_id(
+                    tid
+                )
+                if cont_tid:
+                    cont_rid, cont_started, cont_origin = self._lookup_turn_header(
+                        tid, cont_tid
+                    )
+                    if cont_rid > 0:
+                        self._reuse_product_turn(
+                            tid,
+                            st,
+                            turn_id=cont_tid,
+                            header_rid=cont_rid,
+                            started_at=cont_started,
+                            header_origin=cont_origin,
+                            next_run_id=new_turn_id,
+                            now_ms=now_ms,
+                        )
+                        return
+
             st.run_started = True
             st.turn_id = new_turn_id
             st.last_turn_id = new_turn_id
@@ -1304,21 +1773,6 @@ class V4Mirror:
             st.usage_bumped = False
             rid = self._next_row_id(tid)
             st.turn_header_row_id = rid
-            self._hub.author_append_row(
-                tid,
-                {
-                    "rowId": rid,
-                    "turnId": st.turn_id,
-                    # 面板「N 个文件已更改」展开依赖 ConversationRowTarget.entityId
-                    "entityId": st.turn_id,
-                    "kind": "turnHeader",
-                    "origin": "userInput",
-                    "state": "running",
-                    "startedAt": now_ms,
-                    "createdAt": now_ms,
-                    "createdAtSeq": self._seq_now(tid),
-                },
-            )
             user_text = st.user_text
             user_atts = list(st.user_attachments or [])
             user_mid = str(st.user_message_id or "").strip()
@@ -1329,7 +1783,7 @@ class V4Mirror:
             st.user_message_id = ""
             st.user_origin = "realUser"
             st.user_epilogue_start = 0
-            if (user_text or user_atts) and not (
+            has_visible_user = bool(user_text or user_atts) and not (
                 not user_atts
                 and (
                     (
@@ -1343,7 +1797,25 @@ class V4Mirror:
                     )
                     or _is_hidden_task_notification_message_id(user_mid)
                 )
-            ):
+            )
+            # 无可见 userInput 时不要谎称 origin=userInput（否则浮层右栏有头无气泡、左栏像劈开的回复）。
+            header_origin = "userInput" if has_visible_user else "goalContinuation"
+            self._hub.author_append_row(
+                tid,
+                {
+                    "rowId": rid,
+                    "turnId": st.turn_id,
+                    # 面板「N 个文件已更改」展开依赖 ConversationRowTarget.entityId
+                    "entityId": st.turn_id,
+                    "kind": "turnHeader",
+                    "origin": header_origin,
+                    "state": "running",
+                    "startedAt": now_ms,
+                    "createdAt": now_ms,
+                    "createdAtSeq": self._seq_now(tid),
+                },
+            )
+            if has_visible_user:
                 reusable = self._find_reusable_user_input_row(
                     tid,
                     user_mid=user_mid,
@@ -1396,6 +1868,11 @@ class V4Mirror:
             mid = str(ev.get("messageId") or "").strip()
             if not mid or mid in st.text_row_ids:
                 return
+            if not self._ensure_active_turn_for_stream(
+                tid, st, now_ms=now_ms, via="TEXT_MESSAGE_START"
+            ):
+                return
+            self._clear_empty_run_notices(tid, st)
             # Successful model output starting → clear retry banner + sticky error.
             st.sticky_run_error = None
             self._clear_api_retry(tid, st, now_ms=now_ms)
@@ -1434,15 +1911,23 @@ class V4Mirror:
             rid = st.text_row_ids.get(mid)
             if rid is None:
                 return
+            sess = self._hub.get_session(tid)
+            existing = sess.rows.get(int(rid)) if sess is not None else None
+            # 保留 START 时的 createdAt（每段正文独立时钟）；END 只收 state/text。
+            created_at = (
+                int(existing.get("createdAt") or 0)
+                if isinstance(existing, dict)
+                else 0
+            ) or now_ms
             self._hub.author_upsert_row(
                 tid,
                 {
                     "rowId": rid,
-                    "turnId": st.turn_id,
+                    "turnId": str(st.turn_id or st.last_turn_id or "").strip(),
                     "kind": "assistantText",
                     "state": "complete",
                     "text": st.text_acc.get(mid, ""),
-                    "createdAt": now_ms,
+                    "createdAt": created_at,
                     "createdAtSeq": self._seq_now(tid),
                     "assistantResponseId": mid,
                 },
@@ -1453,6 +1938,11 @@ class V4Mirror:
             mid = str(ev.get("messageId") or "").strip()
             if not mid or mid in st.reasoning_row_ids:
                 return
+            if not self._ensure_active_turn_for_stream(
+                tid, st, now_ms=now_ms, via="REASONING_MESSAGE_START"
+            ):
+                return
+            self._clear_empty_run_notices(tid, st)
             rid = self._next_row_id(tid)
             st.reasoning_row_ids[mid] = rid
             st.reasoning_acc[mid] = ""
@@ -1467,6 +1957,7 @@ class V4Mirror:
                     "createdAt": now_ms,
                     "createdAtSeq": self._seq_now(tid),
                     "assistantResponseId": mid,
+                    "startedAt": now_ms,
                 },
             )
             return
@@ -1486,19 +1977,29 @@ class V4Mirror:
             rid = st.reasoning_row_ids.get(mid)
             if rid is None:
                 return
-            self._hub.author_upsert_row(
-                tid,
-                {
-                    "rowId": rid,
-                    "turnId": st.turn_id,
-                    "kind": "reasoning",
-                    "state": "complete",
-                    "text": st.reasoning_acc.get(mid, ""),
-                    "createdAt": now_ms,
-                    "createdAtSeq": self._seq_now(tid),
-                    "assistantResponseId": mid,
-                },
+            sess = self._hub.get_session(tid)
+            existing = (
+                sess.rows.get(int(rid))
+                if sess is not None and isinstance(sess.rows.get(int(rid)), dict)
+                else None
             )
+            created_at, started_at = self._preserve_tool_timestamps(existing, now_ms=now_ms)
+            duration_ms = self._reasoning_duration_ms(existing, now_ms=now_ms)
+            row_out: dict[str, Any] = {
+                "rowId": rid,
+                "turnId": str(st.turn_id or st.last_turn_id or "").strip(),
+                "kind": "reasoning",
+                "state": "complete",
+                "text": st.reasoning_acc.get(mid, ""),
+                "createdAt": created_at,
+                "createdAtSeq": self._seq_now(tid),
+                "assistantResponseId": mid,
+                "startedAt": started_at,
+                "endedAt": now_ms,
+            }
+            if duration_ms is not None:
+                row_out["durationMs"] = duration_ms
+            self._hub.author_upsert_row(tid, row_out)
             return
 
         if et == "TOOL_CALL_START":
@@ -1506,6 +2007,11 @@ class V4Mirror:
             name = str(ev.get("toolCallName") or ev.get("name") or "tool").strip() or "tool"
             if not tcid or tcid in st.tool_row_ids:
                 return
+            if not self._ensure_active_turn_for_stream(
+                tid, st, now_ms=now_ms, via="TOOL_CALL_START"
+            ):
+                return
+            self._clear_empty_run_notices(tid, st)
             rid = self._next_row_id(tid)
             st.tool_row_ids[tcid] = rid
             st.tool_acc[tcid] = ""
@@ -1530,7 +2036,7 @@ class V4Mirror:
         if et == "TOOL_CALL_ARGS":
             tcid = str(ev.get("toolCallId") or "").strip()
             delta = str(ev.get("delta") or "")
-            rid = st.tool_row_ids.get(tcid)
+            rid, _existing = self._resolve_tool_row_id(tid, st, tcid)
             if rid is None or not delta:
                 return
             st.tool_acc[tcid] = st.tool_acc.get(tcid, "") + delta
@@ -1539,31 +2045,42 @@ class V4Mirror:
 
         if et == "TOOL_CALL_END":
             tcid = str(ev.get("toolCallId") or "").strip()
-            rid = st.tool_row_ids.get(tcid)
+            rid, existing = self._resolve_tool_row_id(tid, st, tcid)
             if rid is None:
                 return
+            created_at, started_at = self._preserve_tool_timestamps(existing, now_ms=now_ms)
+            input_text = st.tool_acc.get(tcid, "") or (
+                str(existing.get("inputText") or "") if isinstance(existing, dict) else ""
+            )
             self._hub.author_upsert_row(
                 tid,
                 {
                     "rowId": rid,
-                    "turnId": st.turn_id,
+                    "turnId": st.turn_id
+                    or (str(existing.get("turnId") or "") if isinstance(existing, dict) else ""),
                     "kind": "toolCall",
                     "toolCallId": tcid,
                     "toolName": self._tool_name(st, tcid, ev),
                     "status": "running",
-                    "inputText": st.tool_acc.get(tcid, ""),
-                    "createdAt": now_ms,
+                    "inputText": input_text,
+                    "createdAt": created_at,
                     "createdAtSeq": self._seq_now(tid),
-                    "startedAt": now_ms,
+                    "startedAt": started_at,
                 },
             )
             return
 
         if et == "TOOL_CALL_RESULT":
             tcid = str(ev.get("toolCallId") or "").strip()
-            rid = st.tool_row_ids.get(tcid)
+            rid, existing = self._resolve_tool_row_id(tid, st, tcid)
             if rid is None:
+                # map 已清且会话里也没有该 toolCallId：无法挂载，丢弃。
                 return
+            # 轮已 seal 时把 product turn 拉回，避免 RESULT 写到空 turnId。
+            if not str(st.turn_id or "").strip():
+                self._ensure_active_turn_for_stream(
+                    tid, st, now_ms=now_ms, via="TOOL_CALL_RESULT"
+                )
             content = str(ev.get("content") or "")
             v4_status = _normalize_agui_tool_status(ev.get("status") or "success")
             # 内容信封里的 _evoflow_tool.status 优先（有时 wire status 仍是 ok）
@@ -1600,13 +2117,7 @@ class V4Mirror:
             # 视频生成等工具结果曾单条 10MB 进投影行，快照字节预算被压到 20 行
             # （「前面轮次/最新用户消息看不到」实锤），也是 WebView2 OOM 主因。
             # 全文不丢——工具卡展开走 /tool-results 按需拉取。
-            output_text = content
-            if len(output_text) > _TOOL_OUTPUT_ROW_PREVIEW_MAX:
-                output_text = (
-                    output_text[:_TOOL_OUTPUT_ROW_PREVIEW_MAX]
-                    + "\n…（已截断，完整内容点开工具卡查看）"
-                )
-            tool_output: dict[str, Any] = {"text": output_text}
+            tool_output: dict[str, Any] = {"text": _preview_tool_output_text(content)}
             # platform_ui（绑渠道二维码等）：与 cua_display 同级上浮，供 V4 PlatformToolCallBlock 出码。
             platform_ui_block: dict[str, Any] | None = None
             raw_platform_ui = ev.get("platform_ui")
@@ -1663,17 +2174,24 @@ class V4Mirror:
                             )
                             agg["additions"] += int(diff["additions"])
                             agg["deletions"] += int(diff["deletions"])
+            created_at, started_at = self._preserve_tool_timestamps(existing, now_ms=now_ms)
+            input_text = st.tool_acc.get(tcid, "") or (
+                str(existing.get("inputText") or "") if isinstance(existing, dict) else ""
+            )
+            turn_id = str(st.turn_id or "").strip() or (
+                str(existing.get("turnId") or "").strip() if isinstance(existing, dict) else ""
+            )
             result_row: dict[str, Any] = {
                 "rowId": rid,
-                "turnId": st.turn_id,
+                "turnId": turn_id,
                 "kind": "toolCall",
                 "toolCallId": tcid,
                 "toolName": tool_name,
                 "status": v4_status,
-                "inputText": st.tool_acc.get(tcid, ""),
-                "createdAt": now_ms,
+                "inputText": input_text,
+                "createdAt": created_at,
                 "createdAtSeq": self._seq_now(tid),
-                "startedAt": now_ms,
+                "startedAt": started_at,
                 "endedAt": now_ms,
                 "output": tool_output,
             }
@@ -1753,6 +2271,17 @@ class V4Mirror:
                     "files": len(st.turn_file_changes),
                 }
             turn_finished_at = now_ms
+            sess_for_origin = self._hub.get_session(tid)
+            existing_header = (
+                sess_for_origin.rows.get(int(st.turn_header_row_id))
+                if sess_for_origin is not None and st.turn_header_row_id
+                else None
+            )
+            header_origin = "userInput"
+            if isinstance(existing_header, dict):
+                prev_origin = str(existing_header.get("origin") or "").strip()
+                if prev_origin:
+                    header_origin = prev_origin
             self._hub.author_upsert_row(
                 tid,
                 {
@@ -1760,7 +2289,7 @@ class V4Mirror:
                     "turnId": st.turn_id,
                     "entityId": st.turn_id,
                     "kind": "turnHeader",
-                    "origin": "userInput",
+                    "origin": header_origin,
                     "state": v4_state,
                     "startedAt": st.turn_started_at_ms or now_ms,
                     "endedAt": turn_finished_at,
@@ -1770,6 +2299,9 @@ class V4Mirror:
                 },
             )
             produced_text = any(str(t or "").strip() for t in st.text_acc.values())
+            has_assistant_work = produced_text or self._turn_has_assistant_work(
+                tid, str(st.turn_id or "")
+            )
             if et == "RUN_ERROR":
                 if user_stopped:
                     # 停止 ≠ 报错：清 sticky / lastError，勿写「详情（可复制反馈）」气泡。
@@ -1782,7 +2314,7 @@ class V4Mirror:
                     st.sticky_run_error = dict(last_error)
                     # 无正文时把详情落到助手气泡，用户不必翻系统日志也能看见/复制。
                     detail = str(last_error.get("detail") or "").strip()
-                    if detail and not produced_text:
+                    if detail and not has_assistant_work:
                         banner = str(last_error.get("message") or "本轮生成失败").strip()
                         self._upsert_error_assistant_text(
                             tid,
@@ -1790,13 +2322,16 @@ class V4Mirror:
                             f"{banner}\n\n详情（可复制反馈）：\n{detail}",
                             now_ms=now_ms,
                         )
-            elif produced_text:
-                # 真正产出正文的成功收尾 → 清 sticky。
+            elif has_assistant_work:
+                # 真正产出正文/工具的成功收尾 → 清 sticky。
                 st.sticky_run_error = None
                 last_error = None
             else:
                 # 空流 FINISHED（常见于 auto-retry 夹缝）：保留上次 RUN_ERROR，横幅别丢。
                 last_error = dict(st.sticky_run_error) if st.sticky_run_error else None
+                # 有用户气泡却无任何助手产物：写可见占位，避免 !EMPTY_ASSISTANT 静默成功。
+                if et == "RUN_FINISHED" and not user_stopped:
+                    self._upsert_empty_run_notice(tid, st, now_ms=now_ms)
             from app.gateway.v4.conversation import _minimal_control
 
             if user_stopped:
@@ -1805,7 +2340,7 @@ class V4Mirror:
                 phase = "error"
             else:
                 phase = "completedSuccess"
-            if et == "RUN_FINISHED" and produced_text:
+            if et == "RUN_FINISHED" and has_assistant_work:
                 phase = "completedSuccess"
             ctrl = _minimal_control(phase)
             # sessionEnded 由 _minimal_control 按终态派生（成功/中断=True；
@@ -1830,7 +2365,7 @@ class V4Mirror:
             # 轮累计 usage 盖轮尾正文行：必须在 seal 之后（行已 complete，否则被整行替换清掉）。
             # failed / 用户停止轮不盖（V4 动作行只渲染 complete 正文，轮尾也不展示失败用量）。
             st.last_turn_success = et == "RUN_FINISHED"
-            if et == "RUN_FINISHED" and produced_text:
+            if et == "RUN_FINISHED" and has_assistant_work and produced_text:
                 self._stamp_turn_usage(tid, st)
             # 会话总计：成功轮的用量并入 sess.usage_state 并发 usage 增量（面板总计条）。
             if et == "RUN_FINISHED":

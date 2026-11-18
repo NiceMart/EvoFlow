@@ -30,6 +30,7 @@ import {
   PROJECTION_WINDOW_SOFT_CAP,
   capAndLightenProjectionWindow,
   countRealUserQueries,
+  ensureLiveTurnInProjectionWindow,
   resolveProjectionWindowSoftCap,
 } from "@/v4/projectionWindowCap.js";
 
@@ -301,7 +302,12 @@ function mergeOlderRows(
   const softCap = opts?.softCap ?? resolveProjectionWindowSoftCap();
   const prefer = opts?.prefer ?? "head";
   const capped = capAndLightenProjectionWindow(merged, { softCap, prefer });
-  return capped === merged ? merged : [...capped];
+  // prefer=head 会裁掉窗尾：直播中必须把当前轮钉回，否则尾仍是上轮正文（stale_prev_turn_tail）。
+  const next =
+    prefer === "head"
+      ? ensureLiveTurnInProjectionWindow(merged, capped, softCap)
+      : capped;
+  return next === merged ? merged : [...next];
 }
 
 /** snapshot / delta 应用后裁尾窗 + 瘦旧工具卡，避免多轮撑爆 WebView2。 */
@@ -363,6 +369,19 @@ uiMemoryDiagnosticsRegistry.register("projection", () => {
   }
   return { stores: liveProjectionStores.size, rows, windowBytes, maxRowBytes };
 });
+
+/** 高压时对所有存活投影 store 再裁一遍窗口（含 KeepAlive 隐藏 host）。 */
+export function shrinkAllLiveProjectionWindows(): number {
+  let n = 0;
+  for (const store of liveProjectionStores) {
+    try {
+      if (store.shrinkProjectionWindowForMemory()) n += 1;
+    } catch {
+      /* best-effort */
+    }
+  }
+  return n;
+}
 
 export class ConversationProjectionStore {
   private state: ConversationStoreState = INITIAL_STATE;
@@ -1303,11 +1322,10 @@ export class ConversationProjectionStore {
       // 在途期间游标失效（row.removed 截断 / snapshot resync 整体替换）→ 结果作废，
       // 防止把权威侧已移除的历史行复活；下次触发按新窗口重新拉。
       if (current.rows.window[0]?.rowId !== beforeRowId) return;
-      // 上滚意图：prefer head，滑动到更早历史。软顶放大到 1200（行内重载荷已在
-      // 服务端截断）：400 会在长回合/大会话里把流式尾部裁掉（行被裁后 rows/range
-      // 游标救不回来）——「正流着突然只剩一点点」的另一实锤。
+      // 上滚意图：prefer head。软顶走内存水位（默认 400）；直播轮尾由
+      // ensureLiveTurnInProjectionWindow 钉回，不再用 1200 地板把窗口撑爆。
       const window = mergeOlderRows(current.rows.window, result.rows, {
-        softCap: Math.max(resolveProjectionWindowSoftCap(), 1_200),
+        softCap: resolveProjectionWindowSoftCap(),
         prefer: "head",
       });
       if (window === null) return;
@@ -1335,8 +1353,7 @@ export class ConversationProjectionStore {
    * **批量拉取、一次性提交**（对齐 loadAllOlder 的纪律「等全部页成功后只换一次
    * snapshot」）：逐页 commit 会让 timeline 每页重建 render units + virtualizer
    * 并重新锚定——大会话打开时表现为「从上滚到下再滚一遍」（2026-11-16 用户实锤）。
-   * 合并软顶放大到 1200（行内重载荷已在服务端截断），prefer head 只保历史页——
-   * 页数上限 × 页大小 < 软顶，不会裁到流式尾部。
+   * 合并软顶走内存水位；prefer head 保历史页，直播轮尾另钉回（见 mergeOlderRows）。
    */
   async autoBackfillForRestore(maxPages: number = 8): Promise<void> {
     if (this.closed || this.state.loadingOlder) return;
@@ -1405,9 +1422,9 @@ export class ConversationProjectionStore {
       ) {
         return;
       }
-      // 一次性提交：单次重排 + 单次锚定
+      // 一次性提交：单次重排 + 单次锚定（软顶按水位；直播尾钉回在 mergeOlderRows）
       const merged = mergeOlderRows(current.rows.window, combined, {
-        softCap: Math.max(resolveProjectionWindowSoftCap(), 1_200),
+        softCap: resolveProjectionWindowSoftCap(),
         prefer: "head",
       });
       if (merged === null) return;
@@ -1786,6 +1803,20 @@ export class ConversationProjectionStore {
       if (bytes > maxRowBytes) maxRowBytes = bytes;
     }
     return { windowBytes, maxRowBytes };
+  }
+
+  /**
+   * 按当前内存水位强制再裁一次已常驻的 rows.window。
+   * 水位升到 high/critical 后，若只等下一帧 delta，旧窗口会一直占着几百行到 OOM。
+   */
+  shrinkProjectionWindowForMemory(): boolean {
+    if (this.closed) return false;
+    const snap = this.state.snapshot;
+    if (!snap?.rows?.window?.length) return false;
+    const next = applySoftCapToSnapshot(snap, "tail");
+    if (next === snap) return false;
+    this.setState({ snapshot: next });
+    return true;
   }
 
   /** 退订并终结本 store（仅 SessionDataLayer 调用）。 */

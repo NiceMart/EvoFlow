@@ -5,6 +5,7 @@ import {
   capAndLightenProjectionWindow,
   capProjectionWindow,
   countRealUserQueries,
+  ensureLiveTurnInProjectionWindow,
   lightenProjectionRowsForMemory,
 } from '../src/zcode-ui/v4/projectionWindowCap.ts'
 import type { ConversationRow } from '../src/zcode-shared/zcode-protocol-v4/index.ts'
@@ -125,24 +126,65 @@ describe('countRealUserQueries', () => {
 })
 
 describe('lightenProjectionRowsForMemory', () => {
-  it('trims old tool payloads outside heavy horizon, keeps display', () => {
+  it('trims old tool payloads outside heavy horizon; stripDisplay drops display', () => {
     const rows: ConversationRow[] = []
     for (let i = 1; i <= 100; i += 1) {
       rows.push(i <= 40 ? heavyTool(i) : row(i))
     }
-    const light = lightenProjectionRowsForMemory(rows, 60)
-    const early = light[0] as { output?: { text?: string; display?: unknown } }
-    const late = light[90] as { kind?: string }
+    const keepDisplay = lightenProjectionRowsForMemory(rows, 60)
+    const earlyKeep = keepDisplay[0] as {
+      output?: { text?: string; display?: unknown }
+    }
+    expect(earlyKeep.output?.text?.includes('[trimmed for memory]')).toBe(true)
+    expect(earlyKeep.output?.display).toEqual({ kind: 'platform', title: 'heavy-1' })
+
+    const stripped = lightenProjectionRowsForMemory(rows, 60, { stripDisplay: true })
+    const early = stripped[0] as { output?: { text?: string; display?: unknown } }
+    const late = stripped[90] as { kind?: string }
     expect(early.output?.text?.includes('[trimmed for memory]')).toBe(true)
-    // display（截图/文件 diff/媒体卡）是历史的一部分，必须保留
-    expect(early.output?.display).toEqual({ kind: 'platform', title: 'heavy-1' })
+    expect(early.output?.display).toBeUndefined()
     expect(late.kind).toBe('assistantMessage')
-    expect(light).not.toBe(rows)
+    expect(stripped).not.toBe(rows)
   })
 
   it('returns same reference when nothing to lighten', () => {
     const rows = [row(1), row(2), heavyTool(3)]
     expect(lightenProjectionRowsForMemory(rows, 60)).toBe(rows)
+  })
+})
+
+describe('ensureLiveTurnInProjectionWindow', () => {
+  it('re-pins live turn when prefer=head capped it away', () => {
+    const rows: ConversationRow[] = []
+    for (let i = 1; i <= 200; i += 1) {
+      if (i % 50 === 1) rows.push(row(i, 'turnHeader'))
+      else if (i % 50 === 2) rows.push(row(i, 'userInput', 'realUser'))
+      else rows.push(row(i, 'toolCall'))
+    }
+    // 新一轮贴在末尾
+    rows.push(row(201, 'turnHeader'))
+    rows.push(row(202, 'userInput', 'realUser'))
+    rows.push({
+      rowId: 203,
+      turnId: 't-live',
+      kind: 'assistantText',
+      text: '新轮正文',
+      state: 'streaming',
+    } as ConversationRow)
+    for (const r of rows.slice(-3)) {
+      ;(r as { turnId: string }).turnId = 't-live'
+    }
+    const headCapped = capProjectionWindow(rows, 80, 'head')
+    expect(headCapped.some((r) => r.rowId === 203)).toBe(false)
+    const pinned = ensureLiveTurnInProjectionWindow(rows, headCapped, 80)
+    expect(pinned[pinned.length - 1]?.rowId).toBe(203)
+    expect(pinned.some((r) => r.kind === 'userInput' && r.rowId === 202)).toBe(true)
+    expect(pinned.length).toBeLessThanOrEqual(80)
+  })
+
+  it('no-ops when live turn already in capped window', () => {
+    const rows = [row(1, 'turnHeader'), row(2, 'userInput', 'realUser'), row(3)]
+    expect(ensureLiveTurnInProjectionWindow(rows, rows, 40)).toBe(rows)
   })
 })
 

@@ -209,6 +209,27 @@ const executeToolStrategy: ToolDisplayStrategy = {
   },
 };
 
+const searchCodeIndexToolStrategy: ToolDisplayStrategy = {
+  matches(context) {
+    // 专属卡自己画展开区；这里关掉 Parameters/Result 复古分区，避免兜底再摊一遍。
+    const name = String(
+      context.toolCall.toolName || context.identity.toolName || "",
+    )
+      .trim()
+      .toLowerCase();
+    return name === "search_code_index";
+  },
+  build() {
+    return {
+      inlinePreview: { type: "none" },
+      showSummaryFileLink: false,
+      showInput: false,
+      showOutput: false,
+      showKind: false,
+    };
+  },
+};
+
 const searchToolStrategy: ToolDisplayStrategy = {
   matches(context) {
     return context.identity.family === "search";
@@ -284,6 +305,8 @@ const TOOL_DISPLAY_STRATEGIES: ToolDisplayStrategy[] = [
   readToolStrategy,
   writeToolStrategy,
   executeToolStrategy,
+  // 必须在 searchToolStrategy 之前：否则 family=search 会抢先关掉 Parameters。
+  searchCodeIndexToolStrategy,
   searchToolStrategy,
   goalToolStrategy,
   nodeReplToolStrategy,

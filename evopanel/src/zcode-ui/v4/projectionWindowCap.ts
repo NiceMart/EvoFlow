@@ -17,17 +17,19 @@
  */
 import type { ConversationRow } from "@zcode/shared/zcode-protocol-v4";
 import {
+  heavyHorizonForMemoryLevel,
   projectionSoftCapForMemoryLevel,
   resolveRendererMemoryLevel,
+  type RendererMemoryLevel,
 } from "../../react/lib/renderer-memory-pressure.js";
 
 /** 正常水位下的渲染层窗口软顶（行）。高压时见 {@link resolveProjectionWindowSoftCap}。 */
-export const PROJECTION_WINDOW_SOFT_CAP = 400;
+export const PROJECTION_WINDOW_SOFT_CAP = 220;
 
 /** 分享全量导出允许更大窗口，避免截断分享目录。 */
 export const PROJECTION_WINDOW_SHARE_CAP = 8_000;
 
-/** 窗口内只对最近 N 行保留完整 tool output 文本；更早的工具卡文本瘦身。 */
+/** 窗口内只对最近 N 行保留完整 tool output；更早的工具卡瘦身。 */
 export const PROJECTION_HEAVY_HORIZON = 60;
 
 const MIN_KEEP = 40;
@@ -41,6 +43,69 @@ function isTurnBoundary(row: ConversationRow | undefined): boolean {
 /** 按当前 renderer 内存水位取软顶（读不到 heap 时用默认 400）。 */
 export function resolveProjectionWindowSoftCap(): number {
   return projectionSoftCapForMemoryLevel(resolveRendererMemoryLevel());
+}
+
+function isRealUserRow(row: ConversationRow | undefined): boolean {
+  return !!row && row.kind === "userInput" && row.origin === "realUser";
+}
+
+/**
+ * 最新非空 realUser 的 (turnStart, userIdx)。turnStart 含紧前 turnHeader。
+ * 用于 prefer=head 裁切后把直播轮尾钉回窗口，避免 stale_prev_turn_tail。
+ */
+export function liveTurnSpan(
+  rows: readonly ConversationRow[],
+): { turnStart: number; userIdx: number } | null {
+  if (!Array.isArray(rows) || rows.length === 0) return null;
+  let userIdx = -1;
+  for (let i = rows.length - 1; i >= 0; i -= 1) {
+    const row = rows[i];
+    if (!isRealUserRow(row)) continue;
+    if (!String((row as { text?: string }).text || "").trim()) continue;
+    userIdx = i;
+    break;
+  }
+  if (userIdx < 0) return null;
+  let turnStart = userIdx;
+  if (userIdx > 0 && rows[userIdx - 1]?.kind === "turnHeader") {
+    turnStart = userIdx - 1;
+  }
+  return { turnStart, userIdx };
+}
+
+/**
+ * prefer=head 裁掉直播轮尾时：在 softCap 内把头窗与直播轮拼回。
+ * 不是按埋深「只留当前轮」重建——有预算就尽量保留 capped 里更早的行。
+ */
+export function ensureLiveTurnInProjectionWindow(
+  full: readonly ConversationRow[],
+  capped: readonly ConversationRow[],
+  softCap: number,
+): readonly ConversationRow[] {
+  const span = liveTurnSpan(full);
+  if (!span) return capped;
+  const live = full.slice(span.turnStart);
+  if (live.length === 0) return capped;
+  const present = new Set(capped.map((r) => r.rowId));
+  if (live.every((r) => present.has(r.rowId))) return capped;
+
+  const cap = Math.max(MIN_KEEP, Math.floor(softCap));
+  if (live.length >= cap) {
+    const head = full.slice(span.turnStart, span.userIdx + 1);
+    const after = full.slice(span.userIdx + 1);
+    const tailBudget = Math.max(0, cap - head.length);
+    const tail = tailBudget > 0 ? after.slice(-tailBudget) : [];
+    return [...head, ...tail];
+  }
+  const olderBudget = cap - live.length;
+  const older = capped.filter((r) => r.rowId < (live[0]?.rowId ?? 0));
+  let olderKeep =
+    older.length > olderBudget ? older.slice(older.length - olderBudget) : older;
+  if (olderKeep.length > 0 && olderKeep[0]?.kind !== "turnHeader") {
+    const idx = olderKeep.findIndex((r) => r.kind === "turnHeader");
+    if (idx > 0) olderKeep = olderKeep.slice(idx);
+  }
+  return [...olderKeep, ...live];
 }
 
 /**
@@ -87,40 +152,51 @@ export function countRealUserQueries(rows: readonly ConversationRow[]): number {
   return n;
 }
 
-function lightenToolCallRow(row: ConversationRow): ConversationRow {
+function lightenToolCallRow(
+  row: ConversationRow,
+  opts?: { stripDisplay?: boolean },
+): ConversationRow {
   if (row.kind !== "toolCall") return row;
   const output = row.output;
   if (!output || typeof output !== "object") return row;
   const text = typeof (output as { text?: unknown }).text === "string"
     ? (output as { text: string }).text
     : "";
-  if (text.length <= LIGHT_TOOL_TEXT_CAP) return row;
-  // 只截断长 text；display（截图/文件 diff/媒体卡）是历史的一部分，必须保留。
+  const hasDisplay = (output as { display?: unknown }).display != null;
+  const needsTextTrim = text.length > LIGHT_TOOL_TEXT_CAP;
+  const needsDisplayDrop = opts?.stripDisplay === true && hasDisplay;
+  if (!needsTextTrim && !needsDisplayDrop) return row;
   return {
     ...row,
     output: {
       ...output,
-      text: `${text.slice(0, LIGHT_TOOL_TEXT_CAP)}\n…[trimmed for memory]`,
+      text: needsTextTrim
+        ? `${text.slice(0, LIGHT_TOOL_TEXT_CAP)}\n…[trimmed for memory]`
+        : text,
+      ...(needsDisplayDrop ? { display: undefined } : {}),
     },
   } as ConversationRow;
 }
 
 /**
- * 保留窗口尾部 heavyHorizon 行的完整工具载荷；更早的 toolCall 丢掉 display、截断 text。
- * 多轮长跑时工具卡 JSON 是 renderer OOM 主因之一，不等于丢掉对话历史（行还在）。
+ * 保留窗口尾部 heavyHorizon 行的完整工具载荷；更早的 toolCall 截断 text。
+ * high/critical 水位还会丢掉旧卡 display（截图/媒体卡是堆膨胀主因之一）。
+ * 行本身还在，不等于丢掉对话历史；上滚可再 hydrate。
  */
 export function lightenProjectionRowsForMemory(
   rows: readonly ConversationRow[],
   heavyHorizon: number = PROJECTION_HEAVY_HORIZON,
+  opts?: { stripDisplay?: boolean },
 ): readonly ConversationRow[] {
   if (!Array.isArray(rows) || rows.length === 0) return rows;
   const horizon = Math.max(10, Math.floor(heavyHorizon));
   if (rows.length <= horizon) return rows;
   const start = rows.length - horizon;
+  const stripDisplay = opts?.stripDisplay === true;
   let changed = false;
   const next = rows.map((row, i) => {
     if (i >= start) return row;
-    const light = lightenToolCallRow(row);
+    const light = lightenToolCallRow(row, { stripDisplay });
     if (light !== row) changed = true;
     return light;
   });
@@ -134,10 +210,16 @@ export function capAndLightenProjectionWindow(
     softCap?: number;
     prefer?: "tail" | "head";
     heavyHorizon?: number;
+    memoryLevel?: RendererMemoryLevel;
   },
 ): readonly ConversationRow[] {
-  const softCap = opts?.softCap ?? resolveProjectionWindowSoftCap();
+  const level = opts?.memoryLevel ?? resolveRendererMemoryLevel();
+  const softCap = opts?.softCap ?? projectionSoftCapForMemoryLevel(level);
   const prefer = opts?.prefer ?? "tail";
+  const heavyHorizon =
+    opts?.heavyHorizon ?? heavyHorizonForMemoryLevel(level);
   const capped = capProjectionWindow(rows, softCap, prefer);
-  return lightenProjectionRowsForMemory(capped, opts?.heavyHorizon ?? PROJECTION_HEAVY_HORIZON);
+  return lightenProjectionRowsForMemory(capped, heavyHorizon, {
+    stripDisplay: level !== "normal",
+  });
 }
