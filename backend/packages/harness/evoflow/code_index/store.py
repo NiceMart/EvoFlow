@@ -53,6 +53,82 @@ from evoflow.utils.workspace_browse import resolve_under_workspace
 
 logger = logging.getLogger(__name__)
 
+# 【self-evolution-bot · 2026-11-18 · 第50轮 · 模型:deepseek-v4.1-flash-1017】
+# 嵌入冷启闸门。为什么需要：Windows 上网关**默认跳过**嵌入暖机
+# （background_startup: `win32 default (set EVOFLOW_EMBEDDING_WARMUP=1 to enable)`），
+# 于是 torch / sentence_transformers 的冷导入与权重加载全部落在**第一次检索**的调用栈里。
+# 本机实测：`import local_provider` 3030ms + 首次 `embed_sync` 1669ms，之后每次 3~4ms；
+# 叠加 torch 惰性子模块的首次 encode 初始化，首次检索 9~13s，网关并发时撞满
+# `_MAX_WALL_SECONDS=45` 直接超时（2026-11-18 17:50 现网复现 45021ms error）。
+# 修法：门未开时**不 import、不加载**，本次直接返回纯词法结果（几百 ms），
+# 后台单飞线程暖机；暖成功后自动开门，下一次检索就用上语义召回。
+# 为什么不改成「启动就暖」：那是平台侧行为（改所有 agent 重启后的 GIL 占用），
+# 且 win32 跳过暖机是修另一事故留下的决定，不在本岗单方面推翻。
+_embed_gate_lock = threading.Lock()
+_embed_gate_open = False        # False=本进程尚未确认嵌入可用，走纯词法
+_embed_warm_last_try = 0.0      # 上次暖机尝试的时间戳（0=从未）
+_EMBED_WARM_RETRY_S = 300.0     # 暖机失败后的重试冷却，避免每次检索都起线程重试
+# 【self-evolution-bot · 2026-11-18 · 第51轮 · 模型:deepseek-v4.1-flash-1017】
+# 本次调用「语义为何没参与」的旁路记录。用 thread-local：检索是同步调用、
+# 同线程内 start→collect 成对；且不必给 _embed_query_sync 加参数（那会破坏
+# 既有 monkeypatch 契约，实测 3 个测试当场红）。
+_DEGRADE_STATE = threading.local()
+
+
+def _embed_ready_without_import() -> bool:
+    """不 import 嵌入栈，只看模型是否**已经**在本进程里加载好。
+
+    为什么这么绕：判定「能不能语义检索」最便宜的办法是查 `_model_cache`，
+    但拿到它得先 import local_provider = 3030ms（实测），等于为了省一次冷启
+    再付一次冷启。模块已在 sys.modules 时直接查，已加载就开门。
+    """
+    mod = sys.modules.get("evoflow.knowledge.embedding.local_provider")
+    if mod is None:
+        return False
+    return bool(getattr(mod, "_model_cache", None))
+
+
+def _start_embed_warmup() -> None:
+    """后台单飞暖机：只起一个线程，失败只在冷却后重试，绝不阻塞检索。"""
+    global _embed_warm_last_try
+    now = time.time()
+    with _embed_gate_lock:
+        if _embed_warm_last_try and now - _embed_warm_last_try < _EMBED_WARM_RETRY_S:
+            return
+        _embed_warm_last_try = now
+
+    def _run() -> None:
+        global _embed_gate_open
+        try:
+            from evoflow.knowledge.embedding.local_provider import (
+                LocalEmbeddingProvider,
+                warmup_local_model,
+            )
+            from evoflow.knowledge.embedding.registry import (
+                _resolve_provider,
+                get_embedding_config,
+            )
+
+            provider = _resolve_provider(get_embedding_config())
+            if not isinstance(provider, LocalEmbeddingProvider):
+                return  # 远端 provider：不在这里暖，保持原行为
+            warmup_local_model(provider.model_name)
+            _embed_gate_open = True
+        except Exception as exc:  # noqa: BLE001 - 暖机失败只降召回质量，不该打断检索
+            logger.warning(
+                "code_index: 嵌入暖机失败，检索暂时退回纯词法：%s: %s",
+                type(exc).__name__,
+                exc,
+            )
+
+    threading.Thread(
+        target=_run,
+        name="evoflow-code-index-embed-warmup",
+        daemon=True,
+    ).start()
+
+
+
 T = TypeVar("T")
 
 # Porter stemmer hurts code identifiers (CredentialPool, assistant_chunk). unicode61 keeps them.
@@ -323,7 +399,50 @@ def source_drift(root: str, *, since_ts: float | None = None) -> dict:
     }
 
 
-def _source_drift_cached(root: str, db_mtime: float) -> dict | None:
+def _spawn_drift_refresh(root: str, key: str, db_mtime: float) -> None:
+    """后台重算漂移结论，**绝不占检索线程**。
+
+    【self-evolution-bot · 2026-11-19 · 第62轮 · 模型:deepseek-v4.1-flash-1017】
+    同一 root 同时只跑一个刷新；用函数自身属性做 inflight 集合，不新增模块级状态
+    （模块级状态要额外的重置路径，本仓已因此踩过坑）。
+
+    失败一律吞掉：漂移是尽力而为的旁路信息，后台刷新挂了就继续用旧值，
+    绝不能因为「算漂移」把检索搞挂。
+    """
+    lock = getattr(_source_drift_cached, "_lock", None)
+    if lock is None:
+        lock = threading.Lock()
+        _source_drift_cached._lock = lock
+    inflight = getattr(_source_drift_cached, "_inflight", None)
+    if inflight is None:
+        inflight = set()
+        _source_drift_cached._inflight = inflight
+    with lock:
+        if root in inflight:
+            return
+        inflight.add(root)
+
+    def _run() -> None:
+        try:
+            drift = source_drift(root, since_ts=db_mtime)
+            _DRIFT_CACHE[key] = (time.time(), drift)
+            if len(_DRIFT_CACHE) > 8:
+                oldest = min(_DRIFT_CACHE, key=lambda k: _DRIFT_CACHE[k][0])
+                _DRIFT_CACHE.pop(oldest, None)
+        except Exception:  # noqa: BLE001 - 后台刷新失败就沿用旧值
+            pass
+        finally:
+            with lock:
+                inflight.discard(root)
+
+    threading.Thread(
+        target=_run, name="code-index-drift-refresh", daemon=True
+    ).start()
+
+
+def _source_drift_cached(
+    root: str, db_mtime: float, *, allow_stale: bool = True
+) -> dict | None:
     """`source_drift` 的进程内缓存（默认 30s），避免每次检索白花 ~230ms。
 
     缓存键含库 mtime：一旦有增量写库（`index_file`）mtime 变化即自动失效，
@@ -337,12 +456,50 @@ def _source_drift_cached(root: str, db_mtime: float) -> dict | None:
     构建期它占检索总耗时的 10%+，而这份漂移信息这 30 秒内根本没变。
     粗化到 60s 桶：真正的增量写库最多晚 60s 才让缓存失效（TTL 30s 本来也在这量级），
     构建期间则稳定命中，省掉每次 290~500ms。
+
+    【self-evolution-bot · 2026-11-19 · 第62轮 · 模型:deepseek-v4.1-flash-1017】
+    改了什么：缓存未命中时**不再同步 walk 全树**，改为「先返回本 root 上一次的结论
+    （哪怕是旧桶），同时起一个后台线程重算」。`allow_stale=False` 才同步算。
+
+    为什么：缓存 TTL 30s、桶 60s，意味着**每 30~60 秒必有一次检索要付全树 stat**。
+    本机实测（7894 个可索引文件）：
+      · `_iter_source_files` 单次 398ms，其中 17558 次 `nt.stat`
+      · 冷缓存 `index_freshness` 322ms，更早一次量到 2251ms（磁盘冷）
+      · 热缓存 0ms
+    而现网 `search_code_index` 的 P50 是 **6.5s**、P90 13.9s（近 1 天 77 次），
+    用户体感就是「搜个代码要转六秒」。把 0.3~2.2s 的同步 walk 挪出主路，
+    直接砍掉这一段。
+
+    代价（必须明写，不能只说好处）：漂移信息最多晚一次刷新才更新，即
+    「刚改的文件，页脚要下一次检索才提示未索引」。这本来只影响**提示文字**，
+    不影响命中结果——真正的增量入库走 `notify_file_changed` / hooks 那条通道，
+    与漂移检测互不相干；而且第 46 轮已把补录投到后台池，本来就不会当次完成。
+    所以这里牺牲的只是「提示的即时性」，换来的是确定可省的同步阻塞。
+
+    为什么用**函数属性**存 inflight 集合而不是模块级变量：模块级状态要额外的
+    重置路径（测试里已多次因为「模块级缓存没清」造成跨用例污染），
+    函数属性跟着函数走，`delattr` 即可复位。
     """
     key = f"{root}\u0000{int(db_mtime // 60)}"
     now = time.time()
     hit = _DRIFT_CACHE.get(key)
     if hit is not None and now - hit[0] < _DRIFT_CACHE_TTL_SECONDS:
         return hit[1]
+
+    if allow_stale:
+        # 本 root 任意桶的旧结论都可用：漂移是「旁路提示」，旧值远好过阻塞。
+        prefix = f"{root}\u0000"
+        prev = None
+        for k, v in _DRIFT_CACHE.items():
+            if k.startswith(prefix) and (prev is None or v[0] > prev[0]):
+                prev = v
+        if prev is not None:
+            _spawn_drift_refresh(root, key, db_mtime)
+            return prev[1]
+        # 本 root 一次都没算过（进程刚起）：同步算这一次，否则首次检索会
+        # 丢掉全部漂移提示，等于用「信息静默消失」换速度——那是另一种降级。
+        # 之后每次过期都走「旧值 + 后台刷新」，不再阻塞检索。先算出结果再往下走。
+
     try:
         drift = source_drift(root, since_ts=db_mtime)
     except Exception:  # noqa: BLE001 - 漂移检测是尽力而为，绝不能拖垮检索
@@ -463,11 +620,28 @@ def _configure_sqlite_connection(conn: sqlite3.Connection) -> None:
     #   search_index 整体   无 mmap 427ms → mmap 353ms（-21%，4 组交替取中位）
     #   vec0 KNN 单段       embed 6.4ms 不变，KNN 374ms → 66ms（-82%）
     # 语义召回那段几乎全是它，所以不映射就每次白等 0.3s。
-    # 1GB 上限：库当前 999MB 刚好整库可映射；超了也不会报错，只是退化成部分映射。
-    # 与 persistence/db.py 的同名 pragma 保持一致的写法（那边 256MB，因主库更小），
+    # 与 persistence/db.py 的同名 pragma 写法一致（那边 256MB，因主库更小），
     # 失败一律吞掉——映射是纯优化，绝不能让它挡住检索。
+    #
+    # 【self-evolution-bot · 2026-11-18 · 第57轮 · 模型:deepseek-v4.1-flash-1017】
+    # 改了什么：上限从写死 1GiB 改成「按库实际大小取整 + 512MiB 余量」。
+    # 为什么：写死 1GiB 的前提是「库当前 999MB 刚好整库可映射」，而这条前提早在
+    # 库长到 1.72GB 时就失效了——**超上限不报错，只是静默退化成部分映射**，
+    # 于是向量段有 42% 读不到映射，没人会发现。
+    # 同一进程同一份向量、同一台机，只改 mmap 大小的 A/B（k=75）：
+    #   1GiB(现状) 300ms / 2GiB 91ms / 3GiB 89ms / 关掉 646ms
+    # → 现状比整库可映射慢 3.3 倍，且这不是某次调用，是**每次检索都付**。
+    _target = 1073741824
     try:
-        conn.execute("PRAGMA mmap_size=1073741824")
+        _page = int(conn.execute("PRAGMA page_size").fetchone()[0] or 4096)
+        _pages = int(conn.execute("PRAGMA page_count").fetchone()[0] or 0)
+        _db_bytes = _page * _pages
+        if _db_bytes > 0:
+            _target = max(_target, _db_bytes + (512 << 20))
+    except Exception:  # noqa: BLE001 - 纯优化，任何失败都退回固定值
+        pass
+    try:
+        conn.execute(f"PRAGMA mmap_size={int(_target)}")
     except Exception:  # noqa: BLE001 - 纯优化，任何失败都退回普通读
         pass
     _load_sqlite_vec_extension(conn)
@@ -1688,6 +1862,38 @@ def _embed_texts_with_bisect(pairs: list[tuple[str, str]]) -> list[list[float]]:
     return _embed_texts_with_bisect(pairs[:mid]) + _embed_texts_with_bisect(pairs[mid:])
 
 
+def _mark_degraded(diag: dict | None, code: str, detail: str) -> None:
+    """把「本次检索只有词法」这件事记到调用方能看见的地方。
+
+    【self-evolution-bot · 2026-11-18 · 第51轮 · 模型:deepseek-v4.1-flash-1017】
+    只在 logger 里说等于没说：语义召回掉线时字面匹配照样能给出结果，
+    返回值看上去完全正常 —— 用户/调用方没有任何线索。
+    code 是稳定标识（便于断言与去重），detail 是给人看的一句话。
+
+    为什么是线程本地而不是加 `diag` 关键字参数：`_embed_query_sync` 的签名
+    被多处测试/调用方 monkeypatch 成单参函数，加 kwarg 会让它们全部 TypeError
+    （本轮实测 3 个测试直接红）。降级原因本来就是「本次调用的旁路信息」，
+    放 thread-local 不用改任何既有签名。
+    """
+    if diag is not None:
+        diag["semantic_degraded"] = code
+        diag["semantic_degraded_detail"] = detail
+    _DEGRADE_STATE.code = code
+    _DEGRADE_STATE.detail = detail
+
+
+def _reset_degraded() -> None:
+    _DEGRADE_STATE.code = ""
+    _DEGRADE_STATE.detail = ""
+
+
+def _collect_degraded() -> dict:
+    return {
+        "semantic_degraded": getattr(_DEGRADE_STATE, "code", "") or "",
+        "semantic_degraded_detail": getattr(_DEGRADE_STATE, "detail", "") or "",
+    }
+
+
 def _embed_query_sync(text: str) -> list[float] | None:
     """Synchronous query embedding — bypasses ``asyncio.to_thread``.
 
@@ -1695,7 +1901,31 @@ def _embed_query_sync(text: str) -> list[float] | None:
     that path used to ``Thread.join`` for tens of seconds (429 retries) and
     froze the whole UI. Local providers stay sync; remote embeds from a
     running loop are skipped (callers fall back to FTS / overlap).
+
+    【self-evolution-bot · 2026-11-18 · 第51轮 · 模型:deepseek-v4.1-flash-1017】
+    返回 None 的**原因**写进 thread-local（见 :func:`_mark_degraded`），
+    由 :func:`_collect_degraded` 取走并随检索结果返回。为什么：这条路径此前只在 `logger.warning` 里说话，而语义召回静默掉线时
+    字面匹配能撑住结果，**工具返回值看起来完全正常**——我是在翻日志时才撞见的。
+    调用方（也是用户）必须能从返回值里看出「这次只有词法」。
     """
+    # 【self-evolution-bot · 2026-11-18 · 第50轮 · 模型:deepseek-v4.1-flash-1017】
+    # 门未开 = 本进程还没把嵌入栈/权重拉起来。此时**不要**在这里同步 import + load：
+    # 那是 4.7s 起的冷导入（实测 import local_provider 3030ms + 首次 embed 1669ms），
+    # 会把调用方线程按在池里、顶着 45s 天花板超时。先给词法结果，后台暖机。
+    global _embed_gate_open
+    if not _embed_gate_open:
+        if _embed_ready_without_import():
+            # 本进程之前已把模型加载好（比如建库路径暖过），不必降级。
+            _embed_gate_open = True
+        else:
+            _start_embed_warmup()
+            _mark_degraded(
+                None,
+                "warming_up",
+                "embedding model is warming up in the background"
+                " (first search after start uses lexical matching only)",
+            )
+            return None
     try:
         try:
             asyncio.get_running_loop()
@@ -1720,6 +1950,12 @@ def _embed_query_sync(text: str) -> list[float] | None:
             logger.debug(
                 "code_index: skip sync remote embed while event loop is running"
             )
+            _mark_degraded(
+                None,
+                "remote_blocked_on_loop",
+                "remote embedding provider is skipped inside a running event loop"
+                " (sync path cannot block); lexical matching only",
+            )
             return None
         return _run_async_in_thread(lambda: _embed_query(text), timeout=8.0)
     except Exception as exc:
@@ -1727,6 +1963,11 @@ def _embed_query_sync(text: str) -> list[float] | None:
             "code_index: sync query embedding failed: %s: %s",
             type(exc).__name__,
             exc,
+        )
+        _mark_degraded(
+            None,
+            "embed_error",
+            f"query embedding failed ({type(exc).__name__}: {exc}); lexical matching only",
         )
         return None
 
@@ -1942,7 +2183,10 @@ def _semantic_recall_sync(
     """Embed query and recall top-k files by vector similarity.
 
     Returns list of ``{path, score, distance, kind: 'semantic'}``.
-    Returns empty list if embedding or vec0 is unavailable.
+    Returns empty list if embedding or vec0 is unavailable — and in that case
+    records the reason via :func:`_mark_degraded` so callers can surface
+    "lexical only" instead of silently pretending the hybrid path ran;
+    read it back with :func:`_collect_degraded`.
     """
     if not cfg.semantic_search_enabled:
         return []
@@ -1952,9 +2196,23 @@ def _semantic_recall_sync(
         query_vec = _embed_query_sync(query_text)
     except Exception as exc:
         logger.warning("code_index: query embedding failed: %s: %s", type(exc).__name__, exc)
+        _mark_degraded(
+            None,
+            "embed_error",
+            f"query embedding failed ({type(exc).__name__}: {exc}); lexical matching only",
+        )
         return []
 
     if not query_vec:
+        # 具体原因已由 _embed_query_sync 写进 thread-local；**不能无条件覆盖**——
+        # 之前这里硬写 no_vector，把更准确的 warming_up 盖掉了（实测：冷启动首查
+        # 明明在暖机，输出却说「返回空向量」，等于把用户往错误方向引）。
+        if not getattr(_DEGRADE_STATE, "code", ""):
+            _mark_degraded(
+                None,
+                "no_vector",
+                "query embedding returned no vector; lexical matching only",
+            )
         return []
 
     # 【self-evolution-bot · 2026-11-16 · 第24轮】召回侧同样以表里声明的维度为准，
@@ -1965,6 +2223,12 @@ def _semantic_recall_sync(
             "code_index: 查询向量维度 %d 与 code_vec 声明维度 %d 不一致，语义召回跳过（需重建索引）",
             len(query_vec),
             table_dim,
+        )
+        _mark_degraded(
+            None,
+            "dim_mismatch",
+            f"query vector is {len(query_vec)}-dim but the index stores {table_dim}-dim;"
+            " semantic recall skipped until the index is rebuilt",
         )
         return []
 
@@ -1980,7 +2244,14 @@ def _semantic_recall_sync(
             "ORDER BY distance",
             (blob, max(top_k, top_k * _SEMANTIC_CHUNK_FANOUT)),
         ).fetchall()
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as exc:
+        # vec0 模块缺失 / 表不存在 —— 这是「语义本来就不是这台机器能提供的」，
+        # 不是临时故障，但调用方仍要知道结果只有词法。
+        _mark_degraded(
+            None,
+            "vec_unavailable",
+            f"vector table unusable ({exc}); lexical matching only",
+        )
         return []
 
     # 按文件聚合：同一文件多个块命中时只保留最相似的那块（距离最小）。
@@ -2031,6 +2302,47 @@ def _mark_reindex_if_tokenizer_changed(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _delete_file_vectors(conn: sqlite3.Connection, rel: str) -> int:
+    """按主键删掉某文件的所有向量块，**不做全表扫**。
+
+    【self-evolution-bot · 2026-11-18 · 第51轮 · 模型:deepseek-v4.1-flash-1017】
+    改了什么：从「`DELETE FROM code_vec WHERE path = ?`（辅助列过滤）」
+    改成「先按 id 前缀从 code_vec_rowids 查出 chunk_id，再按主键逐个删」。
+
+    为什么：`code_vec` 是 vec0 虚表，声明成
+    `vec0(chunk_id TEXT PRIMARY KEY, path TEXT, embedding FLOAT[512])` ——
+    `path` 只是**辅助列**，vec0 不为它建索引。于是按 path 删要扫全表。
+    本机实测（119136 行、库 1.84GB）：
+      A 按 path 删           311.4ms  删 12 行   ← 现状，O(全表)
+      B 前缀查 id（走索引）    0.0ms   拿到 12 个
+      C 按 chunk_id 主键删     0.4ms   删 12 行   ← 改后，O(本文件块数)
+      D LIKE 前缀查          129.0ms  拿到 12 个  ← 会走全扫，故不用 LIKE
+    快约 780 倍，且代价与「库里有多少其它文件」无关。
+
+    这段为什么值得修（不只是数字好看）：单文件增量 `index_file` 的删除段
+    原本要 311ms/文件，漂移自愈一轮 24 个文件就是 7.5 秒的写事务；
+    WAL checkpoint 与写锁持有时长同步放大，用户这时搜索就被挡在门外
+    （2026-11-18 20:48 现网实测：重建窗口内一次检索 10245ms）。
+
+    为什么用 `>=` / `<` 半开区间而不是 `LIKE 'rel||::%'`：
+    `id` 上有 UNIQUE 索引，半开区间是纯 B-tree seek（0.0ms）；
+    LIKE 前缀在 sqlite 里无法保证走索引（实测 129ms，等于没优化）。
+    区间上界用 `rel + ":;"`：`;` 是 `:` 的下一个字符，能覆盖所有
+    `rel::序号` 而不会误伤 `rel2::` 这类前缀相同的邻居文件。
+    """
+    lo = f"{rel}::"
+    hi = f"{rel}:;"  # ';' 紧接 ':'，闭开区间覆盖 rel::* 且不碰 rel2::
+    ids = [
+        r[0]
+        for r in conn.execute(
+            "SELECT id FROM code_vec_rowids WHERE id >= ? AND id < ?", (lo, hi)
+        )
+    ]
+    for chunk_id in ids:
+        conn.execute("DELETE FROM code_vec WHERE chunk_id = ?", (chunk_id,))
+    return len(ids)
+
+
 def _delete_path_from_index(conn: sqlite3.Connection, rel: str) -> None:
     conn.execute("DELETE FROM fts_content WHERE path = ?", (rel,))
     conn.execute("DELETE FROM symbols WHERE path = ?", (rel,))
@@ -2038,10 +2350,7 @@ def _delete_path_from_index(conn: sqlite3.Connection, rel: str) -> None:
     conn.execute("DELETE FROM internal_refs WHERE from_path = ? OR to_path = ?", (rel, rel))
     conn.execute("DELETE FROM type_relations WHERE from_path = ? OR to_path = ?", (rel, rel))
     try:
-        # 【self-evolution-bot · 2026-11-16 · 第26轮】块级表按辅助列 path 删（实测 vec0 支持）。
-        # 原来按主键 path 删单条向量；改块级后同一文件有多行，必须按辅助列整体清掉，
-        # 否则文件改动后旧块会残留，召回里出现已删除的行号/内容。
-        conn.execute("DELETE FROM code_vec WHERE path = ?", (rel,))
+        _delete_file_vectors(conn, rel)
     except sqlite3.OperationalError:
         pass  # vec0 table may not exist if sqlite-vec is unavailable
 
@@ -2509,9 +2818,34 @@ def _vector_coverage_counts(
     hit = _COVERAGE_CACHE.get(root)
     if hit is not None and hit[0] == key_stat:
         return hit[1]
+    # 【self-evolution-bot · 2026-11-19 · 第63轮 · 模型:deepseek-v4.1-flash-1017】
+    # 改了什么：`vec_paths` 不再对 vec0 虚表做 `COUNT(DISTINCT path)`，改为在
+    # `code_vec_rowids` 上数 `substr(id,1,instr(id,'::')-1)`；`denom` 改走
+    # fts5 影子表 `fts_content_docsize`（每文档一行）。
+    # 为什么：`path` 在 vec0 里只是**辅助列**，vec0 不为它建索引，于是
+    # `COUNT(DISTINCT path)` 要扫整张 1.84GB 虚表。本轮本机三次取中位实测：
+    #   现值 COUNT(DISTINCT path) FROM code_vec        334.7ms
+    #   改后 rowids 上数 id 前缀（走 UNIQUE 索引）      13.7ms  (-96%)
+    #   fts_content 上 COUNT(DISTINCT path)             13.8ms
+    #   fts_content_docsize 行数                         0.0ms  (改用影子表)
+    # 等价性**全表对拍**（不是抽样）：vec 侧 7893 / rowids 侧 7893 完全相等，
+    # 且 `instr(id,'::')=0` 的行数实测 0（切前缀不会漏行）。fts 两个数都 7907。
+    # 这段每次检索都要跑，而 `_COVERAGE_CACHE` 判据是 index.db 的 mtime+size——
+    # 后台补录每写一次就整段失效，所以稳态下它并不是「一次性的」开销。
     vec_n = int(conn.execute("SELECT COUNT(*) FROM code_vec").fetchone()[0])
-    vec_paths = int(conn.execute("SELECT COUNT(DISTINCT path) FROM code_vec").fetchone()[0])
-    denom = int(conn.execute("SELECT COUNT(DISTINCT path) FROM fts_content").fetchone()[0])
+    vec_paths = int(
+        conn.execute(
+            # 【self-evolution-bot · 2026-11-19 · 第63轮】`instr` 找不到 '::' 时返回 0，
+            # `substr(id, 1, -1)` 是空串 —— 所有这种行会塌成同一个值，计数悄悄变小
+            # 且不报错（既有测试 tests/test_code_index_coverage_count_cache.py 的
+            # 种子就用无 '::' 的 chunk_id，当场把这条抓出来）。所以没有分隔符时
+            # 退回整串 id，宁可少去重一次也不能静默并成一行。
+            "SELECT COUNT(DISTINCT CASE WHEN instr(id, '::') > 0"
+            " THEN substr(id, 1, instr(id, '::') - 1) ELSE id END)"
+            " FROM code_vec_rowids"
+        ).fetchone()[0]
+    )
+    denom = _fts_doc_count(conn)
     if len(_COVERAGE_CACHE) >= _COVERAGE_CACHE_MAX:
         _COVERAGE_CACHE.pop(next(iter(_COVERAGE_CACHE)), None)
     _COVERAGE_CACHE[root] = (key_stat, (vec_n, vec_paths, denom))
@@ -4022,6 +4356,9 @@ def search_index(
 
     # --- Semantic vector recall (hybrid merge) ---
     semantic_hits: list[dict] = []
+    # 【self-evolution-bot · 2026-11-18 · 第51轮 · 模型:deepseek-v4.1-flash-1017】
+    # 语义召回失败的**原因**必须随结果出到工具出口，不能只在日志里。
+    _reset_degraded()
     if cfg.semantic_search_enabled:
         semantic_hits = _semantic_recall_sync(
             conn,
@@ -4175,6 +4512,10 @@ def search_index(
         "path_scope_empty_hint": path_scope_empty_hint,
         "fts_combine_mode": "or" if synonym_mode else fts_mode,
         "semantic_enabled": cfg.semantic_search_enabled,
+        # 【self-evolution-bot · 2026-11-18 · 第51轮 · 模型:deepseek-v4.1-flash-1017】
+        # 非空 = 本次检索**只有词法**（语义召回被跳过/失败），值是稳定原因码；
+        # 空 = 语义正常参与。输出层据此打一行提示，调用方不必去翻日志。
+        **_collect_degraded(),
         "root": root,
         "db_path": str(_db_path(root)),
         "rebuild_in_progress": rebuild_in_progress,

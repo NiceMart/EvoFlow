@@ -1,7 +1,7 @@
 /* eslint-disable max-lines -- projection/base/recovery/optimistic 必须共享一个原子 store 状态机，拆分会重新引入跨对象竞态。 */
 // Per-session projection store（只读 projection store）。
 // 唯一写入方是订阅推送；UI 只读。客户端遵守三条规则：
-//   1. snapshot → 整体替换，绝不 merge；
+//   1. snapshot → 整体替换（同 epoch 可前插已 loadOlder 的更早行，防 overflow 尾窗冲历史）；
 //   2. delta 帧仅在区间衔接（frame.fromSeq === snapshot.seq）时 apply，断档不猜、不缓存补偿；
 //   3. base 与状态同生共死——断档时状态未被污染，携当前水位重订阅，由服务端裁决 resume/snapshot。
 // 除 optimistic overlay（pending 命令展示）外，本 store 不产生任何 conversation 事实。
@@ -31,6 +31,7 @@ import {
   capAndLightenProjectionWindow,
   countRealUserQueries,
   ensureLiveTurnInProjectionWindow,
+  liveTurnSpan,
   resolveProjectionWindowSoftCap,
 } from "@/v4/projectionWindowCap.js";
 
@@ -267,6 +268,54 @@ export function hasOlderRows(snapshot: ConversationSnapshot | null): boolean {
 }
 
 /**
+ * overflow / recovery 尾窗快照替换前：保住客户端已 loadOlder 的更早行。
+ *
+ * 服务端 snapshot.window 通常只有尾部 ≤60 行；若整窗替换，上拉刚补进的历史会被冲掉，
+ * 用户滚到顶只能看到「当前尾窗的第一轮」，像历史丢了。同 logEpoch 下把 prev 中
+ * rowId < incoming 窗首的行前插回去（incoming 同 id 覆盖），再按 head 软顶。
+ * epoch 变化（CLI 重启 / remint）仍整窗替换，避免把旧纪元行粘回来。
+ */
+export function mergePreservedOlderRowsIntoTailSnapshot(
+  previous: ConversationSnapshot | null | undefined,
+  incoming: ConversationSnapshot,
+): ConversationSnapshot {
+  if (!previous?.rows?.window?.length || !incoming?.rows?.window?.length) {
+    return incoming;
+  }
+  if (String(previous.logEpoch || "") !== String(incoming.logEpoch || "")) {
+    return incoming;
+  }
+  const cut = incoming.rows.window[0]?.rowId;
+  if (cut === undefined) return incoming;
+  const older = previous.rows.window.filter((row) => row.rowId < cut);
+  if (older.length === 0) return incoming;
+  const byId = new Map<number, ConversationRow>();
+  for (const row of older) byId.set(row.rowId, row);
+  for (const row of incoming.rows.window) byId.set(row.rowId, row);
+  const merged = [...byId.values()].sort((a, b) => a.rowId - b.rowId);
+  const softCap = resolveProjectionWindowSoftCap();
+  const capped = capAndLightenProjectionWindow(merged, {
+    softCap,
+    prefer: "head",
+  });
+  const window = ensureLiveTurnInProjectionWindow(merged, capped, softCap);
+  if (window.length === incoming.rows.window.length) {
+    // 软顶后若与 incoming 同长，仍可能内容不同（前插后裁尾）；以 window 为准。
+    const same =
+      window.length === incoming.rows.window.length &&
+      window.every((row, i) => row.rowId === incoming.rows.window[i]?.rowId);
+    if (same) return incoming;
+  }
+  return {
+    ...incoming,
+    rows: {
+      ...incoming.rows,
+      window: [...window],
+    },
+  };
+}
+
+/**
  * 冷快照尾窗是否从一个 turn 的中间截断。turnHeader 是完整 turn 的权威起点；首行允许是
  * lightBoundary，因此不能只判断首行 kind，必须检查首个 turn 在当前窗口里是否已有 header。
  */
@@ -301,11 +350,22 @@ function mergeOlderRows(
   const merged = [...older, ...window];
   const softCap = opts?.softCap ?? resolveProjectionWindowSoftCap();
   const prefer = opts?.prefer ?? "head";
-  const capped = capAndLightenProjectionWindow(merged, { softCap, prefer });
+  // 上拉刚拿到的更早行若仍按原 softCap 钉直播轮，会被「上一轮尾部残片」挤掉
+  // （现场：rows_range 已返回 1…55，窗口仍卡在 56…）。给本页 older 留出预算。
+  const live = liveTurnSpan(merged);
+  const liveLen = live ? merged.length - live.turnStart : 0;
+  const effectiveCap =
+    prefer === "head"
+      ? Math.max(softCap, Math.min(liveLen + older.length, softCap + older.length))
+      : softCap;
+  const capped = capAndLightenProjectionWindow(merged, {
+    softCap: effectiveCap,
+    prefer,
+  });
   // prefer=head 会裁掉窗尾：直播中必须把当前轮钉回，否则尾仍是上轮正文（stale_prev_turn_tail）。
   const next =
     prefer === "head"
-      ? ensureLiveTurnInProjectionWindow(merged, capped, softCap)
+      ? ensureLiveTurnInProjectionWindow(merged, capped, effectiveCap)
       : capped;
   return next === merged ? merged : [...next];
 }
@@ -317,7 +377,10 @@ function applySoftCapToSnapshot(
   softCap: number = resolveProjectionWindowSoftCap(),
 ): ConversationSnapshot {
   const prev = snapshot.rows.window;
-  const next = capAndLightenProjectionWindow(prev, { softCap, prefer });
+  const capped = capAndLightenProjectionWindow(prev, { softCap, prefer });
+  // 尾窗裁切后必须钉回直播轮 in-flight（思考/工具进行中），否则 shrink/snapshot
+  // 一刀切掉中间思考行 → V4 仍推 row.delta，apply 找不到行，页面空白。
+  const next = ensureLiveTurnInProjectionWindow(prev, capped, softCap);
   if (next === prev) return snapshot;
   if (next.length < prev.length) {
     logger.info("[v4-store] projection window soft-capped", {
@@ -928,9 +991,14 @@ export class ConversationProjectionStore {
         frame.payload.snapshot,
         "snapshot",
       );
-      // 规则 1：整体替换，扔掉手里的一切换新的。
-      // Wire 尾窗通常 ≤60；仍做 soft-cap，防止异常大 snapshot / 测试夹具撑爆。
-      const snapshot = applySoftCapToSnapshot(frame.payload.snapshot, "tail");
+      // 规则 1：权威 snapshot 换窗。Wire 尾窗通常 ≤60；soft-cap 防撑爆。
+      // 已 loadOlder 的更早行在同 epoch 下前插保住，否则 overflow recovery 一来
+      // 上拉历史就被冲掉（滚到顶只剩尾窗第一轮）。
+      const cappedIncoming = applySoftCapToSnapshot(frame.payload.snapshot, "tail");
+      const snapshot = mergePreservedOlderRowsIntoTailSnapshot(
+        this.state.snapshot,
+        cappedIncoming,
+      );
       this.setState({
         snapshot,
         planDirectoryRevision: this.state.planDirectoryRevision + 1,

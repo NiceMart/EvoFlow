@@ -626,6 +626,25 @@ class V4ConversationHub:
         ):
             run_status = str((read_run_status_row(tid) or {}).get("status") or "").strip().lower()
             mapped = _phase_for_run_status(run_status)
+            # 工具授权闸仍 pending 时 DB 常被标 done/idle；不得把投影收成 completedSuccess，
+            # 否则页面像「自己停了」、待批工具卡被误当成终态。
+            if mapped == _PHASE_COMPLETED:
+                try:
+                    from evoflow.agents.tool_approval_service import thread_has_pending_approvals
+
+                    if thread_has_pending_approvals(tid):
+                        mapped = ""
+                        logger.info(
+                            "[v4.catchup] skip settle: pending tool approval session=%s db_status=%s",
+                            tid,
+                            run_status,
+                        )
+                except Exception:
+                    logger.debug(
+                        "[v4.catchup] pending-approval check failed session=%s",
+                        tid,
+                        exc_info=True,
+                    )
             if mapped:
                 self.patch_phase(tid, mapped)
                 settled_phase = mapped
@@ -1721,6 +1740,32 @@ class V4ConversationHub:
         return bool(row) and str(row.get("kind") or "") == "turnHeader"
 
     @staticmethod
+    def _include_leading_same_turn_user_input(
+        rows: list[dict[str, Any]], header_idx: int
+    ) -> int:
+        """turnHeader 前若已有同 turnId 的 userInput（ensure/remint 颠倒行序），起点要含住它。
+
+        否则尾窗对齐到 header 会裁掉紧前用户气泡 → 浮层只剩孤头/孤气泡错位。
+        """
+        if header_idx <= 0 or header_idx >= len(rows):
+            return header_idx
+        header = rows[header_idx]
+        if str(header.get("kind") or "") != "turnHeader":
+            return header_idx
+        turn_id = str(header.get("turnId") or "").strip()
+        if not turn_id:
+            return header_idx
+        i = header_idx
+        while i > 0:
+            prev = rows[i - 1]
+            if str(prev.get("kind") or "") != "userInput":
+                break
+            if str(prev.get("turnId") or "").strip() != turn_id:
+                break
+            i -= 1
+        return i
+
+    @staticmethod
     def _align_snapshot_window_start(
         rows: list[dict[str, Any]],
         start: int,
@@ -1730,6 +1775,7 @@ class V4ConversationHub:
         """把尾窗起点对齐到 turnHeader，避免半截旧轮结论挂在窗顶。
 
         先向后最多 40 行找 header；找不到再向前丢弃孤儿头，直到下一轮 header。
+        若 header 前有同 turn 颠倒落盘的 userInput，起点再回退把它收进来。
         """
         n = len(rows)
         if start <= 0 or start >= n:
@@ -1738,20 +1784,23 @@ class V4ConversationHub:
         i = start
         while i > back_floor:
             if V4ConversationHub._is_snapshot_turn_boundary(rows[i]):
-                return i
+                return V4ConversationHub._include_leading_same_turn_user_input(rows, i)
             i -= 1
         if V4ConversationHub._is_snapshot_turn_boundary(rows[start]):
-            return start
+            return V4ConversationHub._include_leading_same_turn_user_input(rows, start)
         i = start
         while i < n - min_keep:
             if V4ConversationHub._is_snapshot_turn_boundary(rows[i]):
-                return i
+                return V4ConversationHub._include_leading_same_turn_user_input(rows, i)
             i += 1
         return start
 
     @staticmethod
     def _live_turn_span(rows: list[dict[str, Any]]) -> tuple[int, int] | None:
-        """Latest non-empty realUser 的 (turnStartIdx, userIdx)。turnStart 含紧前 turnHeader。"""
+        """Latest non-empty realUser 的 (turnStartIdx, userIdx)。
+
+        turnStart = 该 turnId 的首行（含 turnHeader，也兼容 userInput 先于 header 的颠倒序）。
+        """
         last_ui_idx: int | None = None
         for i in range(len(rows) - 1, -1, -1):
             if str(rows[i].get("kind") or "") != "userInput":
@@ -1764,8 +1813,14 @@ class V4ConversationHub:
             break
         if last_ui_idx is None:
             return None
+        turn_id = str(rows[last_ui_idx].get("turnId") or "").strip()
         turn_start = last_ui_idx
-        if last_ui_idx > 0 and str(rows[last_ui_idx - 1].get("kind") or "") == "turnHeader":
+        if turn_id:
+            for i, row in enumerate(rows):
+                if str(row.get("turnId") or "").strip() == turn_id:
+                    turn_start = i
+                    break
+        elif last_ui_idx > 0 and str(rows[last_ui_idx - 1].get("kind") or "") == "turnHeader":
             turn_start = last_ui_idx - 1
         return turn_start, last_ui_idx
 

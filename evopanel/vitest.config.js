@@ -283,6 +283,8 @@ export default defineConfig({
       'tests/langgraph-thread-stale-epoch.test.ts',
       // 超大会话渲染层尾窗软顶（防 loadAllOlder / 长流式撑爆 window）
       'tests/projection-window-cap.test.ts',
+      // overflow/recovery 尾窗快照不得冲掉已 loadOlder 的更早行
+      'tests/v4-preserve-older-on-tail-snapshot.test.ts',
       'tests/v4-userinput-visible-in-tail.test.ts',
       'tests/v4-fold-health.test.ts',
       'tests/v4-display-order-health.test.ts',
@@ -318,6 +320,7 @@ export default defineConfig({
       'tests/v4-projection-memory-probe.test.ts',
       // 视口调试「接口」页：只收录对话页相关 HTTP，并落盘入参/出参
       'tests/v4-viewport-api-tap.test.ts',
+      'tests/v4-viewport-stream-tap.test.ts',
       // search_code_index 卡片：不得被 family=search 抢去渲染成不可展开的一行式块
       // 【self-evolution-bot · 2026-11-17 · 第33轮】新增用例必须登记，否则 vitest 根本不会跑它
       'tests/search-code-index-card.test.ts',
