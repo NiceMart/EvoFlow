@@ -18,6 +18,20 @@ function mayAutoShowWritePanel(): boolean {
 export type StageSetPayload = {
   action?: string
   surface?: Partial<RightStageSurface> | null
+  /**
+   * 【self-evolution-bot · 2026-11-20 · 第100轮 · 模型:deepseek-v4.1-flash-1017】
+   * 新增：`action='activate'` 时的目标标签 key（形如 `employeeProcess:primary`）。
+   * 为什么：切签只认 key，不能靠 surface 反推——surface 会被写进标签/改内容，
+   * 而切签必须做到「不新建、不关闭、不改内容」，只能有一个纯 key 通道。
+   */
+  key?: string
+  /**
+   * 【self-evolution-bot · 2026-11-20 · 第101轮 · 模型:deepseek-v4.1-flash-1017】
+   * 新增：`action='move'` 时「移到哪个签的位置」（另一个标签的 key）。
+   * 为什么：move 靠两个 key 定位（源 + 目标位置），只有 key 一个字段的话，
+   * 前端 reorderTab(activeId, overId) 拿不到 overId，顺序切不动。
+   */
+  target?: string
 }
 
 export const STAGE_SET_APPLIED_EVENT = 'evopanel:stage-set-applied'
@@ -80,6 +94,32 @@ export function buildStageSetPayload(argsText?: string, result?: string | null):
   if (action === 'hide') {
     return { action: 'hide', surface: null }
   }
+  // 【self-evolution-bot · 2026-11-20 · 第100轮 · 模型:deepseek-v4.1-flash-1017】
+  // 改了什么：activate 动作从工具 result 里取 key（没有 surface，不能走下面的 kind 校验）。
+  // 为什么：漏了这里，`platform ui.activate` 的返回会在解析阶段被判成「无 kind → null」，
+  //   于是后端说切了、前端没动——又一个「工具回 ok 而用户屏幕没变化」。
+  if (action === 'activate') {
+    const targetKey = String(resultObj?.key || '').trim()
+    if (!targetKey) return null
+    return { action: 'activate', surface: null, key: targetKey }
+  }
+  // 【self-evolution-bot · 2026-11-20 · 第101轮 · 模型:deepseek-v4.1-flash-1017】
+  // 改了什么：工具 result 回放通道同样识别 close / move。
+  // 为什么：这条通道（拿工具返回值解析）与 SSE 实时通道是**两条独立路径**，
+  //   只在 SSE 里接、不在这里接，就等于「实时切得动、回放切不动」——
+  //   而 ui.close / ui.move 是普通工具调用，走的就是这条 result 回放。
+  //   第100轮我已在 activate 上撞过同型问题（一条通道绿不能推另一条绿）。
+  if (action === 'close') {
+    const targetKey = String(resultObj?.key || '').trim()
+    if (!targetKey) return null
+    return { action: 'close', surface: null, key: targetKey }
+  }
+  if (action === 'move') {
+    const srcKey = String(resultObj?.key || '').trim()
+    const dstKey = String(resultObj?.target || '').trim()
+    if (!srcKey || !dstKey) return null
+    return { action: 'move', surface: null, key: srcKey, target: dstKey }
+  }
 
   const resultSurface = resultObj?.surface
   if (resultSurface && typeof resultSurface === 'object' && !Array.isArray(resultSurface)) {
@@ -130,6 +170,79 @@ export function applyStageSetPayload(
     ownerSessionKey: ownerSessionKey || '(空)',
     dataKeys: payload.surface?.data ? Object.keys(payload.surface.data) : [],
   })
+  // 【self-evolution-bot · 2026-11-20 · 第100轮 · 模型:deepseek-v4.1-flash-1017】
+  // 改了什么：把 activate 分支提到 hide 判断**之前**。
+  // 为什么（这是我本轮自己撞出来的真缺陷，测试一开始没抓到）：
+  //   下面 hide 的判据是 `action === 'hide' || payload.surface === null`。
+  //   而 activate **天然没有 surface**：
+  //     · SSE 实时通道 → surface 是 `undefined`，`!== null` 所以侥幸没进 hide；
+  //     · 工具 result 回放通道 → buildStageSetPayload 返回 `surface: null`，
+  //       于是「切到某签」会被当成「收起右栏」，用户看到的是面板整个关了。
+  //   两条通道一条侥幸绿、一条真坏 —— 正是「一条绿不能推另一条绿」那类缺陷。
+  //   顺序改对之后，activate 无论 surface 是 null 还是 undefined 都先被自己接住。
+  if (action === 'activate') {
+    const targetKey = String(payload.key || '').trim()
+    if (!targetKey) {
+      logPanelSet('① 动作=activate 失败：缺 key')
+      return false
+    }
+    const snap0 = rightStageStore.getSnapshot()
+    const before = { activeKey: snap0.activeKey || null, tabCount: (snap0.tabs || []).length }
+    rightStageStore.activateTab(targetKey)
+    const snap1 = rightStageStore.getSnapshot()
+    const ok = String(snap1.activeKey || '') === targetKey
+    logPanelSet('① 动作=activate 已切签', {
+      targetKey,
+      ok,
+      before,
+      after: { activeKey: snap1.activeKey || null, tabCount: (snap1.tabs || []).length },
+    })
+    dispatchStageSetApplied({ action: 'activate', key: targetKey })
+    return ok
+  }
+  // 【self-evolution-bot · 2026-11-20 · 第101轮 · 模型:deepseek-v4.1-flash-1017】
+  // 改了什么：补 close（关单个签）与 move（调签顺序）两条分发——store 里 closeTab /
+  //   reorderTab 早就存在，但 SSE 这条通道从来没接，后端加了动作前端也不会动。
+  // 为什么（用户当场要求）：「或者是给它关掉……或者给它调换位置。就这种像人一样的操作。」
+  // 与 hide 的区别必须写清：hide 收起整栏（签还在）；close 真的删掉那一个签。
+  // 判据：close 后 tabCount 减 1 且其它签 key 不变；move 后 tabCount 不变、两签顺序互换。
+  if (action === 'close') {
+    const targetKey = String(payload.key || '').trim()
+    if (!targetKey) {
+      logPanelSet('① 动作=close 失败：缺 key')
+      return false
+    }
+    const snap0 = rightStageStore.getSnapshot()
+    const beforeKeys = (snap0.tabs || []).map((t) => rightStageStore.keyOf(t))
+    if (!beforeKeys.includes(targetKey)) {
+      logPanelSet('① 动作=close 失败：目标签不存在', { targetKey, beforeKeys })
+      return false
+    }
+    rightStageStore.closeTab(targetKey)
+    const snap1 = rightStageStore.getSnapshot()
+    const afterKeys = (snap1.tabs || []).map((t) => rightStageStore.keyOf(t))
+    const ok = afterKeys.length === beforeKeys.length - 1 && !afterKeys.includes(targetKey)
+    logPanelSet('① 动作=close 已关签', { targetKey, ok, beforeKeys, afterKeys })
+    dispatchStageSetApplied({ action: 'close', key: targetKey })
+    return ok
+  }
+  if (action === 'move') {
+    const srcKey = String(payload.key || '').trim()
+    const dstKey = String(payload.target || '').trim()
+    if (!srcKey || !dstKey) {
+      logPanelSet('① 动作=move 失败：缺 key/target', { srcKey, dstKey })
+      return false
+    }
+    const snap0 = rightStageStore.getSnapshot()
+    const beforeKeys = (snap0.tabs || []).map((t) => rightStageStore.keyOf(t))
+    rightStageStore.reorderTab(srcKey, dstKey)
+    const snap1 = rightStageStore.getSnapshot()
+    const afterKeys = (snap1.tabs || []).map((t) => rightStageStore.keyOf(t))
+    const ok = afterKeys.length === beforeKeys.length && afterKeys.join('|') !== beforeKeys.join('|')
+    logPanelSet('① 动作=move 已调顺序', { srcKey, dstKey, ok, beforeKeys, afterKeys })
+    dispatchStageSetApplied({ action: 'move', key: srcKey, target: dstKey })
+    return ok
+  }
   if (action === 'hide' || payload.surface === null) {
     logPanelSet('① 动作=hide，收起右栏')
     rightStageStore.applyRemote({ action: 'hide', surface: null })
@@ -151,6 +264,12 @@ export function applyStageSetPayload(
     const isBackgroundOwner =
       !xiaomiVoiceFg &&
       Boolean(ownerSessionKey && uiSessionKey && ownerSessionKey !== uiSessionKey)
+    // 【self-evolution-bot · 2026-11-21 · 第104轮 · 模型:deepseek-v4.1-flash-1017】
+    // 改了什么：新增 userInitiatedShow —— 本次展示是否由「用户主动喊员工干活」触发。
+    // 为什么：这类动作的语义是「用户点开了它」，必须落在用户当前看的面板里；
+    //   不能因为 ownerSessionKey / uiSessionKey 抖动就被当成后台会话挪走（见下方挪签判据）。
+    // 判据：payload 里带 forceExpand（后端按用户发起动作置 true）即视为用户主动。
+    const userInitiatedShow = payload.surface?.expand === true
     logPanelSet('① 进度面板：openProgressFromPanelSet', {
       kind,
       stampSk: stampSk || '(空)',
@@ -161,14 +280,30 @@ export function applyStageSetPayload(
         ...payload.surface,
         kind,
       },
-      { sessionKey: stampSk },
+      // 【self-evolution-bot · 2026-11-20 · 第91轮 · 模型:deepseek-v4.1-flash-1017】
+      // 改了什么：把 surface.expand 映射成 forceExpand 透传给 openProgressFromPanelSet。
+      // 为什么：用户收起右栏后 ui.show 只写标签不撑开（本轮实测 shellExists=false），
+      // expand=true 是调用方明确要求「让用户看见」，语义等同用户亲手点开。
+      { sessionKey: stampSk, forceExpand: payload.surface.expand === true },
     )
     if (!opened) {
       logPanelSet('① 进度面板打开失败：缺必填 data')
       return false
     }
     // 后台会话：live 打开后立刻挪进该会话冻结记忆，再从当前 UI 表剔除，避免串进前台。
-    if (isBackgroundOwner && ownerSessionKey) {
+    // 【self-evolution-bot · 2026-11-21 · 第104轮 · 模型:deepseek-v4.1-flash-1017】
+    // 改了什么：只有「确实是后台会话」且「本次不是用户主动发起」时才挪签。
+    // 为什么（本轮真机实测对照实验，用户原话「新打开的也没有显示最新的，也没有进行切换，
+    //   你现在也控制不了」）：
+    //   - `web-embed`（非进度类，不走本分支）：10:52:59.330 emit → 10:52:59.940 report，
+    //     610ms 落地，activeKey 正确切到新签。
+    //   - `shell-page` / `employeeProcess`（进度类，走本分支）：10:47:45.915 emit 之后
+    //     **两分钟零 report**，activeKey 原地不动。
+    //   同一工具、同一通道，唯一差别就是走不走这里 —— 通道没问题，是这条分支把事件吃掉了。
+    // 判据：用户的当前 UI 会话就是他正在看的会话，那次派单本来就该落在这个面板里；
+    //   ownerSessionKey 与 uiSessionKey 不等，更常见的原因是**其中一边取值抖动/为空**，
+    //   不能一律当「后台会话」处理。挪签只在 isBackgroundOwner 真正成立且非用户发起时做。
+    if (isBackgroundOwner && ownerSessionKey && !userInitiatedShow) {
       const tabKey = `${kind}:${opened}`
       const tab = rightStageStore.findTab(tabKey)
       if (tab) {
@@ -220,7 +355,21 @@ export function applyStageSetPayload(
   const isBackgroundOwner =
     !xiaomiVoiceFg &&
     Boolean(ownerSessionKey && uiSessionKey && ownerSessionKey !== uiSessionKey)
-  if (isBackgroundOwner && scopeOfKind(kind) === 'session') {
+  // 【self-evolution-bot · 2026-11-21 · 第106轮 · 模型:deepseek-v4.1-flash-1017】
+  // 改了什么：本条「后台会话 → 只写冻结记忆」的隔离分支，补上与进度类分支同一套
+  //   ``expand=true`` 豁免。
+  // 为什么（本轮现网日志定案的 44 秒真因，不是延迟）：
+  //   13:26:37.506 emit 一条 web-embed show(expand=true)；
+  //   13:26:52 / 13:26:56 / 13:26:59 三条 report 全是 12 个 screenshot 签在翻滚，
+  //   **我的 web-embed 签一次都没上过报**；
+  //   13:27:13.456 用户点发送切到我的会话 → 13:27:21.586 report 才变成 tabs=1/web-embed。
+  //   即：那签在 13:26:37 就被写进了「我的会话」的冻结记忆，用户切过来才换出表。
+  //   事件没丢、也没慢，是**隔离分支吃掉了 expand**——第104轮我只给进度类分支加了
+  //   豁免（userInitiatedShow），web-embed/file 等会话级 kind 走的是本分支，没有豁免。
+  // 判据：expand=true 是调用方明确要求「让用户看见」（语义等同用户亲手点开），
+  //   与「后台自动挂载不抢焦点」不冲突——后者从不带 expand。
+  //   带 expand 时按用户当前 UI 会话盖章写 live，让用户此刻就能看见。
+  if (isBackgroundOwner && scopeOfKind(kind) === 'session' && payload.surface.expand !== true) {
     // 后台会话：只更新它自己的冻结记忆，绝不写当前 UI 的右栏。
     logPanelSet('① 后台会话：只写冻结记忆，不抢当前右栏', {
       ownerSessionKey,
@@ -243,8 +392,16 @@ export function applyStageSetPayload(
   }
   logPanelSet('① 前台：applyRemote 写右栏', { kind, action, xiaomiVoiceFg })
   // 语音全屏：归属钉到当前 UI 会话，避免 tab.sessionKey=小V 被 ChatApp 过滤掉
-  const stampSk = xiaomiVoiceFg
-    ? uiSessionKey || undefined
+  // 【self-evolution-bot · 2026-11-21 · 第106轮 · 模型:deepseek-v4.1-flash-1017】
+  // 改了什么：``expand=true``（调用方明确要求「让用户看见」）时，归属同样钉到当前 UI 会话。
+  // 为什么（与上面那条豁免配套，缺一不可）：只放行隔离分支不改盖章还不够——
+  //   签若仍盖 ``ownerSessionKey``（用户没在看的那条会话），
+  //   ChatApp 侧按 ``isRightStageTabVisibleForSession`` 过滤时会把刚写进去的签再滤掉，
+  //   表现为「分支放行了、屏幕上还是什么都没有」，与第104轮 610ms 落地那条的成功案例恰恰相反。
+  // 判据：expand=true → stampSk 必须等于 uiSessionKey；其余情况保持原语义。
+  const forceUserVisible = payload.surface?.expand === true
+  const stampSk = xiaomiVoiceFg || forceUserVisible
+    ? uiSessionKey || ownerSessionKey || undefined
     : ownerSessionKey || undefined
   rightStageStore.applyRemote({
     action,
@@ -311,9 +468,27 @@ export function applyRightStageAgUiCustom(
   const stagePayload: StageSetPayload = {
     action: String(payload.action || 'show'),
     surface: payload.surface as Partial<RightStageSurface> | null | undefined,
+    // 【self-evolution-bot · 2026-11-20 · 第100轮 · 模型:deepseek-v4.1-flash-1017】
+    // 改了什么：SSE custom 流也把 key 透传给 applyStageSetPayload。
+    // 为什么：后端 activate 走的是 stream_writer({type:'right_stage', action:'activate', key})，
+    //   这里不取 key，实时通道就切不动签（只有工具 result 回放那条路能切），
+    //   表现为「工具说切了、屏幕没动」。两条通道都得通。
+    ...(String(payload.key || '').trim() ? { key: String(payload.key).trim() } : {}),
+    // 【self-evolution-bot · 2026-11-20 · 第101轮 · 模型:deepseek-v4.1-flash-1017】
+    // 改了什么：``target`` 也必须透传。
+    // 为什么（本轮前端测试当场抓到）：我只把 key 搬进来、漏了 target，
+    //   结果 ui.move 分发时读到 ``dstKey: ''``，走「缺 key/target」直接 return false。
+    //   这正是「加参数只改声明处、漏掉使用处」的老毛病 —— 第100轮 activate 也是在这里
+    //   只搬了 key；这次别再漏第二个字段。
+    ...(String(payload.target || '').trim() ? { target: String(payload.target).trim() } : {}),
   }
-  applyStageSetPayload(stagePayload, options)
-  return true
+  // 【self-evolution-bot · 2026-11-20 · 第100轮 · 模型:deepseek-v4.1-flash-1017】
+  // 改了什么：把 applyStageSetPayload 的返回值如实返回，不再无条件 `return true`。
+  // 为什么：本文件所有调用方（ws-client / 工具 result 回放）都拿这个 bool 判断「是否落地」。
+  //   无条件 true 会让「activate 缺 key」「surface.kind 缺失」「进度面板缺必填 data」
+  //   这些真失败全部报成完成 —— 就是「工具回 ok、用户屏幕没变化」那类假成功。
+  //   本轮新加的测试一眼照出来：缺 key 时 expected false，received true。
+  return applyStageSetPayload(stagePayload, options)
 }
 
 /** Build news context block for harness prompt injection. */

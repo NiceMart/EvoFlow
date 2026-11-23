@@ -1,6 +1,7 @@
 import {
   defaultLayoutForKind,
   defaultTitleForKind,
+  normalizeOpenedBy,
   normalizeRightStageKind,
   type RightStageKind,
   type RightStageStreamChunk,
@@ -11,6 +12,7 @@ import { getCurrentRightStageSessionKey, resolveTabSessionKey, scopeOfKind } fro
 import { isTaskCenterStageSessionKey } from './task-center-stage-key.js'
 import { isProgressStageKind } from './open-progress-from-panel-set.js'
 import { logPanelSet, logRightStage } from './panel-set-debug-log.js'
+import { reportRightStageState } from './right-stage-state-report.js'
 
 /** RUN_FINISHED / 平台 toast 收栏时不得拆掉的 kind（用户还要盯进度 / 浏览器）。 */
 function isProtectedIdleHideKind(kind: string | null | undefined): boolean {
@@ -48,6 +50,14 @@ export type RightStageSessionMemory = {
   activeKey: string | null
   collapsed: boolean
   recentClosed: RecentClosedRightStageTab[]
+  /**
+   * 【self-evolution-bot · 2026-11-21 · 第102轮 · 模型:deepseek-v4.1-flash-1017】
+   * 用户是否**主动**收起（收起锁）。必须与 ``collapsed`` 分开存：
+   * ``collapsed`` 是"现在收没收"，可能只是因为当时没标签；
+   * ``userCollapsed`` 是"用户亲手收的，别再自动撑开"。
+   * 旧版本没存这个字段，读回按 false 处理（宁可多展开一次，也不永久锁死）。
+   */
+  userCollapsed?: boolean
 }
 
 type Listener = () => void
@@ -109,6 +119,18 @@ export class RightStageStore {
 
   private tabKeyOf(surface: RightStageSurface): string {
     return `${surface.kind}:${surface.id}`
+  }
+
+  /**
+   * 【self-evolution-bot · 2026-11-20 · 第101轮 · 模型:deepseek-v4.1-flash-1017】
+   * 改了什么：把 tab key 计算暴露成公开方法 `keyOf(surface)`。
+   * 为什么：`tabKeyOf` 是 private，而 SSE 分发侧（right-stage-agui）需要算出
+   *   「关签前后 tabCount 变没变、其它签 key 有没有被动」来做**真判据**。
+   *   为了拿这个判据去复制一份 `${kind}:${id}` 到别处，等于把规则写两遍，
+   *   下次改了这里、漏了那里就是新的「同一目标塌成两个 key」缺陷。
+   */
+  keyOf(surface: RightStageSurface): string {
+    return this.tabKeyOf(surface)
   }
 
   /** 记录最近关闭：同 key 再次关闭时去重并置顶，避免总览里出现重复行。 */
@@ -217,6 +239,13 @@ export class RightStageStore {
         .map((t) => ({ ...t, data: { ...t.data } })),
       activeKey: this.activeKey,
       collapsed: this.collapsed,
+      // 【self-evolution-bot · 2026-11-21 · 第102轮 · 模型:deepseek-v4.1-flash-1017】
+      // 改了什么：把用户主动收起锁一并冻结到会话记忆里。
+      // 为什么：下面 importSessionMemory 原本用 ``userCollapsed = this.collapsed``
+      //   从"现在收没收"倒推"用户是否锁了"，于是任何一次被动收起（比如当时没标签）
+      //   都会被记成用户意图，切回来以后所有 autoOpen 被永久挡住 ——
+      //   这就是右栏"再也不自动展开"的语义根因。只有真的存下来才谈得上尊重用户。
+      userCollapsed: this.userCollapsed,
       recentClosed: this.recentClosed
         .filter((e) => !isTaskCenterStageSessionKey(e.tab?.sessionKey))
         .map((e) => ({
@@ -252,8 +281,12 @@ export class RightStageStore {
         typeof options?.collapsedWhenNoMemory === 'boolean'
           ? options.collapsedWhenNoMemory
           : carried.length === 0
-      // 切会话重置收起锁，避免上一会话的「收起」钉死新会话。
-      this.userCollapsed = this.collapsed
+      // 【self-evolution-bot · 2026-11-21 · 第102轮 · 模型:deepseek-v4.1-flash-1017】
+      // 改了什么：无记忆分支不再把"现在收没收"当成"用户锁了"。
+      // 为什么：``collapsed`` 只是当前视觉状态（新会话没标签时它天然是 true），
+      //   拿它当收起锁会让下一次 ui.show 也被挡住。切过来的新会话从"未锁定"开始，
+      //   由 ``collapse()`` / ``setCollapsed(true)`` 这种**用户手势**去设锁。
+      this.userCollapsed = false
       this.recentClosed = []
       this.streams.clear()
       this.bump()
@@ -291,7 +324,13 @@ export class RightStageStore {
     this.activeKey = restoredActive ?? (merged.length ? this.tabKeyOf(merged[merged.length - 1]!) : null)
     this.collapsed =
       typeof memory.collapsed === 'boolean' ? memory.collapsed : this.tabs.length === 0
-    this.userCollapsed = this.collapsed
+    // 【self-evolution-bot · 2026-11-21 · 第102轮 · 模型:deepseek-v4.1-flash-1017】
+    // 改了什么：有记忆分支改为读回**冻结时的用户意图**，读不到才回落 false。
+    // 为什么：这里原本也是 ``userCollapsed = this.collapsed`` —— 同一个错误：
+    //   把"这份记忆当时是收着的"当成"用户亲手锁了"。旧版本记忆没有该字段，
+    //   按 false 处理：宁可多自动展开一次，也不要让右栏永久打不开。
+    //   用户在会话里主动收起的意图，由 exportSessionMemory 显式存下来。
+    this.userCollapsed = memory.userCollapsed === true
     this.recentClosed = Array.isArray(memory.recentClosed) ? memory.recentClosed : []
     this.streams.clear()
     this.bump()
@@ -304,6 +343,15 @@ export class RightStageStore {
   private bump() {
     this.rev += 1
     this.rebuildSnapshot()
+    // 【self-evolution-bot · 2026-11-20 · 第100轮 · 模型:deepseek-v4.1-flash-1017】
+    // 改了什么：每次右栏状态变化，把「用户当前在看的签」上报给后端（节流 400ms）。
+    // 为什么（用户 2026-11-20 指出）：模型要开面板时**根本不知道用户此刻右栏停在哪一页**。
+    //   `grep activeKey backend --include=*.py` 命中 0 次 —— 这份状态此前只活在前端内存里。
+    //   后果：用户正盯着一份文档/一个员工进程，模型再 ui.show 一个东西就直接把视线抢走；
+    //   或者反过来，该复用的那一页被新开成第二个签。
+    // 判据：上报必须是「状态真的变了」才发（bump 是唯一收敛点），且失败静默——
+    //   上报通道绝不能反过来影响 UI。
+    reportRightStageState(this.cachedSnapshot)
     for (const fn of this.listeners) {
       try {
         fn()
@@ -326,6 +374,14 @@ export class RightStageStore {
      * 以免顶掉用户「收起」或把已切走的 active 抢回去。
      */
     forceExpand?: boolean
+    /**
+     * 【self-evolution-bot · 2026-11-23 · 第128轮 · 模型:deepseek-v4.1-flash】
+     * 改了什么：新增「谁打开的」。创建签时定死，后续同签 show/update **不覆盖**。
+     * 为什么：用户要求标签上能看出是用户 / 某个智能体 / 某条会话打开的，避免串台。
+     * 判据：缺省兜底成 `session:<当前会话>`（拿不到 sessionKey 时干脆不写，
+     *   不猜），绝不默认成 `user` —— 那会把模型自动开的签谎报成用户亲手开的。
+     */
+    openedBy?: string
   }) {
     const kind = normalizeRightStageKind(String(input.kind || '').trim())
     if (!kind) {
@@ -353,6 +409,13 @@ export class RightStageStore {
       input.sessionKey,
       getCurrentRightStageSessionKey(),
     )
+    // 【self-evolution-bot · 2026-11-23 · 第128轮 · 模型:deepseek-v4.1-flash】
+    // 「谁打开的」在创建时定死（对齐 sessionKey 的盖戳时机）：
+    //   显式传入优先 → 没有则按归属会话兜底成 `session:<key>` → 连会话都没有就不写。
+    // 不兜成 'user'：模型自动开的签被标成用户亲手开，正是用户要防的那种串台。
+    const openedBy =
+      normalizeOpenedBy(input.openedBy) ||
+      (sessionKey ? (`session:${sessionKey}` as const) : '')
     const next: RightStageSurface = {
       id: String(input.id || 'primary').trim() || 'primary',
       kind,
@@ -360,6 +423,7 @@ export class RightStageStore {
       layout: input.layout || defaultLayoutForKind(kind),
       data: { ...(input.data || {}) },
       ...(sessionKey ? { sessionKey } : {}),
+      ...(openedBy ? { openedBy } : {}),
     }
     const key = this.tabKeyOf(next)
     const pinned = this.userPinnedActiveKey
@@ -379,10 +443,17 @@ export class RightStageStore {
       if (explicitSk) next.sessionKey = explicitSk
       else if (prev.sessionKey) next.sessionKey = prev.sessionKey
       else delete next.sessionKey
+      // 【self-evolution-bot · 2026-11-23 · 第128轮 · 模型:deepseek-v4.1-flash】
+      // 「谁打开的」创建时定死：已有值一律**不覆盖**（否则同签被别的 agent update 一次，
+      // 归属就被改写成后者，溯源当场失真）。只在空缺时补一次，
+      // 补的是老会话记忆里没有该字段的存量签（回填后仍以首次真值为准）。
+      if (prev.openedBy) next.openedBy = prev.openedBy
+      else if (!next.openedBy) delete next.openedBy
       const same =
         prev.title === next.title &&
         prev.layout === next.layout &&
         prev.sessionKey === next.sessionKey &&
+        prev.openedBy === next.openedBy &&
         JSON.stringify(prev.data) === JSON.stringify(next.data)
       if (same) {
         // 仅激活；用户收起锁定时不偷偷展开（forceExpand 除外）
@@ -411,6 +482,7 @@ export class RightStageStore {
       kind,
       title: next.title,
       sessionKey: next.sessionKey || '(空)',
+      openedBy: next.openedBy || '(未标)',
       tabCount: this.tabs.length,
       collapsed: this.collapsed,
       userCollapsed: this.userCollapsed,
@@ -750,15 +822,39 @@ export class RightStageStore {
   applyRemote(payload: {
     action?: string
     surface?: Partial<RightStageSurface> | null
+    key?: string
     stream?: RightStageStreamChunk & { action?: string; format?: string; path?: string; title?: string }
   }) {
     const action = String(payload.action || '').trim().toLowerCase()
+    // 【self-evolution-bot · 2026-11-20 · 第100轮 · 模型:deepseek-v4.1-flash-1017】
+    // 改了什么：把 activate 接在 hide 判断**之前**（下面那条判据是
+    //   `action === 'hide' || payload.surface === null`，而 activate 天然没有 surface）。
+    // 为什么：同型缺陷本轮已在 right-stage-agui.ts 撞过一次 —— activate 带 surface:null
+    //   会被当成「收起右栏」，用户点切签反而整个面板关掉。这里当前虽未走到，
+    //   但入口语义必须一致，不能让下一个人重踩。
+    if (action === 'activate') {
+      const k = String(payload.key || '').trim()
+      if (k) this.activateTab(k)
+      return
+    }
     if (action === 'hide' || payload.surface === null) {
-      logRightStage('store.applyRemote:hide', { action, surfaceNull: payload.surface === null }, {
+      // 【self-evolution-bot · 2026-11-21 · 第104轮 · 模型:deepseek-v4.1-flash-1017】
+      // 改了什么：``ui.hide`` 落到 store 时改调 ``collapse()``（整栏收起、签全部保留），
+      //   不再调 ``hide()``（那是"关掉一个标签"）。
+      // 为什么（本轮真机实测抓到的真缺陷，10:29:30 起 24 秒无任何前端上报）：
+      //   工具文档写「ui.hide 整栏收起、签还在」，但 applyRemote 把 hide 派给 store.hide()，
+      //   而 store.hide() 的语义是"关激活那一个签"。更糟的是它先 filter(t => t.id === 'primary')，
+      //   shell-page 的 id 是 ``shell:/tasks`` 根本不含 'primary'，于是走 fallback 分支，
+      //   命中 ``isProtectedIdleHideKind``（shell-page 属 isProgressStageKind）→ 直接 return。
+      //   结果：右栏纹丝不动、标签一个不少、collapsed 仍为 false，而工具回 ``ok:true``。
+      //   证据：10:29:30.041 ``[py] emit sent action=hide`` 之后再无 ``[web-state] report``，
+      //   状态盘停在 collapsed=false / tabs=2；对比 ui.show 每次都能 400ms 内成对上报。
+      // 判据：收起是"面板占位消失"这件事，只有 collapse() 能表达；关单个签请走 ui.close。
+      logRightStage('store.applyRemote:hide → collapse', { action, surfaceNull: payload.surface === null }, {
         stack: true,
         store: this,
       })
-      this.hide()
+      this.collapse()
       return
     }
     if (payload.stream) {
@@ -800,15 +896,61 @@ export class RightStageStore {
           title: surfNorm.title,
           layout: surfNorm.layout,
           data: surfNorm.data || {},
+          openedBy: surfNorm.openedBy,
+          forceExpand: surfNorm.expand === true,
         })
       } else {
+        // 【self-evolution-bot · 2026-11-23 · 第128轮 · 模型:deepseek-v4.1-flash】
+        // update 分支同样不许改「谁打开的」：同签被别的 agent update 一次就改归属，
+        // 溯源等于作废。先把 payload 里的 openedBy 剔掉，只在存量签空缺时补一次。
+        const { openedBy: incomingOpenedBy, ...surfNoOpened } = surfNorm as
+          RightStageSurface & Record<string, unknown>
+        const backfill = existing.openedBy
+          ? ''
+          : normalizeOpenedBy(incomingOpenedBy) ||
+            (existing.sessionKey ? (`session:${existing.sessionKey}` as const) : '')
         this.tabs = this.tabs.map((t) =>
           this.tabKeyOf(t) === key
-            ? { ...t, ...surfNorm, data: { ...t.data, ...(surfNorm.data || {}) } }
+            ? {
+                ...t,
+                ...surfNoOpened,
+                data: { ...t.data, ...(surfNorm.data || {}) },
+                ...(t.openedBy
+                  ? { openedBy: t.openedBy }
+                  : backfill
+                    ? { openedBy: backfill }
+                    : {}),
+              }
             : t,
         )
-        if (this.activeKey !== key) {
+        // 【self-evolution-bot · 2026-11-20 · 第95轮 · 模型:deepseek-v4.1-flash-1017】
+        // 改了什么：update 分支不再无条件抢焦点，改成与 show() 同一套 pinAlive 判据
+        //   （用户已钉在别的签上且该签还活着 → 只更新内容，不切 active；
+        //    显式 expand=true 仍然可以抢）。
+        // 为什么：用户场景是「我让另一个 AI 干活，右栏实时显示，我还要能接着跟它聊」。
+        //   实测 `employees.chat_send` 打开「发版工程师」后 active 正确，但约 10 秒后
+        //   自己跳到「任务」标签——因为同会话里 shell-page 之类的面板持续发 update，
+        //   而这里 `if (this.activeKey !== key) this.activeKey = key` 是无条件的，
+        //   任何一个面板刷新都把人正在看的对话抢走，续聊当场断掉。
+        //   与 show() 的 shouldActivate = forceExpand || !pinAlive 对齐后，
+        //   后台刷新只灌内容，不再夺走视线。
+        const updatePinned = this.userPinnedActiveKey
+        const updatePinAlive =
+          Boolean(updatePinned) &&
+          updatePinned !== key &&
+          this.tabs.some((t) => this.tabKeyOf(t) === updatePinned)
+        const updateCanSteal = surfNorm.expand === true || !updatePinAlive
+        if (updateCanSteal && this.activeKey !== key) {
           this.activeKey = key
+        }
+        // 【self-evolution-bot · 2026-11-20 · 第91轮 · 模型:deepseek-v4.1-flash-1017】
+        // 改了什么：update 分支也要认 expand，撑开被用户收起的右栏。
+        // 为什么：`ui.update` 走这条分支，原先即使带了 expand 也不会展开，
+        // 与 show 分支行为不一致。
+        if (surfNorm.expand === true) {
+          this.userCollapsed = false
+          this.collapsed = false
+          this.userPinnedActiveKey = key
         }
         this.bump()
       }
@@ -820,12 +962,31 @@ export class RightStageStore {
       title: surfNorm.title,
       layout: surfNorm.layout,
       data: surfNorm.data || {},
+      // 【self-evolution-bot · 2026-11-23 · 第128轮 · 模型:deepseek-v4.1-flash】
+      // 改了什么：SSE 下来的 surface 也带上 openedBy（后端 platform 工具按 ambient
+      // actor 盖章），前端不再把它当"无来源"。
+      // 为什么：这条是智能体打开面板的主通路；不带就等于所有模型开的签都退回会话兜底，
+      // 用户看到的全是「会话：xxx」而分不出是哪个智能体在动他的右栏。
+      openedBy: surfNorm.openedBy,
+      // 【self-evolution-bot · 2026-11-20 · 第91轮 · 模型:deepseek-v4.1-flash-1017】
+      // 改了什么：applyRemote 把 surface.expand 映射为 show() 的 forceExpand。
+      // 为什么：此前 applyRemote 调 show() 从不传 forceExpand，导致
+      // `ui.show` 在用户收起右栏时只写标签不展开 —— 工具回 ok、用户看不见。
+      forceExpand: surfNorm.expand === true,
     })
   }
 }
 
 /** Process-wide default store (per-tab). Session scoping stays in ChatApp wiring. */
 export const rightStageStore = new RightStageStore()
+
+// Main-panel CDP getState() reads this without dynamic import (ExecuteScript is sync).
+try {
+  ;(window as Window & { __evoflowRightStageStore?: RightStageStore }).__evoflowRightStageStore =
+    rightStageStore
+} catch {
+  /* ignore */
+}
 
 /** 只关掉匹配 kind 的标签；不能再 hideAll，否则会把其它 kind 一并清掉。 */
 export function hideRightStageIfKind(...kinds: string[]) {

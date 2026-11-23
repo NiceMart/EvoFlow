@@ -19,6 +19,8 @@ import { isV4GoalActive } from '../../v4/goalCommand.js'
 import {
   platformRunEntriesFromChatArtifacts,
   latestPlatformRunEntryId,
+  hasPlatformFeedbackSeen,
+  markPlatformFeedbackSeen,
   tryEagerAutoOpenPlatformFromArgs,
 } from '../../../lib/right-stage/platform-feedback.js'
 import { showRightStageFilePreview } from '../../../lib/right-stage/open-right-stage-file.js'
@@ -35,6 +37,7 @@ import {
 import {
   readXiaomiAssistantSessionKey,
   resolveChatEventTarget,
+  shouldDispatchRightStageCustom,
 } from '../../lib/chat-ws-foreground.js'
 
 export type ChatWsOnEventCtx = Record<string, any>
@@ -1201,12 +1204,31 @@ export function createChatWsOnEventHandler(ctx: ChatWsOnEventCtx) {
                 } else merged.push(row)
               }
               merged.sort((a, b) => b.appliedAt - a.appliedAt)
+              // 仅「未见过」的平台产物才 announce（撑开右上角 / 切 tab）。
+              // 新回合 SSE 若回放历史 platform artifacts，已见过的静默合并，勿再当新通知。
+              // seen 同时认 bare toolCallId 与 platform:<id>（热路径 / 落库 id 形态不同）。
+              const freshArtifactRows = fromArtifacts.filter(
+                (row) =>
+                  !hasPlatformFeedbackSeen(
+                    platformFeedbackSeenRef.current,
+                    row.toolCallId,
+                    row.id,
+                  ),
+              )
               for (const row of fromArtifacts) {
-                platformFeedbackSeenRef.current.add(String(row.toolCallId || row.id))
+                markPlatformFeedbackSeen(
+                  platformFeedbackSeenRef.current,
+                  row.toolCallId,
+                  row.id,
+                )
               }
               publishPlatformEntriesRef.current(
                 merged,
-                latestPlatformRunEntryId(fromArtifacts) || latestPlatformRunEntryId(merged),
+                freshArtifactRows.length
+                  ? latestPlatformRunEntryId(freshArtifactRows) ||
+                      latestPlatformRunEntryId(merged)
+                  : undefined,
+                { announce: freshArtifactRows.length > 0 },
               )
             }
           }
@@ -2046,8 +2068,26 @@ export function createChatWsOnEventHandler(ctx: ChatWsOnEventCtx) {
             }
           }
         }
-        if (!isBackground && aguiEvent.type === EventType.CUSTOM) {
-          const customName = String((aguiEvent as { name?: string }).name || '')
+        // 【self-evolution-bot · 2026-11-21 · 第104轮 · 模型:deepseek-v4.1-flash-1017】
+        // 改了什么：右栏类 custom 事件（right_stage / right_stage_stream）不再被
+        //   ``!isBackground`` 整条丢掉，改由 shouldDispatchRightStageCustom 统一判定；
+        //   其它 custom 事件仍按原样受后台门禁约束。
+        // 为什么（本轮真机实测，用户原话「你现在也控制不了」）：
+        //   · 我的 run 跑在 ``proactive:self-evolution-bot:chat:2026-11-19T16-15-39.290Z``，
+        //     而用户此刻看的会话是 ``agent:main:new-a8d17462`` → 每个事件都判成 isBackground。
+        //   · 后端 writer 正常（``[py] emit sent`` 有 4 条），但前端 store 的 rev 整整
+        //     4 分钟一动不动（CDP 实测 rev=28，同期上报也是 rev=28）——说明事件在**入口**就被丢了，
+        //     根本没进 applyRightStageAgUiCustom。
+        //   · 同一时刻 screenshot/browser 两个签能正常出签并推进 rev，通道本身是通的。
+        // 判据：归属由 applyStageSetPayload 按 payload.sessionKey 判定（后台会话只写冻结记忆、
+        //   不抢前台），入口不提前整条丢弃；恢复验证看 store.rev 是否随 emit 前移。
+        const customName = String(
+          aguiEvent.type === EventType.CUSTOM ? (aguiEvent as { name?: string }).name || '' : '',
+        )
+        if (
+          aguiEvent.type === EventType.CUSTOM &&
+          shouldDispatchRightStageCustom({ isBackground: !!isBackground, customName })
+        ) {
           const customValue = (aguiEvent as { value?: unknown }).value
           if (customName === 'write_file_progress') {
             // content_len / body ticks must force a React bump even when tools[].length is unchanged.
@@ -2188,8 +2228,12 @@ export function createChatWsOnEventHandler(ctx: ChatWsOnEventCtx) {
             aguiEvent.type === EventType.REASONING_START,
         })
           if (aguiEvent.type === 'RUN_FINISHED' || aguiEvent.type === 'RUN_ERROR') {
-          // Computer Use 顶栏：只在 RUN_ERROR 强制收起（中间 RUN_FINISHED 会闪灭）。
-          // 正常 turn 收尾靠 gateway 30s grace + glow-status poll，对齐 ZCode AUTO_HIDE。
+          // Computer Use 顶栏生命周期（开关在后端 cua_glow_state + 前端 poll）：
+          //   开：首个 CUA cell start → pulse_start
+          //   亮着：cell 间隙走 30s grace（同轮下一步继续亮，不许闪灭）
+          //   关：用户停/解除/Esc、RUN_ERROR、grace 到期
+          // 工具循环中间也会冒 RUN_FINISHED —— 若在这里 clear，就会「一步亮、间隙灭、下一步再亮」。
+          // 真正停对话的收回在 stopSessionExecution（revoke + hide）。
           if (aguiEvent.type === 'RUN_ERROR') {
             hideCuaGlowOverlayForced?.()
             void import('../../../lib/cua-glow-poll.js').then((m) => m.clearCuaGlowStatusRemote?.())
@@ -2296,10 +2340,12 @@ export function createChatWsOnEventHandler(ctx: ChatWsOnEventCtx) {
             isBackground,
           }, { store: rightStageStore })
           if (platformEntries.length > 0 && !hasArtifacts) {
-            logRightStage('RUN_FINISHED → publishPlatformEntries')
+            // RESULT / tools-scan 已 toast+announce；终态只静默对齐条目，避免每轮结束再撑开中间通知气泡。
+            logRightStage('RUN_FINISHED → publishPlatformEntries (silent)')
             publishPlatformEntriesRef.current(
               platformEntries,
               latestPlatformRunEntryId(platformEntries),
+              { announce: false },
             )
           } else if (hasArtifacts) {
             logRightStage('RUN_FINISHED → publishArtifacts')

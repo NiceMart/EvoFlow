@@ -10,8 +10,8 @@ import {
   type KeyboardEvent,
   type ReactNode,
 } from 'react'
-import { Loader2, Send, Square, Volume2, VolumeX, X } from 'lucide-react'
-import { api, getGatewayBaseUrl } from '../../lib/tauri-api.js'
+import { Loader2, Pencil, Send, Square, Volume2, VolumeX, X } from 'lucide-react'
+import { api, getGatewayBaseUrl, gatewayProxy } from '../../lib/tauri-api.js'
 import {
   ensureMeReady,
   getCachedMe,
@@ -49,9 +49,12 @@ import {
 } from '../lib/dept-group-audit.js'
 import {
   deptGroupWakeChainKey,
-  isTrivialGroupNestGoal,
   shouldAutoNestWake,
 } from '../lib/dept-group-nest-policy.js'
+// 【self-evolution-bot · 2026-11-20 · 第88轮 · 模型:deepseek-v4.1-flash-1017】
+// 叫醒队列旁路持久化：刷新/断线/崩溃后仍能捡回未完成任务。
+// 旁路=失败静默，编排语义仍在前端 DeptGroupWakeQueue 内，不改变现有行为。
+import { DeptGroupWakePersist } from '../lib/dept-group-wake-persist.js'
 import {
   mergeWakeJobSnapshots,
   resolveMentionDispatchStatus,
@@ -73,6 +76,9 @@ import {
   workSessionKeyForSpeaker,
   type DeptGroupTimelineMsg,
 } from '../lib/dept-group-transcript.js'
+// 【self-evolution-bot · 2026-11-20 · 第88轮 · 模型:deepseek-v4.1-flash-1017】
+// 群近期上下文改按 token 预算裁剪（用户拍板：不按天翻篇，也不该按条数硬编码）
+import { buildRecentGroupContext } from '../lib/dept-group-context.js'
 import {
   isPersonOnDuty,
   personDutyLabel,
@@ -81,6 +87,7 @@ import {
 } from './HomeOrgCommandBoard.js'
 import { EmployeeStageAvatar } from './EmployeeStageAvatar.js'
 import { DeptAvatar } from './DeptAvatar.js'
+import { showEditDeptModal } from '../../lib/proactive-dept-edit.js'
 import {
   enableDeptGroupTtsFromUserGesture,
   isDeptGroupTtsMuted,
@@ -917,6 +924,7 @@ export function HomeDeptGroupChat({
       depth: number
       fromAgentName?: string
       stewardMode?: boolean
+      headDefaultCatcher?: boolean
       contextSummary?: string
       sourceMsgId?: string
       signal: { aborted: boolean }
@@ -1005,6 +1013,7 @@ export function HomeDeptGroupChat({
             attempt: input.attempt,
             depth: input.depth,
             stewardMode: !!input.stewardMode,
+            headDefaultCatcher: !!input.headDefaultCatcher,
             fromAgentName: input.fromAgentName || undefined,
             goal: String(input.goal || '').slice(0, 160),
           },
@@ -1018,6 +1027,7 @@ export function HomeDeptGroupChat({
           groupContext: input.contextSummary || '',
           fromAgentName: input.fromAgentName,
           stewardMode: !!input.stewardMode,
+          headDefaultCatcher: !!input.headDefaultCatcher,
           roster: input.stewardMode
             ? membersRef.current.map((m) => ({
                 agent_code: m.agent_code,
@@ -1164,9 +1174,9 @@ export function HomeDeptGroupChat({
           : await streamBodyIntoBubble(bubbleId, reply)
 
         if (input.depth >= MAX_NEST_DEPTH) return {}
-        // 本轮只是打招呼/回一声：即便模型硬 @ 派活，也不自动接力（防总监借报到开单）
-        if (input.depth >= 1 && isTrivialGroupNestGoal(input.goal)) return {}
-        // 嵌套接力只叫醒部门员工，避免 @小V 自循环
+        // 嵌套接力只叫醒部门员工，避免 @小V 自循环。
+        // 勿因「本轮目标是寒暄」整段 return：负责人被叫醒后 @ 下属做观众口播必须能入队
+        // （逐条用 shouldAutoNestWake / isTrivialGroupNestGoal 判断子目标即可）。
         const nestRoster = membersRef.current.filter(
           (m) => !isDeptGroupStewardCode(m.agent_code),
         )
@@ -1179,7 +1189,7 @@ export function HomeDeptGroupChat({
           const goal =
             extractMentionGoal(finalText, next) ||
             `「${person.role_name}」在群里 @ 了你，请直接在群里回复。`
-          // 成员互相「你也打个招呼」不再自动叫醒；管家首轮分流 (depth=0) 仍可 @ 多人
+          // 成员互相「你也打个招呼」不再自动叫醒；对观众口播/带队发言放行（见 nest-policy）
           if (!shouldAutoNestWake({ fromDepth: input.depth, goal })) continue
           woken.add(next.agent_code)
           nested.push({ person: next, goal })
@@ -1312,6 +1322,19 @@ export function HomeDeptGroupChat({
 
   useEffect(() => {
     const wakeSigByJob = new Map<string, string>()
+    // 【self-evolution-bot · 2026-11-20 · 第88轮 · 模型:deepseek-v4.1-flash-1017】
+    // 叫醒队列旁路持久化实例。transport 直接走网关 HTTP：
+    // 失败（后端未重启到该版本 / 401 / 网络断）由 DeptGroupWakePersist 内部吞掉，
+    // 群聊行为与改造前一致——这是「不破坏现有前端」的硬要求。
+    const persistWake = new DeptGroupWakePersist({
+      transport: {
+        post: (path, body) => gatewayProxy('POST', path, body),
+        get: (path, query) => gatewayProxy('GET', path, null, query),
+      },
+      onError: (where, err) => {
+        console.warn('[dept-group] wake persist failed', where, err)
+      },
+    })
     const q = new DeptGroupWakeQueue({
       run: (input) => runWakeJobRef.current(input),
       onChange: (jobs) => {
@@ -1338,6 +1361,24 @@ export function HomeDeptGroupChat({
               error: j.error || undefined,
               goal: String(j.goal || '').slice(0, 160),
             },
+          })
+          // 【self-evolution-bot · 2026-11-20 · 第88轮 · 模型:deepseek-v4.1-flash-1017】
+          // 旁路持久化：先把「入队」事实抄一份，再同步状态。
+          // 全部 best-effort（persist 内部吞异常），失败只退化成今天的行为。
+          void persistWake.recordEnqueue({
+            jobId: j.id,
+            deptId: dept.id,
+            agentCode: j.agentCode,
+            roleName: j.roleName,
+            goal: j.goal,
+            depth: j.depth,
+            sourceMsgId: j.sourceMsgId,
+          })
+          void persistWake.recordStatus({
+            jobId: j.id,
+            status: j.status,
+            error: j.error,
+            requeue: j.status === 'queued' && j.attempts > 0,
           })
           void persistDeptGroupWakeEvent({
             deptId: dept.id,
@@ -1422,7 +1463,55 @@ export function HomeDeptGroupChat({
       },
     })
     wakeQueueRef.current = q
+    // 【self-evolution-bot · 2026-11-20 · 第88轮 · 模型:deepseek-v4.1-flash-1017】
+    // 恢复上次未完成的任务（刷新/断线/崩溃后）。三条纪律：
+    // 1) 必须走后端 claim，不能直接重排——否则每开一次页面就重跑一轮（重复回复+计费）；
+    // 2) 整个恢复是 best-effort，后端未升级/不可用时什么都不做，行为退化成今天；
+    // 3) 只恢复 queued（已终态的不该再跑）。
+    let restoreCancelled = false
+    void (async () => {
+      try {
+        const pending = await persistWake.loadPending(dept.id)
+        if (restoreCancelled || !pending.length) return
+        const seenAgents = new Set<string>()
+        for (const p of pending) {
+          if (restoreCancelled) return
+          // 同一个人只恢复一条（后端本来就按人串行，多取无益）
+          if (seenAgents.has(p.agent_code)) continue
+          seenAgents.add(p.agent_code)
+          const claimed = await persistWake.claim(dept.id, p.agent_code, 'evopanel')
+          if (!claimed || restoreCancelled) continue
+          const person = membersRef.current.find((m) => m.agent_code === claimed.agent_code)
+          if (!person) {
+            // 成员已不在本部门：任务作废，别让它永远卡在 queued
+            void persistWake.recordStatus({
+              jobId: claimed.job_id,
+              status: 'failed',
+              error: '成员已不在本部门，恢复时作废',
+            })
+            continue
+          }
+          try {
+            await q.enqueue({
+              agentCode: person.agent_code,
+              roleName: person.role_name,
+              goal: claimed.goal,
+              depth: claimed.depth,
+              fromAgentName: claimed.from_agent_name || undefined,
+              stewardMode: claimed.steward_mode,
+              sourceMsgId: claimed.source_msg_id || undefined,
+              chainKey: claimed.chain_key || undefined,
+            })
+          } catch (err) {
+            console.warn('[dept-group] restore enqueue failed', claimed.job_id, err)
+          }
+        }
+      } catch (err) {
+        console.warn('[dept-group] wake restore failed', err)
+      }
+    })()
     return () => {
+      restoreCancelled = true
       q.dispose()
       if (wakeQueueRef.current === q) wakeQueueRef.current = null
     }
@@ -1437,6 +1526,7 @@ export function HomeDeptGroupChat({
       contextSummary?: string
       fromAgentName?: string
       stewardMode?: boolean
+      headDefaultCatcher?: boolean
       sourceMsgId?: string
       chainKey?: string
     }) => {
@@ -1450,6 +1540,7 @@ export function HomeDeptGroupChat({
         contextSummary: opts.contextSummary,
         fromAgentName: opts.fromAgentName,
         stewardMode: opts.stewardMode,
+        headDefaultCatcher: opts.headDefaultCatcher,
         sourceMsgId: opts.sourceMsgId,
         chainKey: opts.chainKey,
       })
@@ -1585,7 +1676,27 @@ export function HomeDeptGroupChat({
     setTtsMuted(isDeptGroupTtsMuted())
     const mentioned = parseMentions(text, roster)
     const goal = stripLeadingMentions(text, mentioned)
-    const { targets, viaSteward } = resolveDeptGroupWakeTargets(mentioned, dept.name)
+    const headCode = String(dept.head_agent_code || '').trim()
+    const headMember = headCode
+      ? members.find((m) => m.agent_code === headCode) ||
+        roster.find((m) => m.agent_code === headCode)
+      : null
+    const fallbackMember =
+      members.find((m) => m.agent_code && m.agent_code !== headCode) || members[0] || null
+    const { targets, viaSteward, viaHeadDefault } = resolveDeptGroupWakeTargets(mentioned, {
+      deptName: dept.name,
+      head: headMember
+        ? { agent_code: headMember.agent_code, role_name: headMember.role_name }
+        : headCode
+          ? {
+              agent_code: headCode,
+              role_name: String(dept.head_role_name || '').trim() || headCode,
+            }
+          : null,
+      fallback: fallbackMember
+        ? { agent_code: fallbackMember.agent_code, role_name: fallbackMember.role_name }
+        : null,
+    })
     const now = Date.now()
     const userMsgId = `user-${now}`
     logDeptGroupWake({
@@ -1593,7 +1704,7 @@ export function HomeDeptGroupChat({
       level: targets.length ? 'info' : 'warn',
       zh: targets.length
         ? `发送 · 点名 ${targets.map((p) => `@${p.role_name}`).join(' ')}${
-            viaSteward ? '（管家接管）' : ''
+            viaHeadDefault ? '（负责人承接）' : viaSteward ? '（管家兜底）' : ''
           }`
         : '发送 · 未能解析到叫醒目标',
       deptId: dept.id,
@@ -1601,6 +1712,7 @@ export function HomeDeptGroupChat({
       sourceMsgId: userMsgId,
       detail: {
         viaSteward,
+        viaHeadDefault,
         mentioned: mentioned.map((m) => m.agent_code),
         targets: targets.map((p) => ({ code: p.agent_code, name: p.role_name })),
         textPreview: text.slice(0, 160),
@@ -1619,28 +1731,24 @@ export function HomeDeptGroupChat({
 
     try {
       // 群近期发言作首轮提示；每人 sticky 会话自带多轮 harness 历史
-      const recentCtx = msgsRef.current
-        .filter((m) => m.kind !== 'system' && !m.streaming && String(m.text || '').trim())
-        .slice(-8)
-        .map((m) => {
-          const who =
-            m.kind === 'user' ? '用户' : String(m.agentName || m.agentCode || '成员')
-          return `${who}：${String(m.text || '').trim().slice(0, 240)}`
-        })
-        .join('\n')
-      // 未 @ → 小V；@ 多人 → 各人入队（同人串行、异人并行；忙则重试）。
+      // 【self-evolution-bot · 2026-11-20 · 第88轮 · 模型:deepseek-v4.1-flash-1017】
+      // 原实现写死「最近 8 条 × 每条 240 字」——条数与真实上下文压力无关：
+      // 8 条长的和 8 条短的能差好几倍 token。改成按 token 预算从新往旧累加。
+      const recentCtx = buildRecentGroupContext(msgsRef.current)
+      // 未 @ → 部门负责人（无负责人再小V 兜底）；@ 多人 → 各人入队。
       // 入队即解锁：不 await 整轮回复，否则输入框被锁到所有目标说完（busy 退避可拖几分钟）。
-      // 回复进度看时间线气泡与派工条。
       void Promise.all(
         targets.map((person) =>
           enqueueWake({
             person,
-            goal: viaSteward
-              ? text
-              : extractMentionGoal(text, person) || goal || text,
+            goal:
+              viaSteward || viaHeadDefault
+                ? text
+                : extractMentionGoal(text, person) || goal || text,
             contextSummary: recentCtx,
             depth: 0,
             stewardMode: viaSteward,
+            headDefaultCatcher: viaHeadDefault,
             sourceMsgId: userMsgId,
             // 首轮也占坑：后面成员再 @ 同一人会被 nestSeen 丢掉
             chainKey: deptGroupWakeChainKey(userMsgId, person.agent_code),
@@ -1752,13 +1860,41 @@ export function HomeDeptGroupChat({
       >
         {isMain ? (
           <header className="dept-im__head dept-im__head--dept">
-            <DeptAvatar avatar={dept.avatar} deptId={dept.id} avatarRev={dept.avatar_rev} name={dept.name} size={36} title={dept.name} />
+            <button
+              type="button"
+              className="dept-im__avatar-btn"
+              title="编辑部门"
+              aria-label={`编辑 ${dept.name}`}
+              onClick={() => {
+                void showEditDeptModal(dept)
+              }}
+            >
+              <DeptAvatar
+                avatar={dept.avatar}
+                deptId={dept.id}
+                avatarRev={dept.avatar_rev}
+                name={dept.name}
+                size={36}
+                title={dept.name}
+              />
+            </button>
             <div className="dept-im__titles">
               <div className="dept-im__title-row">
                 <h3 className="dept-im__title">{dept.name}</h3>
                 {roster.length ? (
                   <span className="evo-home-cmd__gc-badge">{roster.length} 人</span>
                 ) : null}
+                <button
+                  type="button"
+                  className="dept-im__edit-btn"
+                  title="编辑部门"
+                  aria-label={`编辑 ${dept.name}`}
+                  onClick={() => {
+                    void showEditDeptModal(dept)
+                  }}
+                >
+                  <Pencil size={14} strokeWidth={1.75} />
+                </button>
               </div>
               <p className="dept-im__sub">
                 {dept.head_role_name ? `负责人 ${dept.head_role_name}` : '部门群聊'}
@@ -1774,73 +1910,96 @@ export function HomeDeptGroupChat({
                 ) : null}
               </p>
             </div>
-            {ttsUtterance && !ttsMuted ? (
+            <div className="dept-im__head-actions">
+              {ttsUtterance && !ttsMuted ? (
+                <button
+                  type="button"
+                  className="dept-im__tts-btn is-on"
+                  title="停止当前播报"
+                  aria-label="停止当前播报"
+                  onClick={() => {
+                    stopDeptGroupTts()
+                    setTtsUtterance(null)
+                  }}
+                >
+                  <Square size={16} strokeWidth={2} fill="currentColor" />
+                </button>
+              ) : null}
               <button
                 type="button"
-                className="dept-im__tts-btn is-on"
-                title="停止当前播报"
-                aria-label="停止当前播报"
+                className={`dept-im__tts-btn${!ttsMuted ? ' is-on' : ''}`}
+                title={ttsMuted ? '开启语音播报' : '静音语音播报（停播且不自动续播）'}
+                aria-pressed={!ttsMuted}
+                aria-label={ttsMuted ? '开启语音播报' : '静音语音播报'}
                 onClick={() => {
-                  stopDeptGroupTts()
-                  setTtsUtterance(null)
+                  const snapshot = msgsRef.current.map((m) => ({
+                    id: m.id,
+                    kind: m.kind,
+                    agentCode: m.agentCode,
+                    text: m.text,
+                    streaming: m.streaming,
+                    error: m.error,
+                    ts: m.ts,
+                  }))
+                  const nextMuted = toggleDeptGroupTtsMuted(snapshot)
+                  setTtsMuted(nextMuted)
+                  if (!nextMuted) {
+                    void reloadTtsAgents().then((agents) => {
+                      void syncDeptGroupTts({
+                        deptId: dept.id,
+                        open: true,
+                        messages: snapshot,
+                        agents: agents as Array<{ agent_code?: string }>,
+                      })
+                    })
+                  }
                 }}
               >
-                <Square size={16} strokeWidth={2} fill="currentColor" />
+                {ttsMuted ? <VolumeX size={18} strokeWidth={1.75} /> : <Volume2 size={18} strokeWidth={1.75} />}
               </button>
-            ) : null}
-            <button
-              type="button"
-              className={`dept-im__tts-btn${!ttsMuted ? ' is-on' : ''}`}
-              title={ttsMuted ? '开启语音播报' : '静音语音播报（停播且不自动续播）'}
-              aria-pressed={!ttsMuted}
-              aria-label={ttsMuted ? '开启语音播报' : '静音语音播报'}
-              onClick={() => {
-                const snapshot = msgsRef.current.map((m) => ({
-                  id: m.id,
-                  kind: m.kind,
-                  agentCode: m.agentCode,
-                  text: m.text,
-                  streaming: m.streaming,
-                  error: m.error,
-                  ts: m.ts,
-                }))
-                const nextMuted = toggleDeptGroupTtsMuted(snapshot)
-                setTtsMuted(nextMuted)
-                if (!nextMuted) {
-                  void reloadTtsAgents().then((agents) => {
-                    void syncDeptGroupTts({
-                      deptId: dept.id,
-                      open: true,
-                      messages: snapshot,
-                      agents: agents as Array<{ agent_code?: string }>,
-                    })
-                  })
-                }
-              }}
-            >
-              {ttsMuted ? <VolumeX size={18} strokeWidth={1.75} /> : <Volume2 size={18} strokeWidth={1.75} />}
-            </button>
+            </div>
           </header>
         ) : (
           <>
             <header className="evo-home-cmd__detail-head">
               <div className="evo-home-cmd__detail-titles">
                 <div className="evo-home-cmd__detail-title-row">
-                  <DeptAvatar
-                    avatar={dept.avatar}
-                    deptId={dept.id}
-                    avatarRev={dept.avatar_rev}
-                    name={dept.name}
-                    size={36}
-                    title={dept.name}
-                    className="evo-home-cmd__detail-dept-avatar"
-                  />
+                  <button
+                    type="button"
+                    className="evo-home-cmd__detail-dept-avatar-btn"
+                    title="编辑部门"
+                    aria-label={`编辑 ${dept.name}`}
+                    onClick={() => {
+                      void showEditDeptModal(dept)
+                    }}
+                  >
+                    <DeptAvatar
+                      avatar={dept.avatar}
+                      deptId={dept.id}
+                      avatarRev={dept.avatar_rev}
+                      name={dept.name}
+                      size={36}
+                      title={dept.name}
+                      className="evo-home-cmd__detail-dept-avatar"
+                    />
+                  </button>
                   <h3 className="evo-home-cmd__detail-title">
                     {dept.name}
                     {roster.length ? (
                       <span className="evo-home-cmd__gc-badge">{roster.length} 人</span>
                     ) : null}
                   </h3>
+                  <button
+                    type="button"
+                    className="evo-home-cmd__detail-edit"
+                    title="编辑部门"
+                    aria-label={`编辑 ${dept.name}`}
+                    onClick={() => {
+                      void showEditDeptModal(dept)
+                    }}
+                  >
+                    <Pencil className="evo-home-ic" size={14} strokeWidth={1.75} />
+                  </button>
                 </div>
               </div>
               <button type="button" className="evo-home-cmd__detail-close" aria-label="关闭" onClick={onClose}>
@@ -1932,9 +2091,16 @@ export function HomeDeptGroupChat({
         <div className="evo-home-cmd__gc-timeline" ref={listRef} role="log" aria-live="polite">
           {!msgs.length ? (
             <div className="evo-home-cmd__gc-empty">
-              {isMain
-                ? `直接说事，小V会回复、帮你解决问题；或 @${dept.head_role_name || members[0]?.role_name || '技术总监'} 点名`
-                : `直接说事交给小V，或 @${dept.head_role_name || members[0]?.role_name || '技术总监'} 点名`}
+              {(() => {
+                const headLabel =
+                  dept.head_role_name ||
+                  members.find((m) => m.agent_code === dept.head_agent_code)?.role_name ||
+                  members[0]?.role_name ||
+                  '负责人'
+                return isMain
+                  ? `直接说事由「${headLabel}」承接；需要谁就 @成员点名`
+                  : `直接说事交给「${headLabel}」，或 @成员点名`
+              })()}
             </div>
           ) : (
             msgs
@@ -2184,7 +2350,7 @@ export function HomeDeptGroupChat({
                   className="react-chat-input"
                   rows={2}
                   value={draft}
-                  placeholder="直接说事，小V会回复；或 @成员点名…"
+                  placeholder={`直接说事交给${dept.head_role_name || '负责人'}；或 @成员点名…`}
                   onChange={(e) => onDraftChange(e.target.value)}
                   onKeyDown={onKeyDown}
                   disabled={sending}
@@ -2232,7 +2398,7 @@ export function HomeDeptGroupChat({
                 className="evo-home-cmd__gc-input"
                 rows={2}
                 value={draft}
-                placeholder="直接说事交给小V，或 @ 选人…"
+                placeholder={`直接说事交给${dept.head_role_name || '负责人'}，或 @成员…`}
                 onChange={(e) => onDraftChange(e.target.value)}
                 onKeyDown={onKeyDown}
                 disabled={sending}

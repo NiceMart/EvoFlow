@@ -3,9 +3,10 @@
 import os
 from pathlib import Path
 
-from langchain.tools import ToolRuntime, tool
+from langchain_core.tools import tool
 from langgraph.types import Command
 
+from evoflow.core.tool_runtime_type import ToolRuntime
 from evoflow.tools.host_direct.read_logic import apply_whole_file_read_gate, read_file_content
 from evoflow.tools.host_direct.workspace_context import resolve_tool_workspace_root
 from evoflow.tools.host_direct.workspace_path_guard import (
@@ -219,13 +220,30 @@ def _resolve_read_target(path: str, *, runtime: ToolRuntime) -> Path | str:
         return target
 
     root_s, _tid = resolve_tool_workspace_root(runtime=runtime)
+
+    # 【self-evolution-bot · 2026-11-20 · 第89轮 · 模型:deepseek-v4.1-flash-1017】
+    # read 是调用量最高的文件工具（近7天 1549 次），但它**没走** `resolve_tool_path`：
+    # 普通相对路径在这里按「会话工作区根 / 进程 cwd」自己拼，于是第 89 轮给
+    # `resolve_tool_path` 加的「复用 bash 学到的 cwd」对它完全没生效——
+    # 上一笔提交 message 写「read 也生效」是不准确的，这里补上真接线。
+    # 语义取最保守形态：只在 bash cwd 下**真实存在**时采用，否则一律回落旧逻辑。
+    from evoflow.tools.host_direct.workspace_path_guard import _bash_cwd_for_thread
+
+    _bcwd = _bash_cwd_for_thread(_tid, root_s)
+    if _bcwd is not None:
+        _cand = (_bcwd / expanded).resolve()
+        if _cand.is_file():
+            return _cand
+
     if root_s:
         root = Path(os.path.expanduser(os.path.expandvars(root_s))).resolve()
         if not root.is_dir():
             return f"Error: Workspace root is not a directory: {root}"
         target = _resolve_relative_under_root(root, raw.replace("\\", "/"))
+        _base_dir, _base_kind = root, "会话工作区根"
     else:
         target = (Path.cwd() / expanded).resolve()
+        _base_dir, _base_kind = Path.cwd(), "进程当前目录"
 
     if not target.is_file():
         if target.is_dir():
@@ -237,6 +255,17 @@ def _resolve_read_target(path: str, *, runtime: ToolRuntime) -> Path | str:
         # 一起回显，且当工作区根下确实存在同名但不同根的候选时，把「你可能想用仓库绝对路径」
         # 这句也说出来；纯绝对路径入参不重复啰嗦工作区根。
         tried = target
+        # 【self-evolution-bot · 2026-11-19 · 第67轮 · 模型:deepseek-v4.1-flash-1017】
+        # 相对路径找不到时，先沿父目录向上找真实存在的同名文件，别直接报死。
+        # 为什么：网关进程 cwd 是 ``backend/``，而 agent 习惯写**仓库相对**路径
+        # （``backend/packages/.../installer.py``），拼出来就是 ``backend/backend/...``，
+        # 文件明明在却报找不到——现网 obs 实测这类占 read::file 错误的绝大多数。
+        # 往上找是安全的：read 本就是 IDE-like、docstring 明写 without workspace
+        # confinement，不引入新的越权面。命中就当场说清是用哪条路径读到的。
+        if not _is_absolute_path(expanded, expanded):
+            up = _resolve_upward_fallback(target)
+            if up is not None:
+                return up
         detail = f"Error: File not found: {path}（实际查找的绝对路径：{tried}）"
         root_s_hint, _tid2 = resolve_tool_workspace_root(runtime=runtime)
         if root_s_hint and not _is_absolute_path(expanded, expanded):
@@ -245,14 +274,103 @@ def _resolve_read_target(path: str, *, runtime: ToolRuntime) -> Path | str:
                 f"；相对路径是按工作区根 {root_hint} 拼接的，"
                 "仓库内文件请传 D:/... 绝对路径"
             )
+        elif not _is_absolute_path(expanded, expanded):
+            # 未绑定工作区时走 ``Path.cwd()`` 分支，旧代码在这条路上一句提示都不给，
+            # 于是 ``backend/backend/...`` 这种重复前缀没人解释得清。补上。
+            detail += (
+                f"；相对路径是按进程当前目录 {Path.cwd()} 拼接的"
+                "（已向上查找同名文件，未命中）；仓库内文件请传 D:/... 绝对路径"
+            )
+        # 【self-evolution-bot · 2026-11-20 · 第89轮 · 模型:deepseek-v4.1-flash-1017】
+        # 第 89 轮起相对路径会**先**按 bash 学到的 cwd 试一次。若上面报的是工作区根
+        # 或进程 cwd，不再补这一句会让调用方以为没试过 bash 的当前目录。
+        if _bcwd is not None and not _is_absolute_path(expanded, expanded):
+            detail += f"（bash 当前目录 {_bcwd} 下也未命中）"
         return detail
 
+    # 【self-evolution-bot · 2026-11-19 · 第67轮 · 模型:deepseek-v4.1-flash-1017】
+    # 补上成功分支的 return。这里原本**漏了这一行**：`if not target.is_file():` 块内
+    # 每条路径都 return 了错误串，块外却没有 `return target`，于是「相对路径 + 文件确实
+    # 存在」这个最常见的**成功**路径会一路掉到函数末尾，隐式返回 None；上游把它当成
+    # 解析失败，报出 ``could not resolve path 'AGENTS.md' to a file (resolver returned
+    # NoneType)``——文件明明存在（5242B），调用方却只能换写法重试。
+    # 取证：trace 捕获 return 行号 = 231（正是 `if not target.is_file():` 那行，块后无返回），
+    # 入参/expanded/target 全部正常且 target.is_file() 为 True。
+    # 现网后果：read::file 错误后半期 11 次 / 前半期 2 次，绝大多数是这种「存在却报解析失败」。
+    # 第52轮我只在这里补了「拿到非 Path 就报错」的防线，没找到根因，所以 bug 一直在。
+    return target
 
-def _note_model_read(path: Path, *, full_read: bool = True, content_hash: str | None = None) -> None:
+
+def _resolve_upward_fallback(target: Path) -> Path | None:
+    """【self-evolution-bot · 2026-11-19 · 第67轮 · 模型:deepseek-v4.1-flash-1017】
+
+    相对路径拼出的 ``target`` 不存在时，沿父目录向上找**真实存在的同名文件**。
+
+    为什么需要：网关进程 cwd 是 ``backend/``，而 agent 习惯写仓库相对路径
+    （``backend/packages/.../installer.py``），拼出来是 ``backend/backend/...``；
+    文件本身就在，却被报「找不到」。现网 obs 实证：``read::file`` 错误
+    后半期 11 次 / 前半期 2 次，抽样全是这种重复前缀形态。
+
+    安全性：``read`` 的 docstring 明写 IDE-like、``without workspace confinement``，
+    本函数只是把「已经写对的相对路径」认回来，不扩大可读范围——最终返回的路径
+    仍必须是 ``is_file()`` 的真实文件。
+
+    判据：只在**命中真实文件**时返回 Path；找不到返回 ``None``，由调用方照旧报错。
+    不做模糊匹配（同名多份时取最近的一层并保证唯一），避免读错文件。
+    """
+    try:
+        orig = Path(target)
+        name = orig.name
+        # ① 先修「重复前缀」这个真形态：`backend/backend/packages/x.py` 里
+        # ``backend`` 连着出现两次，合并相邻重复段即得真实路径。这比盲目上溯精准，
+        # 也不会把某个无关目录下的同名文件蒙进来。
+        parts = list(orig.parts)
+        dedup: list[str] = []
+        for p in parts:
+            if dedup and p == dedup[-1] and p not in ("\\", "/"):
+                continue
+            dedup.append(p)
+        if len(dedup) != len(parts):
+            cand0 = Path(*dedup)
+            if cand0.is_file():
+                return cand0.resolve()
+
+        # ② 兜底：沿父目录向上，整段相对路径重试（最多 12 层，覆盖
+        # ``backend/backend/`` 这类出一整段重复前缀的场景）。
+        cur = orig.parent
+        for _ in range(12):
+            if cur == cur.parent:
+                break
+            cur = cur.parent
+            if (cur / name).is_file():
+                return (cur / name).resolve()
+            try:
+                rel = orig.relative_to(cur)
+            except ValueError:
+                continue
+            if (cur / rel).is_file():
+                return (cur / rel).resolve()
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _note_model_read(
+    path: Path,
+    *,
+    full_read: bool = True,
+    content_hash: str | None = None,
+    thread_id: str = "",
+) -> None:
     try:
         from evoflow.tools.zcode_port.read_file_state import note_read
 
-        note_read(str(path), full_read=full_read, content_hash=content_hash)
+        note_read(
+            str(path),
+            full_read=full_read,
+            content_hash=content_hash,
+            thread_id=thread_id or None,
+        )
     except Exception:
         return
 
@@ -308,6 +426,14 @@ def read_file_hd(
         run_view_image_refs,
     )
 
+    # 【self-evolution-bot · 2026-11-19 · 第83轮 · 模型:deepseek-v4.1-flash-1017】
+    # 本会话 id：读回执按线程记账，否则别的岗位/别的线程读过的文件会让我这边
+    # 收到「Wasted call，去翻你之前那条 tool_result」——而那条根本不在我上下文里。
+    # 现网 70 次 Wasted call 里 41 次（58.6%）就是这么来的（详见 read_file_state.py）。
+    from evoflow.tools.zcode_port.read_file_state import runtime_thread_id
+
+    _tid = runtime_thread_id(runtime)
+
     # Staged-image Commands must carry the originating tool call id; the real
     # graph always provides it via ToolRuntime (node_repl_tool uses the same
     # pattern — no InjectedToolCallId param, so direct ``.invoke()`` keeps working).
@@ -362,7 +488,7 @@ def read_file_hd(
 
         text = read_pdf_file(resolved, pages=pages)
         if not str(text).startswith("Error:"):
-            _note_model_read(resolved, full_read=False)
+            _note_model_read(resolved, full_read=False, thread_id=_tid)
         return text
     if symbol:
         content = resolved.read_text(encoding="utf-8", errors="replace")
@@ -385,7 +511,7 @@ def read_file_hd(
             text += f"\n\n… [symbol '{symbol}' body is {total} lines; showing first {_SYMBOL_MAX_LINES}. Read the rest with offset={start + _SYMBOL_MAX_LINES}, limit={min(_SYMBOL_MAX_LINES, remaining)}]"
             return text
         text = "\n".join(f"{start + i}: {line}" for i, line in enumerate(body_lines))
-        _note_model_read(resolved, full_read=False)
+        _note_model_read(resolved, full_read=False, thread_id=_tid)
         return text
     # ZCode-style file_unchanged short-circuit: a full-text re-read of an
     # unchanged file returns a one-line marker instead of resending content.
@@ -393,7 +519,7 @@ def read_file_hd(
         try:
             from evoflow.tools.zcode_port.read_file_state import unchanged_since_last_read
 
-            if unchanged_since_last_read(resolved):
+            if unchanged_since_last_read(resolved, thread_id=_tid):
                 return (
                     "Wasted call — file unchanged since your last Read. "
                     "Refer to that earlier tool_result instead. "
@@ -421,5 +547,5 @@ def read_file_hd(
             from evoflow.tools.zcode_port.read_file_state import file_content_hash
 
             content_hash = file_content_hash(resolved)
-        _note_model_read(resolved, full_read=full_read, content_hash=content_hash)
+        _note_model_read(resolved, full_read=full_read, content_hash=content_hash, thread_id=_tid)
     return text

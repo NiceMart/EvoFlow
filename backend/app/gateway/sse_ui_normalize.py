@@ -1246,6 +1246,18 @@ class UiStreamNormalizer:
     tuple_tools_kicked: bool = False
     # tool_call_id 已在本轮向前端下发过；无对应 tool_call 的 tool_result 多为 LangGraph 历史回放。
     emitted_tool_call_ids: set[str] = field(default_factory=set)
+    # 已下发过 tool_result 的 id（values 兜底与 messages 路径去重）。
+    emitted_tool_result_ids: set[str] = field(default_factory=set)
+    # 【self-evolution-bot · 2026-11-23 · 第128轮 · 模型:deepseek-v4.1-flash】
+    # tool_call_id → 真实工具名。为什么必须有它：ToolMessage 在部分路径上退化成
+    # 只有 tool_call_id/type 的形态，`_slim_tool_result_message` 于是把 name 兜底成
+    # 字面量 "tool"，而 `tool_omit_from_chat_panel("tool")` **返回 True** ——
+    # 整条 tool_result 被当成「未知内部工具」静默丢弃，V4 卡永久停在「等待中」。
+    # 现网证据（20 份 sse-recv 全量复算）：search_code_index 5 次调用 4 次没下发
+    # 结果（80%），bash 4%、platform 8%、read 0%；缺失集中在带 queries/read_limit、
+    # 走过 post_search_reads 附赠读取的那几次。START 那一侧名字是全的，
+    # 记下来就能在 RESULT 侧补回去，判据只看「有没有名字」，不看谁发的。
+    tool_call_names: dict[str, str] = field(default_factory=dict)
     # 流式 AI 块：同 id 上 tool_calls 出现前暂存正文，确认带工具则丢弃（非用户可见回复）。
     stream_ai_id: str = ""
     pending_text_by_ai_id: dict[str, str] = field(default_factory=dict)
@@ -1403,7 +1415,6 @@ class UiStreamNormalizer:
         prev_removed = int(prev.get("lines_removed") or 0)
         content = str(fields.get("content") or "")
         old_string = str(fields.get("old_string") or "")
-        prev_content = str(prev.get("content") or "")
         prev_old = str(prev.get("old_string") or "")
         # Body bytes already delivered to the wire.  content_delta needs an
         # anchored path, so body streamed before the path key appears is not
@@ -1411,7 +1422,9 @@ class UiStreamNormalizer:
         # is known, otherwise per-chunk growth deltas would lose that prefix.
         prev_content_sent = int(prev.get("content_sent_len") or 0)
         prev_old_sent = int(prev.get("old_string_sent_len") or 0)
-        content_grew = len(content) > len(prev_content)
+        # 【self-evolution-bot · 2026-11-19 · 第74轮 · 模型:deepseek-v4.1-flash-1017】
+        # 删掉 content_grew：它被下面的 content_pending（按 path 锚定的已发送长度
+        # 比较）取代后再无人读，ruff F841 一直报。保留 old_grew，它仍参与 1434 行判定。
         old_grew = len(old_string) > len(prev_old)
         lines_changed = lines_added != prev_added or lines_removed != prev_removed
         path_now = str(fields.get("path") or prev.get("path") or "").strip()
@@ -1549,6 +1562,19 @@ class UiStreamNormalizer:
             self.emitted_tool_call_ids.add(wire_id)
             if meta is not None:
                 self.block_ledger.register_tool_id(meta.block_id, wire_id)
+            # 【self-evolution-bot · 2026-11-23 · 第128轮 · 模型:deepseek-v4.1-flash】
+            # 这是**唯一在真实路径上**登记 START 的点（`_register_tool_id` 原来没有任何
+            # 调用点，是死函数——我第一版就改在那儿，等于没改）。名字在 chunk 分片里
+            # 常常只出现在第一片，所以要「有就记、没有不擦」。
+            fn = sanitized.get("function")
+            wire_name = str(
+                sanitized.get("name")
+                or sanitized.get("tool_name")
+                or (fn.get("name") if isinstance(fn, dict) else "")
+                or ""
+            ).strip()
+            if wire_name and wire_name.lower() != "tool":
+                self.tool_call_names[wire_id] = wire_name
         if ev_type == "tool_call_chunk":
             payload: dict[str, Any] = {"type": "tool_call_chunk", "chunk": sanitized, "source": source}
             self._wire_block(payload, meta)
@@ -1771,6 +1797,11 @@ class UiStreamNormalizer:
         self.final_text = ""
         self.prev_turn_assistant_id = ""
         self.emitted_tool_call_ids.clear()
+        self.emitted_tool_result_ids.clear()
+        # 【self-evolution-bot · 2026-11-23 · 第128轮 · 模型:deepseek-v4.1-flash】
+        # 与上面两个 set 同生命周期：重锚后 tool_call_id 会重新登记，旧名字留着
+        # 只会把上一轮的 id 映射到这一轮的同名 id（泄漏 + 错名）。
+        self.tool_call_names.clear()
         self.stream_ai_id = ""
         self.pending_text_by_ai_id.clear()
         self.tool_call_ai_ids.clear()
@@ -1787,9 +1818,48 @@ class UiStreamNormalizer:
         self._reset_block_ledger(human_idx)
 
     def _register_tool_id(self, tc_or_chunk: dict[str, Any]) -> None:
+        """登记 tool_call_id（+ 名字）：START 那一侧名字全，RESULT 侧常缺失。
+
+        【self-evolution-bot · 2026-11-23 · 第128轮 · 模型:deepseek-v4.1-flash】
+        为什么需要 name 映射：`_slim_tool_result_message` 对缺 name 的 ToolMessage
+        兜底成字面量 "tool"，而 `tool_omit_from_chat_panel("tool")` 返回 True
+        （把「未知工具」当内部工具隐藏）→ **已有全文的 result 被静默丢弃**，
+        前端卡永久「等待中」。现网 20 份 sse-recv 复算：search_code_index 5 次调用
+        4 次没下发结果（80%），bash 4%、platform 8%、read 0%。
+        接线口径：真实路径的 START 登记在 `_append_write_tool_wire`，
+        本函数保留作为显式手工登记入口（本仓曾有大量「定义了却没人调」的死函数）。
+        """
         cid = str(tc_or_chunk.get("id") or tc_or_chunk.get("tool_call_id") or "").strip()
         if cid:
             self.emitted_tool_call_ids.add(cid)
+        # 只填不覆盖：chunk 分片里 name 往往是空的，别用空值把已记的真名擦掉。
+        if not cid:
+            return
+        fn = tc_or_chunk.get("function")
+        name = str(
+            tc_or_chunk.get("name")
+            or tc_or_chunk.get("tool_name")
+            or (fn.get("name") if isinstance(fn, dict) else "")
+            or ""
+        ).strip()
+        if name and name.lower() != "tool" and cid not in self.tool_call_names:
+            self.tool_call_names[cid] = name
+
+    def _resolve_tool_name_for_result(self, payload: dict[str, Any]) -> str:
+        """RESULT 侧补名：payload 里的名字优先，缺失或退化成 "tool" 时查 START 登记表。
+
+        【self-evolution-bot · 2026-11-23 · 第128轮 · 模型:deepseek-v4.1-flash】
+        为什么必须补：`_slim_tool_result_message` 对缺失 name 的 ToolMessage 兜底成
+        字面量 "tool"，而 `tool_omit_from_chat_panel("tool")` 返回 True（它把
+        「未知工具」当内部工具隐藏）——于是**已有全文的 tool_result 被静默丢弃**，
+        前端卡永久「等待中」。这不是显示问题，是数据没下发。
+        判据：只补名字，不改 content/status；查不到名字时原样返回，不吞不改。
+        """
+        name = str(payload.get("name") or payload.get("tool_name") or "").strip()
+        if name and name.lower() != "tool":
+            return name
+        tcid = str(payload.get("tool_call_id") or payload.get("id") or "").strip()
+        return self.tool_call_names.get(tcid) or name
 
     def _buffer_preanchor_stream(self, root: dict[str, Any]) -> None:
         """按 messages 到达顺序缓冲，锚定后原序重放（避免工具全在顶、正文沉底）。"""
@@ -2089,11 +2159,28 @@ class UiStreamNormalizer:
                 return []
             tool_payload = _slim_tool_result_message(root)
             tcid = str(tool_payload.get("tool_call_id") or tool_payload.get("id") or "").strip()
-            tool_name = str(tool_payload.get("name") or tool_payload.get("tool_name") or "tool").strip()
+            # 【self-evolution-bot · 2026-11-23 · 第128轮 · 模型:deepseek-v4.1-flash】
+            # 先补名再判隐藏：否则 name 缺失被兜底成 "tool" → tool_omit 命中 →
+            # 已落库全文的 result 在这里被静默丢弃，卡永久「等待中」。
+            resolved_name = self._resolve_tool_name_for_result(tool_payload)
+            tool_payload["name"] = resolved_name
+            tool_name = str(resolved_name or "").strip()
             if tool_omit_from_chat_panel(tool_name):
                 return out
-            if not tcid or tcid not in self.emitted_tool_call_ids:
+            if not tcid:
                 return out
+            # 原先：tcid 不在 emitted_tool_call_ids 就丢弃（防历史回放）。
+            # 现网：流式 state 重建 / 锚定清 set 后，search_code_index 等慢工具的
+            # tool_result 被丢掉 → V4 卡永久 inputStreaming（「等待中」+「检索中…」），
+            # 尽管 transcript 已有全文。已锚定则照常下发；mirror 无 START 行时 RESULT
+            # 自己会 no-op，不会造孤儿卡。
+            if tcid not in self.emitted_tool_call_ids:
+                if not self.anchored:
+                    return out
+                self.emitted_tool_call_ids.add(tcid)
+            if tcid in self.emitted_tool_result_ids:
+                return out
+            self.emitted_tool_result_ids.add(tcid)
             result_frame: dict[str, Any] = {
                 "type": "tool_result",
                 "tool": tool_payload,
@@ -2133,6 +2220,24 @@ class UiStreamNormalizer:
         tool_names = [
             str(tc.get("name") or (tc.get("function") or {}).get("name") or "").strip() for tc in turn_calls_for_state if _chat_panel_visible_tool_call(tc) and str(tc.get("name") or (tc.get("function") or {}).get("name") or "").strip()
         ]
+        # 【self-evolution-bot · 2026-11-20 · 第92轮 · 模型:deepseek-v4.1-flash-1017】
+        # 去重（保留**最后一次**出现的位置）再进 thread_state 签名。
+        # 为什么：toolNames 是「本轮用过哪些工具」的集合语义，前端只用最后一个做
+        # 活动详情（`data.toolNames[data.toolNames.length - 1]`，见 ws-client.js）。
+        # 而它在工具调用增加时会变成 ['read','read'] —— 一个纯粹重复的名字却把
+        # dedup 签名改掉，于是每多一次同名工具调用就白推一帧 thread_state，
+        # 正是 test_stream_thread_state_dedup 要守的那类噪声。
+        # 保留最后位置而不是简单 dict.fromkeys：同名工具重跑后，「最近用的是谁」
+        # 这个语义不能变（A,B,A 必须仍然是 A 在末尾）。
+        if tool_names:
+            _seen_names: set[str] = set()
+            _reversed_unique: list[str] = []
+            for _name in reversed(tool_names):
+                if _name in _seen_names:
+                    continue
+                _seen_names.add(_name)
+                _reversed_unique.append(_name)
+            tool_names = list(reversed(_reversed_unique))
         activity_kind, activity_detail, last_assistant_calls = _resolve_thread_activity_from_messages(
             messages,
             human_idx_for_state,
@@ -2202,6 +2307,53 @@ class UiStreamNormalizer:
                     self.tuple_tools_kicked = True
                 out.extend(self._emit_tool_calls_list_passthrough(visible_turn_calls, source="values"))
 
+        # messages 流偶发不推 tool 行时，values 里已有 ToolMessage——补发 tool_result，
+        # 否则 V4 卡永久 inputStreaming（「等待中」），尽管 transcript 已有全文。
+        out.extend(self._emit_tool_results_from_values(messages, human_idx))
+
+        return out
+
+    def _emit_tool_results_from_values(
+        self, messages: list[dict[str, Any]], human_idx: int
+    ) -> EvfPayloadList:
+        """Emit missing tool_result frames from values snapshot for this turn."""
+        if human_idx < 0 or not self.anchored:
+            return []
+        out: EvfPayloadList = []
+        for m in messages[human_idx + 1 :]:
+            if not isinstance(m, dict) or not _is_tool(m):
+                continue
+            tool_payload = _slim_tool_result_message(m)
+            tcid = str(
+                tool_payload.get("tool_call_id") or tool_payload.get("id") or ""
+            ).strip()
+            # 【self-evolution-bot · 2026-11-23 · 第128轮 · 模型:deepseek-v4.1-flash】
+            # 同上：按 **补名后的** 名字判隐藏，且这两条空值是「无法挂载」而非
+            # 「内部工具」——分开判，否则名字缺失时连 tcid 都拿不到却被当成隐藏工具。
+            resolved_name = self._resolve_tool_name_for_result(tool_payload)
+            tool_payload["name"] = resolved_name
+            if tool_omit_from_chat_panel(str(resolved_name or "")):
+                continue
+            if not tcid:
+                continue
+            # 只补「本轮已下发过 START」的结果，避免历史 ToolMessage 回放造卡。
+            if tcid not in self.emitted_tool_call_ids:
+                continue
+            if tcid in self.emitted_tool_result_ids:
+                continue
+            self.emitted_tool_result_ids.add(tcid)
+            result_frame: dict[str, Any] = {
+                "type": "tool_result",
+                "tool": tool_payload,
+                "tool_call_id": tcid,
+                "name": tool_payload.get("name") or tool_payload.get("tool_name") or "tool",
+                "content": tool_payload.get("content"),
+                "status": tool_payload.get("status") or "ok",
+            }
+            if tool_payload.get("truncated"):
+                result_frame["truncated"] = True
+                result_frame["content_bytes"] = tool_payload.get("content_bytes")
+            out.append(_attach_platform_ui_to_tool_result_frame(result_frame, tool_payload))
         return out
 
     def _on_custom(self, data: Any) -> EvfPayloadList:
@@ -2427,6 +2579,10 @@ class UiStreamNormalizer:
             tcid = str(chunk.get("tool_call_id") or "").strip()
             if not tcid:
                 return out
+            if tcid in self.emitted_tool_result_ids:
+                return out
+            self.emitted_tool_call_ids.add(tcid)
+            self.emitted_tool_result_ids.add(tcid)
             tool_name = str(chunk.get("tool_name") or "tool").strip()
             wire_status = str(chunk.get("status") or "ok").strip() or "ok"
             content = chunk.get("content")

@@ -513,6 +513,17 @@ CREATE TABLE IF NOT EXISTS "evoflow_chat_stream_mirror_meta" (
             byte_count       INTEGER NOT NULL DEFAULT 0
         , last_persisted_seq INTEGER NOT NULL DEFAULT 0);
 
+CREATE TABLE IF NOT EXISTS "evoflow_v4_event_log" (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id  TEXT NOT NULL,
+            log_epoch   TEXT NOT NULL DEFAULT '1',
+            seq         INTEGER NOT NULL,
+            op          TEXT NOT NULL,
+            payload     TEXT NOT NULL,
+            created_at  TEXT NOT NULL,
+            UNIQUE(session_id, log_epoch, seq)
+        );
+
 CREATE TABLE IF NOT EXISTS evoflow_collab_peer_messages (
             message_id TEXT NOT NULL PRIMARY KEY,
             main_task_id TEXT NOT NULL,
@@ -1288,6 +1299,33 @@ CREATE TABLE IF NOT EXISTS evoflow_duty_runs (
     updated_at TEXT NOT NULL
 );
 
+-- 【self-evolution-bot · 2026-11-20 · 第88轮 · 模型:deepseek-v4.1-flash-1017】
+-- 部门群聊叫醒队列落库。改前队列只活在前端 `useRef`：刷新/断线/关页面即全部丢失，
+-- 用户看到的是「@ 了人却没回复」，且没有任何记录可查。
+-- 判据要点：`running` 不等于「还活着」——必须看 `heartbeat_at` 是否超时，
+-- 否则前端崩溃留下的 running 行会永久卡住该 agent 的队头。
+CREATE TABLE IF NOT EXISTS evoflow_dept_group_wake_jobs (
+    job_id TEXT PRIMARY KEY,
+    dept_id TEXT NOT NULL DEFAULT '',
+    agent_code TEXT NOT NULL,
+    role_name TEXT NOT NULL DEFAULT '',
+    goal TEXT NOT NULL DEFAULT '',
+    goal_norm TEXT NOT NULL DEFAULT '',
+    depth INTEGER NOT NULL DEFAULT 0,
+    chain_key TEXT NOT NULL DEFAULT '',
+    steward_mode INTEGER NOT NULL DEFAULT 0,
+    from_agent_name TEXT NOT NULL DEFAULT '',
+    source_msg_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'queued',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    owner TEXT NOT NULL DEFAULT '',
+    enqueued_at TEXT NOT NULL DEFAULT '',
+    started_at TEXT NOT NULL DEFAULT '',
+    heartbeat_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
+);
+
 CREATE TABLE IF NOT EXISTS evoflow_session_child_works (
     work_id TEXT PRIMARY KEY,
     session_key TEXT NOT NULL,
@@ -1840,6 +1878,12 @@ CREATE INDEX IF NOT EXISTS idx_evo_chat_shares_session
 CREATE INDEX IF NOT EXISTS idx_evo_chat_stream_mirror_run
             ON evoflow_chat_stream_mirror(session_key, run_id, seq);
 
+CREATE INDEX IF NOT EXISTS idx_v4_event_log_session
+            ON evoflow_v4_event_log(session_id, log_epoch, seq);
+
+CREATE INDEX IF NOT EXISTS idx_v4_event_log_created
+            ON evoflow_v4_event_log(created_at);
+
 CREATE INDEX IF NOT EXISTS idx_evo_collab_exec_hist_main
     ON evoflow_collab_task_execution_history(main_task_id, parent_task_id, subtask_id);
 
@@ -2290,6 +2334,12 @@ _POST_BASELINE_TABLES: tuple[str, ...] = (
     "evoflow_departments",
     "evoflow_role_push_bindings",
     "evoflow_v4_session_goals",
+    # 【self-evolution-bot · 2026-11-20 · 第88轮 · 模型:deepseek-v4.1-flash-1017】
+    # 群叫醒队列落库；已 stamped 的库靠这条 backfill 建表。
+    "evoflow_dept_group_wake_jobs",
+    # 【lifecycle · 2026-11-21】v4 权威 delta 日志持久化（ZCode durable event 语义）：
+    # 发送/停止/流式每一帧 delta 落库，事后审计「这条流/轮发生了什么、断在哪」。
+    "evoflow_v4_event_log",
 )
 
 

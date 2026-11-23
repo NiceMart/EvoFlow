@@ -1,4 +1,4 @@
-mod commands;
+pub mod commands;
 mod models;
 mod power;
 mod tray;
@@ -7,7 +7,7 @@ mod voice_hotkey;
 
 use commands::{
     app_server, assistant, backend, boot_cycle, browser_embed, browser_embed_bridge, config,
-    cua_glow_overlay, export_logs, gateway, logs, mcp_market, resource_manager, ui_extensions,
+    cua_glow_overlay, cua_glow_ring, export_logs, gateway, logs, mcp_market, resource_manager, ui_extensions,
     update, voice_overlay, wake_kws,
 };
 /// Windows-only: expose WebView2 CDP commands directly to Python over HTTP invoke.
@@ -171,6 +171,10 @@ pub fn run() {
                                 commands::main_popup_guard::install_main_window_popup_guard(
                                     &guard_app,
                                 );
+                                // OOM sad tab → 宿主自动 Reload 一次（冷却内不连环刷）。
+                                commands::main_oom_autoreload::install_main_window_oom_autoreload(
+                                    &guard_app,
+                                );
                                 return;
                             }
                             std::thread::sleep(std::time::Duration::from_millis(250));
@@ -222,14 +226,15 @@ pub fn run() {
                 })
                 .map_err(|e| format!("启动内置后端线程失败: {e}"))?;
 
-            // 日志保留：日切 14 天 + stream-compare 短窗 + debug/ 3 天。
-            // 启动先跑一次，之后每 6 小时；失败仅日志，不影响启动。
+            // 日志保留：日切 14 天 + stream-compare 默认 3h + debug/ 3 天 + 全局磁盘配额兜底。
+            // 启动先跑一次，之后每 30 分钟（匹配小时级 stream-compare 窗口）；失败仅日志。
             std::thread::Builder::new()
                 .name("log-pruner".into())
                 .spawn(|| {
                     use commands::log_files::{
-                        debug_logs_dir, prune_all_daily_logs, prune_debug_logs_dir,
-                        prune_stream_compare_logs, DEFAULT_EXPORT_LOOKBACK_DAYS,
+                        debug_logs_dir, enforce_logs_disk_quota, prune_all_daily_logs,
+                        prune_debug_logs_dir, prune_stream_compare_logs,
+                        DEFAULT_EXPORT_LOOKBACK_DAYS,
                     };
                     use std::time::Duration;
                     let logs = commands::evoflow_dir().join("logs");
@@ -257,10 +262,20 @@ pub fn run() {
                             Ok(_) => {}
                             Err(e) => eprintln!("[log-pruner] debug 清理失败: {e}"),
                         }
+                        // 全局配额 LRU 兜底：不管过期与否，总量超限就从最旧开始删。
+                        match enforce_logs_disk_quota(&logs) {
+                            Ok((removed, remaining, max)) if removed > 0 => eprintln!(
+                                "[log-pruner] 磁盘配额清理 {removed} 个文件，logs 现 {}MB / 上限 {}MB",
+                                remaining / (1024 * 1024),
+                                max / (1024 * 1024)
+                            ),
+                            Ok(_) => {}
+                            Err(e) => eprintln!("[log-pruner] 磁盘配额清理失败: {e}"),
+                        }
                     };
                     tick();
                     loop {
-                        std::thread::sleep(Duration::from_secs(6 * 60 * 60));
+                        std::thread::sleep(Duration::from_secs(30 * 60));
                         tick();
                     }
                 })
@@ -457,6 +472,10 @@ pub fn run() {
             export_logs::export_logs,
             cua_glow_overlay::cua_glow_overlay_show,
             cua_glow_overlay::cua_glow_overlay_hide,
+            cua_glow_overlay::cua_glow_overlay_stop,
+            cua_glow_overlay::cua_glow_overlay_step,
+            cua_glow_ring::cua_glow_ring_show,
+            cua_glow_ring::cua_glow_ring_hide,
             wake_kws::wake_kws_start,
             wake_kws::wake_kws_feed_pcm,
             wake_kws::wake_kws_pause,

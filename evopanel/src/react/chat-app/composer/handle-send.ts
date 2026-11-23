@@ -9,6 +9,7 @@ import type { ContextFileEntry } from '../../components/WorkspaceFileTree.js'
 import type { SkillSelection } from '../../components/SkillPickerModal.js'
 import type { PluginSelection } from '../../components/PluginPickerModal.js'
 import type { PriorTurnStripBundle } from '../../lib/turn-text-isolation.js'
+import { setPendingOptimisticMessageId } from '../../v4/optimisticUserInput.js'
 import {
   bindChatTurnSendSession,
   describeStalledPriorSend,
@@ -122,7 +123,6 @@ export async function handleSend(
     setExpectedChatRunId,
     setLiveTurnAssistantRunId,
     setLiveTurnTokens,
-    setPlatformFocusEntryId,
     setPluginComposerPillsVisible,
     setRoleUiNonce,
     setPreferHomeDashboard,
@@ -425,6 +425,9 @@ export async function handleSend(
     const noActiveSession = !activeSk
     if (isCurrentSession || noActiveSession) {
       if (noActiveSession) sessionRef.current = sessionKey
+      // id 先于文本落账：echo/认领走 entityId 精确匹配（对齐 ZCode sourceCommandId 语义），
+      // 文本 endsWith 匹配降级为无 id 兜底（长回合把 userInput 挤出尾窗时文本匹配永不命中）。
+      setPendingOptimisticMessageId(sessionKey, optimisticMessageId)
       setPendingOptimisticUserText?.(userMessage)
       setSessionHadContent(true)
       if (opts?.leaveHomeOnPaint) setPreferHomeDashboard?.(false)
@@ -543,10 +546,33 @@ export async function handleSend(
     rtAddStaleToolCallIds(rtSend, priorStripBundle.toolIds)
     rtSend.stream = emptyStream()
     rtSend.stream.aguiTurn = emptyAgUiTurnState('', '')
+    // 封存上一轮工具 id：MESSAGES_SNAPSHOT 常带回历史 platform 工具；若不封存会灌进
+    // 新 turn.tools，随后 tools-scan 把已通知过的结果再 toast 一遍（中间气泡重放）。
+    {
+      const seal = rtSend.stream.aguiTurn.sealedToolIds
+      for (const id of priorStripBundle.toolIds || []) {
+        const s = String(id || '').trim()
+        if (s) seal.add(s)
+      }
+      for (const id of rtSend.staleToolCallIds || []) {
+        const s = String(id || '').trim()
+        if (s) seal.add(s)
+      }
+      for (const id of platformFeedbackSeenRef.current) {
+        const s = String(id || '').trim()
+        if (!s) continue
+        seal.add(s)
+        if (s.startsWith('platform:')) {
+          const bare = s.slice('platform:'.length).trim()
+          if (bare) seal.add(bare)
+        }
+      }
+    }
     rtSend.seenRunIds = []
     rightStageRunIdRef.current = `run-${Date.now()}`
     dismissedRightStageKindsRef.current = new Set()
-    platformFeedbackSeenRef.current = new Set()
+    // 平台 toast / 摘要「平台」tab：seen 跨回合保留（对齐 seenArtifacts）。
+    // 旧逻辑每发必清空 → tools-scan / chat_artifacts / RESULT 把历史平台结果当新通知再推一遍。
     writeStreamDismissedRef.current = false
     turnRunArtifactsRef.current = []
     turnPlatformEntriesRef.current = []
@@ -628,7 +654,8 @@ export async function handleSend(
         if (!tailSame) setRows([...next])
       }
       setTurnPlatformEntries([])
-      setPlatformFocusEntryId('')
+      // 勿清 platformFocus：清掉后再被 chat_artifacts/历史扫描写回同 id，
+      // ChatSummaryPanel 会当成「新通知」再撑开右上角平台卡。
       setTurnArtifacts([])
       setArtifactFocusId('')
       setStreamingWritePreview(null)

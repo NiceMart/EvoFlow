@@ -576,12 +576,24 @@ def build_duty_beat_text(
     prompt: str,
     kind: str = "think",
     from_agent: str = "",
+    plain_user_chat: bool = False,
 ) -> str:
     """Short human-facing duty open line for the work-process timeline.
 
     ``think`` / patrol: one line (no「本轮值班开始」prefix). Dispatch names who
     sent the work (user display name / employee / 小V). ``execute`` keeps
     「开始执行」— same task's second phase, not a new duty shift.
+
+    【self-evolution-bot · 2026-11-21 · 第107轮 · 模型:deepseek-v4.1-flash-1017】
+    改了什么：新增 ``plain_user_chat``，为真时派发行只保留目标原文，不加
+      「推进{谁}派发：」前缀。
+    为什么（用户原话「为啥总是要这样去显示呀？就相当于是正常说话就行了，
+      不要说什么'谁推进小微派发'，这干嘛呀这是！」）：员工对话（``wk == "chat"``）
+      里那条 beat 会被当成 **user 角色的消息**落进 transcript，前端再按
+      ``isDutyBeatUserText`` 渲染成灰色节拍条 —— 等于用户正常说一句话，
+      系统却替他造了一句「推进小V派发：…」放在对话里。派发语义属于
+      值班/派单回合，不属于人跟员工聊天。
+    判据：chat 回合的 beat 必须逐字等于用户自己那句话；仍带前缀 = 没修好。
     """
     name = str(role_name or "").strip() or "智能体员工"
     body = str(prompt or "")
@@ -592,8 +604,13 @@ def build_duty_beat_text(
         return f"开始执行 · {name}\n按已批计划执行并结案。"
 
     if "### 用户派发任务" in body or "用户派发目标" in body:
-        who = _dispatcher_label_from_prompt(body, from_agent=from_agent)
         goal = _dispatch_goal_from_prompt(body)
+        # 人跟员工聊天：不加「推进X派发：」前缀，原话怎么写就怎么显示。
+        if plain_user_chat:
+            if goal:
+                return goal[:72] if len(goal) <= 72 else goal[:71] + "…"
+            return str(body or "").strip()[:72]
+        who = _dispatcher_label_from_prompt(body, from_agent=from_agent)
         if goal:
             if len(goal) > 72:
                 goal = goal[:71] + "…"
@@ -780,8 +797,56 @@ def prepare_proactive_chat_session(
             try:
                 from evoflow.persistence.db import get_db, run_db_with_retry
 
+                # 【self-evolution-bot · 2026-11-22 · 第125轮 · 模型:deepseek-v4.1-flash】
+                # 改了什么：除了「thread_id 为空才写」，再加一条「本会话是 task 桶、
+                #   而现有绑定指向的不是本任务的 task 桶」时也改写。
+                # 为什么（用户「task 那个老是误导别人」+ 现网数据复算 2026-11-22）：
+                #   派单先落到发起人 chat 会话时，这条语句就把**发起对话**的 thread 写进
+                #   task.thread_id；等真正的执行会话（proactive:{code}:task:{id}）建好，
+                #   条件已不成立 → 执行记录永远挂不上。实测 40 条带 thread_id 的任务里
+                #   16 条如此（例：task 2611221757_60a8 的 thread 指向该员工的 chat 会话
+                #   28 条普通聊天，真执行记录在 task 桶 5 条里）。
+                # 判据：只有 task 桶会话有权覆盖既有绑定 —— chat/duty 桶绝不许抢执行会话的位子，
+                #   否则「人工在普通对话里顺嘴派一句」会把任务过程又搬回普通对话。
+                # 边界：collab/工作流的 thread（不是 proactive 桶）一律不动。
+                _parsed_sk = parse_proactive_session_key(sk)
+                is_task_bucket = (
+                    _parsed_sk.get("kind") == "task"
+                    and str(_parsed_sk.get("task_id") or "").strip()
+                    == str(related_task).strip()
+                )
+
                 def _bind_task_thread() -> None:
                     conn = get_db()
+                    if is_task_bucket:
+                        row = conn.execute(
+                            "SELECT thread_id FROM evoflow_collab_tasks WHERE task_id = ?",
+                            (related_task,),
+                        ).fetchone()
+                        cur_tid = str((row["thread_id"] if row is not None else "") or "").strip()
+                        if cur_tid == str(tid).strip():
+                            return
+                        if cur_tid:
+                            cur_sk = str(
+                                sess_repo.find_session_key_by_thread_id(cur_tid) or ""
+                            ).strip()
+                            cur_parsed = parse_proactive_session_key(cur_sk)
+                            # 已绑到本任务的 task 桶 → 尊重既有绑定，不来回改；
+                            # 绑到 proactive 的别的桶（chat/duty）或无会话键 → 由本任务专用会话接管。
+                            if (
+                                cur_parsed.get("kind") == "task"
+                                and str(cur_parsed.get("task_id") or "").strip()
+                                == str(related_task).strip()
+                            ):
+                                return
+                            if cur_sk and not cur_sk.startswith("proactive:"):
+                                return
+                        conn.execute(
+                            "UPDATE evoflow_collab_tasks SET thread_id = ? WHERE task_id = ?",
+                            (tid, related_task),
+                        )
+                        conn.commit()
+                        return
                     conn.execute(
                         """
                         UPDATE evoflow_collab_tasks
@@ -843,7 +908,16 @@ def prepare_proactive_chat_session(
             principal_id=identity_pid,
         )
 
-        beat = build_duty_beat_text(role_name=role_name, prompt=body, kind=kind)
+        # 【self-evolution-bot · 2026-11-21 · 第107轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：chat 会话（人跟员工正常说话）的 beat 不再带「推进X派发：」前缀。
+        # 为什么：这条 beat 是以 role="user" 落进 transcript 的，带前缀等于系统
+        #   替用户造了一句机器话（用户原话：「就相当于是正常说话就行了」）。
+        beat = build_duty_beat_text(
+            role_name=role_name,
+            prompt=body,
+            kind=kind,
+            plain_user_chat=(wk == "chat"),
+        )
         try:
             from evoflow.persistence.chat_message_repositories import transcript_duplicate_exists
 
@@ -995,3 +1069,154 @@ def list_employee_conversation_sessions(
         if len(out) >= lim:
             break
     return out
+# 【self-evolution-bot · 2026-11-20 · 第97轮 · 模型:deepseek-v4.1-flash-1017】
+# 改了什么：新增 `latest_human_session_key()`——按**真人发言时间**找该岗位最新的对话屏。
+# 为什么（本轮现网取证，已复算）：重启后的自唤醒不是没发生，是**投错了屏**。
+#   2026-11-20 17:45:11 自验证脚本把 sessionKey 写进 state.json（当时确实是最新屏
+#   …16-15-39.290Z，最后真人发言 17:43:29）；17:45:27 用户在**另一屏**
+#   （…16-17-14-53.207Z）发话；17:47:08 看门狗照旧键 wake，消息投进 16-15-39.290Z。
+#   用户等的那一屏直到 17:56 才有下一条消息 —— 界面表现就是「重启完卡在那里」。
+# 结论：会话键**不能在注册时快照、投递时盲用**，必须在投递时按「谁最近说过话」重算。
+# 判据（不是猜的，已用现网全量反向验证）：面板真人消息的 content_json 形如
+#   {"content":[{"type":"text",...}]} —— `json_type(content_json,'$.content')='array'`；
+#   系统注入（<task-notification> / [CONTEXT COMPACTION / # 值班 / 推进…）一律是纯 str。
+#   现网 6000 条 user 消息分桶：array=2061（真人，0 条带系统前缀）、text=2131（全系统注入）。
+def latest_human_session_key(
+    agent_code: str,
+    *,
+    kinds: list[str] | None = None,
+    limit: int = 8,
+) -> tuple[str, str]:
+    """Return ``(session_key, last_human_at)`` for the employee's newest human-active screen.
+
+    「真人发言」= Panel 发出的消息（content 是片段数组），**不含**系统注入的
+    task-notification / 上下文压缩 / 值班简报。这些注入必须排除：它们发生在被唤醒之后，
+    算进去就会把「刚被系统写过的会话」误当成「用户正在看的会话」。
+
+    ``kinds`` 默认只看 ``chat`` 桶；task/duty 会话是工作轨迹，不是用户对着说话的屏。
+    返回 ``("", "")`` 表示没有任何真人发言记录。
+    """
+    code = str(agent_code or "").strip()
+    if not code:
+        return "", ""
+    lim = max(1, min(int(limit), 50))
+    kind_filter = {str(k).strip().lower() for k in (kinds or ["chat"]) if str(k).strip()}
+    prefix = f"proactive:{code}"
+    try:
+        from evoflow.persistence.db import get_db
+
+        rows = (
+            get_db()
+            .execute(
+                """
+                SELECT m.session_key AS sk,
+                       MAX(julianday(m.created_at)) AS last_jd,
+                       MAX(m.created_at) AS last_at
+                FROM evoflow_chat_messages m
+                JOIN evoflow_chat_sessions s ON s.session_key = m.session_key
+                WHERE m.role = 'user'
+                  AND s.is_deleted = 0
+                  AND (s.session_key = ? OR s.session_key LIKE ?)
+                  AND CASE WHEN json_valid(m.content_json)
+                           THEN json_type(m.content_json, '$.content') END = 'array'
+                GROUP BY m.session_key
+                ORDER BY last_jd DESC
+                LIMIT ?
+                """,
+                (prefix, f"{prefix}:%", lim * 3),
+            )
+            .fetchall()
+        )
+    except Exception:
+        logger.debug("latest_human_session_key failed code=%s", code, exc_info=True)
+        return "", ""
+
+    for row in rows:
+        sk = str(row["sk"] or "").strip()
+        if not sk:
+            continue
+        parsed = parse_proactive_session_key(sk)
+        if str(parsed.get("agent_code") or "").strip() != code:
+            continue
+        if parsed.get("legacy"):
+            continue
+        if kind_filter and str(parsed.get("kind") or "legacy").lower() not in kind_filter:
+            continue
+        return sk, str(row["last_at"] or "").strip()
+    return "", ""
+
+
+# 【self-evolution-bot · 2026-11-20 · 第97轮 · 模型:deepseek-v4.1-flash-1017】
+# 改了什么：新增 `prefer_newest_human_session()`——投递前用「谁最近说过话」校正钉住的会话键。
+# 为什么：见上面 `latest_human_session_key` 的现网取证。钉住的键在注册时是对的、投递时
+# 已过期（中间只隔 2 分钟，用户换了屏）。所以校正必须发生在**投递时**。
+# 边界（防误伤）：① 只在调用方**显式钉了**会话键时校正 —— 空键走原 task/duty 分桶，
+# 对心跳/协作派发零影响；② 目标键本身还有新鲜真人发言就**不动**（多屏同时用的情况）；
+# ③ 只有新屏比旧屏新出 ``min_gap_s`` 以上才切换，避免同一秒内的写入竞争；
+# ④ 新键同样过 `normalize_pinned_session_key`（归属校验），不属于该岗位一律丢弃。
+def prefer_newest_human_session(
+    agent_code: str,
+    pinned_session_key: str | None,
+    *,
+    min_gap_s: float = 60.0,
+) -> tuple[str, str]:
+    """Return ``(session_key, reason)`` — corrected pin when the user moved to another screen.
+
+    ``reason``: ``kept``(钉住的键仍是最新屏) / ``retargeted``(换到新屏) / ``unpinned``(入参为空)。
+    """
+    pinned = str(pinned_session_key or "").strip()
+    if not pinned:
+        return "", "unpinned"
+    newest, newest_at = latest_human_session_key(agent_code)
+    if not newest or newest == pinned:
+        return pinned, "kept"
+
+    from evoflow.persistence.timestamps import iso_z_to_ms
+
+    newest_ms = iso_z_to_ms(newest_at) if newest_at else 0
+    if newest_ms <= 0:
+        return pinned, "kept"
+
+    pinned_ms = _session_last_human_ms(pinned)
+    if pinned_ms and (newest_ms - pinned_ms) < max(0.0, float(min_gap_s)) * 1000.0:
+        return pinned, "kept"
+
+    if not normalize_pinned_session_key(agent_code, newest):
+        return pinned, "kept"
+    return newest, "retargeted"
+
+
+def _session_last_human_ms(session_key: str) -> float:
+    """Epoch-ms of the last human-typed message in one session (0 when none)."""
+    sk = str(session_key or "").strip()
+    if not sk:
+        return 0.0
+    try:
+        from evoflow.persistence.db import get_db
+
+        row = (
+            get_db()
+            .execute(
+                """
+                SELECT MAX(created_at) AS last_at
+                FROM evoflow_chat_messages
+                WHERE session_key = ?
+                  AND role = 'user'
+                  AND CASE WHEN json_valid(content_json)
+                           THEN json_type(content_json, '$.content') END = 'array'
+                """,
+                (sk,),
+            )
+            .fetchone()
+        )
+    except Exception:
+        logger.debug("_session_last_human_ms failed session=%s", sk, exc_info=True)
+        return 0.0
+    if not row:
+        return 0.0
+    last_at = str(row["last_at"] or "").strip()
+    if not last_at:
+        return 0.0
+    from evoflow.persistence.timestamps import iso_z_to_ms
+
+    return iso_z_to_ms(last_at)

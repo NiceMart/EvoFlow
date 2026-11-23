@@ -24,6 +24,8 @@ def _headers(session_id: str) -> list[dict[str, Any]]:
 def mirror_session(monkeypatch: pytest.MonkeyPatch) -> str:
     # 确保镜像开启（环境可能在 CI 关掉）
     monkeypatch.setattr("app.gateway.v4.agui_mirror._MIRROR_DISABLED", False)
+    # 单测要立刻断言占位；生产默认延后 2.5s 防「先闪未产出」
+    monkeypatch.setattr("app.gateway.v4.agui_mirror._EMPTY_RUN_DEFER_SEC", 0.0)
     sid = "mirror-multi-turn-test"
     # 清掉同名会话，避免跨用例污染
     if sid in getattr(HUB, "_sessions", {}):
@@ -64,8 +66,58 @@ def test_empty_stream_retry_does_not_duplicate_user_input(mirror_session: str) -
     assert len(headers) == 2
     assert headers[0]["turnId"] == "run-first"
     assert headers[0]["state"] == "failed"
+    # 用户气泡已挂到 run-retry：旧头不得再自称 userInput（否则 !NO_USER）
+    assert headers[0]["origin"] == "goalContinuation"
     assert headers[1]["turnId"] == "run-retry"
     assert headers[1]["state"] == "running"
+
+
+def test_steal_user_from_completed_turn_demotes_old_header(mirror_session: str) -> None:
+    """已完成轮的 userInput 被挂到新 run 后，旧头必须降成 goalContinuation。
+
+    现场诊断：#1 turnHeader(origin=userInput)+assistant 无用户；#2 user.rowId < header。
+    """
+    tid = mirror_session + "-steal-completed"
+    if tid in getattr(HUB, "_sessions", {}):
+        del HUB._sessions[tid]  # noqa: SLF001
+    mirror = V4Mirror(HUB)
+
+    mirror.note_user_input(tid, "欢迎一下", message_id="user-msg-welcome")
+    mirror.feed_events(
+        tid,
+        [
+            {"type": "RUN_STARTED", "threadId": tid, "runId": "8c5caa19-8390-4aaa-bbbb-cccccccccccc"},
+            {"type": "TEXT_MESSAGE_START", "messageId": "m-welcome"},
+            {
+                "type": "TEXT_MESSAGE_CONTENT",
+                "messageId": "m-welcome",
+                "delta": "哈哈，欢迎欢迎",
+            },
+            {"type": "TEXT_MESSAGE_END", "messageId": "m-welcome"},
+            {"type": "RUN_FINISHED", "threadId": tid, "runId": "8c5caa19-8390-4aaa-bbbb-cccccccccccc"},
+        ],
+    )
+    # 同 message_id 再开新 run（retry / 乱序 START）：用户气泡挂走，旧头曾变成 !NO_USER
+    mirror.note_user_input(tid, "欢迎一下", message_id="user-msg-welcome")
+    mirror.feed_events(
+        tid,
+        [
+            {"type": "RUN_STARTED", "threadId": tid, "runId": "run-e0d357f6"},
+            {"type": "TEXT_MESSAGE_START", "messageId": "m2"},
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "m2", "delta": "在的，随时说。"},
+            {"type": "TEXT_MESSAGE_END", "messageId": "m2"},
+            {"type": "RUN_FINISHED", "threadId": tid, "runId": "run-e0d357f6"},
+        ],
+    )
+
+    users = [r for r in _rows(tid) if r.get("kind") == "userInput"]
+    assert len(users) == 1
+    assert users[0]["turnId"] == "run-e0d357f6"
+
+    headers = {h["turnId"]: h for h in _headers(tid)}
+    assert headers["8c5caa19-8390-4aaa-bbbb-cccccccccccc"]["origin"] == "goalContinuation"
+    assert headers["run-e0d357f6"]["origin"] == "userInput"
+    assert headers["run-e0d357f6"]["state"] == "completedSuccess"
 
 
 def test_prior_reset_without_user_reuses_turn_not_orphan_header(mirror_session: str) -> None:
@@ -332,6 +384,57 @@ def test_empty_finished_writes_visible_notice(mirror_session: str) -> None:
     assert str(texts[0].get("entityId") or "").startswith("empty-run-")
     assert "未产出可见回复" in str(texts[0].get("text") or "")
     assert texts[0]["turnId"] == "run-empty"
+
+
+def test_deferred_empty_run_cancelled_by_late_text(
+    mirror_session: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """过早 FINISHED 后马上迟到 TEXT：延时占位必须取消，禁止先闪「未产出」。"""
+    import time
+
+    monkeypatch.setattr("app.gateway.v4.agui_mirror._EMPTY_RUN_DEFER_SEC", 0.35)
+    tid = mirror_session + "-defer-cancel"
+    if tid in getattr(HUB, "_sessions", {}):
+        del HUB._sessions[tid]  # noqa: SLF001
+    mirror = V4Mirror(HUB)
+    mirror.note_user_input(tid, "hi", message_id="u-defer-1")
+    mirror.feed_events(
+        tid,
+        [
+            {"type": "RUN_STARTED", "threadId": tid, "runId": "run-defer"},
+            {"type": "RUN_FINISHED", "threadId": tid, "runId": "run-defer"},
+        ],
+    )
+    # 延时期间尚无占位
+    assert not [
+        r
+        for r in _rows(tid)
+        if r.get("kind") == "assistantText"
+        and str(r.get("entityId") or "").startswith("empty-run-")
+    ]
+    mirror.feed_events(
+        tid,
+        [
+            {"type": "TEXT_MESSAGE_START", "messageId": "m-defer"},
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "m-defer", "delta": "在的"},
+            {"type": "TEXT_MESSAGE_END", "messageId": "m-defer"},
+        ],
+    )
+    time.sleep(0.45)
+    notices = [
+        r
+        for r in _rows(tid)
+        if r.get("kind") == "assistantText"
+        and str(r.get("entityId") or "").startswith("empty-run-")
+        and not str(r.get("entityId") or "").startswith("empty-run-cleared-")
+    ]
+    assert notices == []
+    texts = [
+        r
+        for r in _rows(tid)
+        if r.get("kind") == "assistantText" and str(r.get("text") or "").strip() == "在的"
+    ]
+    assert len(texts) == 1
 
 
 def test_second_run_gets_fresh_running_turn_header(mirror_session: str) -> None:
@@ -682,6 +785,81 @@ def test_late_tool_result_after_run_finished_recovers_cancelled_row(
     assert int(tool.get("startedAt") or 0) == int(sealed.get("startedAt") or sealed.get("createdAt") or 0)
 
 
+def test_late_tool_end_result_does_not_steal_into_new_turn(mirror_session: str) -> None:
+    """新轮已开时，上一轮 toolCallId 的迟到 END/RESULT 不得改写 turnId。
+
+    现场：user#2162 turn=run-4a35… 下挂 row#2007 旧 bash（RESULT 用 st.turn_id 覆盖）。
+    """
+    tid = mirror_session + "-no-steal"
+    if tid in getattr(HUB, "_sessions", {}):
+        del HUB._sessions[tid]  # noqa: SLF001
+    mirror = V4Mirror(HUB)
+
+    mirror.note_user_input(tid, "查蓝光")
+    mirror.feed_events(
+        tid,
+        [
+            {"type": "RUN_STARTED", "threadId": tid, "runId": "run-old"},
+            {
+                "type": "TOOL_CALL_START",
+                "toolCallId": "tc-old-bash",
+                "toolCallName": "bash",
+            },
+            {
+                "type": "TOOL_CALL_ARGS",
+                "toolCallId": "tc-old-bash",
+                "delta": '{"command":"grep glow"}',
+            },
+            {"type": "TOOL_CALL_END", "toolCallId": "tc-old-bash"},
+            {
+                "type": "TOOL_CALL_RESULT",
+                "toolCallId": "tc-old-bash",
+                "content": "ring show ok",
+                "status": "success",
+            },
+            {"type": "RUN_FINISHED", "threadId": tid, "runId": "run-old"},
+        ],
+    )
+    old_tool = next(r for r in _rows(tid) if r.get("kind") == "toolCall")
+    assert old_tool["turnId"] == "run-old"
+    old_rid = int(old_tool["rowId"])
+
+    mirror.note_user_input(tid, "我已经重启好了，你试一下")
+    mirror.feed_events(
+        tid,
+        [{"type": "RUN_STARTED", "threadId": tid, "runId": "run-4a35a33d4ff8"}],
+    )
+    # 新轮进行中：重放/迟到的旧 tool END+RESULT（map 已清，按 toolCallId 找回旧行）
+    # 已 success → 必须吞掉（禁止再 upsert）；内容保持原样，turnId 不得被偷。
+    sess = HUB.get_session(tid)
+    assert sess is not None
+    seq_before = int(sess.seq)
+    mirror.feed_events(
+        tid,
+        [
+            {"type": "TOOL_CALL_END", "toolCallId": "tc-old-bash"},
+            {
+                "type": "TOOL_CALL_RESULT",
+                "toolCallId": "tc-old-bash",
+                "content": "ring show ok (late)",
+                "status": "success",
+            },
+        ],
+    )
+    assert int(sess.seq) == seq_before, "replayed success tool must not emit deltas"
+    tools = [r for r in _rows(tid) if r.get("kind") == "toolCall"]
+    assert len(tools) == 1, tools
+    tool = tools[0]
+    assert int(tool["rowId"]) == old_rid
+    assert tool["turnId"] == "run-old", tool
+    out = ((tool.get("output") or {}).get("text") or "")
+    assert out == "ring show ok", out
+    users = [r for r in _rows(tid) if r.get("kind") == "userInput"]
+    new_user = next(r for r in users if "重启好了" in str(r.get("text") or ""))
+    assert new_user["turnId"] == "run-4a35a33d4ff8"
+    assert int(tool["rowId"]) < int(new_user["rowId"])
+
+
 def test_seal_backfills_output_from_transcript_when_result_missing(
     mirror_session: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -733,6 +911,181 @@ def test_seal_backfills_output_from_transcript_when_result_missing(
     out = (tool.get("output") or {}).get("text") or ""
     assert "[index] last updated" in out
     assert "zzq_heal" in out
+
+
+def test_empty_tool_result_content_backfills_from_transcript(
+    mirror_session: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SSE slim 把 search_code_index content 置空时，RESULT 必须从 transcript 回填。
+
+    现网：工具已成功落库 13KB+，V4 卡却「已执行 / 暂无检索结果」。
+    """
+    tid = mirror_session + "-empty-result-body"
+    if tid in getattr(HUB, "_sessions", {}):
+        del HUB._sessions[tid]  # noqa: SLF001
+
+    monkeypatch.setattr(
+        "app.gateway.v4.agui_mirror._transcript_tool_result_text",
+        lambda _tid, tcid: (
+            (
+                "search_code_index",
+                "[index] last updated 53m ago (age=3180s)\n\n"
+                "Code index results for 'v4 conversation projection':\n\n"
+                "Symbols:\n  - function ConversationTurnGroup @ ConversationTurnGroup.tsx:1",
+            )
+            if tcid == "tc-empty-body"
+            else None
+        ),
+    )
+
+    mirror = V4Mirror(HUB)
+    mirror.note_user_input(tid, "查投影")
+    mirror.feed_events(
+        tid,
+        [
+            {"type": "RUN_STARTED", "threadId": tid, "runId": "run-empty-body"},
+            {
+                "type": "TOOL_CALL_START",
+                "toolCallId": "tc-empty-body",
+                "toolCallName": "search_code_index",
+            },
+            {
+                "type": "TOOL_CALL_ARGS",
+                "toolCallId": "tc-empty-body",
+                "delta": '{"queries":["v4 conversation projection turnHeader rowId window"]}',
+            },
+            {"type": "TOOL_CALL_END", "toolCallId": "tc-empty-body"},
+            {
+                "type": "TOOL_CALL_RESULT",
+                "toolCallId": "tc-empty-body",
+                "toolCallName": "search_code_index",
+                # slim_content_for_ui lazy-empty：wire 正文被掏空
+                "content": "",
+                "status": "success",
+            },
+            {"type": "RUN_FINISHED", "threadId": tid, "runId": "run-empty-body"},
+        ],
+    )
+    tool = next(r for r in _rows(tid) if r.get("kind") == "toolCall")
+    assert tool["status"] == "success", tool
+    out = (tool.get("output") or {}).get("text") or ""
+    assert "ConversationTurnGroup" in out
+    assert "[index] last updated" in out
+
+
+def test_seal_heals_orphan_open_tool_when_map_cleared(
+    mirror_session: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """tool_row_ids 中途被清掉后，RUN_FINISHED 仍须扫 HUB 孤儿行并回填。
+
+    现网：search_code_index 卡永久 inputStreaming（「等待中」/「检索中…」），
+    transcript 已有正文，但 seal 因 map 空直接 return。
+    """
+    tid = mirror_session + "-orphan-heal"
+    if tid in getattr(HUB, "_sessions", {}):
+        del HUB._sessions[tid]  # noqa: SLF001
+
+    monkeypatch.setattr(
+        "app.gateway.v4.agui_mirror._transcript_tool_result_text",
+        lambda _tid, tcid: (
+            (
+                "search_code_index",
+                "[index] last updated 3s ago (age=3s)\n\nSymbols:\n  - function orphan_heal",
+            )
+            if tcid == "tc-orphan"
+            else None
+        ),
+    )
+
+    mirror = V4Mirror(HUB)
+    mirror.note_user_input(tid, "搜孤儿")
+    mirror.feed_events(
+        tid,
+        [
+            {"type": "RUN_STARTED", "threadId": tid, "runId": "run-orphan-heal"},
+            {
+                "type": "TOOL_CALL_START",
+                "toolCallId": "tc-orphan",
+                "toolCallName": "search_code_index",
+            },
+            {
+                "type": "TOOL_CALL_ARGS",
+                "toolCallId": "tc-orphan",
+                "delta": '{"query":"orphan_heal"}',
+            },
+        ],
+    )
+    stuck = next(r for r in _rows(tid) if r.get("kind") == "toolCall")
+    assert stuck["status"] == "inputStreaming", stuck
+
+    # 模拟流式 map 中途清空（保留 turn_id，否则 FINISHED 无法对上本轮行）。
+    st = mirror._states[tid]  # noqa: SLF001
+    st.tool_row_ids.clear()
+    st.tool_acc.clear()
+    st.tool_names.clear()
+
+    mirror.feed_events(
+        tid,
+        [{"type": "RUN_FINISHED", "threadId": tid, "runId": "run-orphan-heal"}],
+    )
+    tool = next(r for r in _rows(tid) if r.get("kind") == "toolCall")
+    assert tool["status"] == "success", tool
+    out = (tool.get("output") or {}).get("text") or ""
+    assert "orphan_heal" in out
+    assert "[index] last updated" in out
+
+
+def test_tool_call_end_backfills_success_from_transcript(
+    mirror_session: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TOOL_CALL_END 时若 transcript 已有正文，直接升 success——不等可能丢失的 RESULT。
+
+    现网：search_code_index 执行完仍「等待中」，因为 END 只写 running，RESULT 被 SSE 丢掉。
+    """
+    tid = mirror_session + "-end-backfill"
+    if tid in getattr(HUB, "_sessions", {}):
+        del HUB._sessions[tid]  # noqa: SLF001
+
+    monkeypatch.setattr(
+        "app.gateway.v4.agui_mirror._transcript_tool_result_text",
+        lambda _tid, tcid: (
+            (
+                "search_code_index",
+                "[index] last updated 2s ago (age=2s)\n\nSymbols:\n  - function end_bf",
+            )
+            if tcid == "tc-end-bf"
+            else None
+        ),
+    )
+
+    mirror = V4Mirror(HUB)
+    mirror.note_user_input(tid, "搜")
+    mirror.feed_events(
+        tid,
+        [
+            {"type": "RUN_STARTED", "threadId": tid, "runId": "run-end-bf"},
+            {
+                "type": "TOOL_CALL_START",
+                "toolCallId": "tc-end-bf",
+                "toolCallName": "search_code_index",
+            },
+            {
+                "type": "TOOL_CALL_ARGS",
+                "toolCallId": "tc-end-bf",
+                "delta": '{"query":"end_bf"}',
+            },
+            # 无 TOOL_CALL_RESULT
+            {"type": "TOOL_CALL_END", "toolCallId": "tc-end-bf"},
+        ],
+    )
+    tool = next(r for r in _rows(tid) if r.get("kind") == "toolCall")
+    assert tool["status"] == "success", tool
+    out = (tool.get("output") or {}).get("text") or ""
+    assert "end_bf" in out
+    assert int(tool.get("endedAt") or 0) > 0
 
 
 def test_reasoning_end_writes_duration_ms(mirror_session: str) -> None:
@@ -824,6 +1177,118 @@ def test_reasoning_restart_same_message_id_opens_new_row(mirror_session: str) ->
     assert reasonings[0]["rowId"] != reasonings[1]["rowId"]
 
 
+def test_historical_success_tool_replay_does_not_flood_deltas(
+    mirror_session: str,
+) -> None:
+    """新 run 开头重放 N 条历史 success 工具：不得刷 online upsert 堵 tip。
+
+    复刻 8e4715ba：发问后流式日志墙钟最新，但先蹦出 rowId 远小于用户气泡的
+    bash/platform 卡，约 25s 后才出现本轮 reasoning。
+    """
+    tid = mirror_session + "-no-flood"
+    if tid in getattr(HUB, "_sessions", {}):
+        del HUB._sessions[tid]  # noqa: SLF001
+    mirror = V4Mirror(HUB)
+
+    mirror.note_user_input(tid, "上一问")
+    first_batch: list[dict[str, Any]] = [
+        {"type": "RUN_STARTED", "threadId": tid, "runId": "run-hist"},
+    ]
+    for i in range(8):
+        tcid = f"tc-hist-{i}"
+        first_batch.extend(
+            [
+                {
+                    "type": "TOOL_CALL_START",
+                    "toolCallId": tcid,
+                    "toolCallName": "bash",
+                },
+                {
+                    "type": "TOOL_CALL_ARGS",
+                    "toolCallId": tcid,
+                    "delta": f'{{"command":"echo {i}"}}',
+                },
+                {"type": "TOOL_CALL_END", "toolCallId": tcid},
+                {
+                    "type": "TOOL_CALL_RESULT",
+                    "toolCallId": tcid,
+                    "content": f"ok-{i}",
+                    "status": "success",
+                },
+            ]
+        )
+    first_batch.append({"type": "RUN_FINISHED", "threadId": tid, "runId": "run-hist"})
+    mirror.feed_events(tid, first_batch)
+
+    mirror.note_user_input(tid, "好了好了，你再看一下")
+    mirror.feed_events(
+        tid,
+        [{"type": "RUN_STARTED", "threadId": tid, "runId": "run-tip"}],
+    )
+    sess = HUB.get_session(tid)
+    assert sess is not None
+    seq_before = int(sess.seq)
+
+    replay: list[dict[str, Any]] = []
+    for i in range(8):
+        tcid = f"tc-hist-{i}"
+        replay.extend(
+            [
+                {
+                    "type": "TOOL_CALL_START",
+                    "toolCallId": tcid,
+                    "toolCallName": "bash",
+                },
+                {
+                    "type": "TOOL_CALL_ARGS",
+                    "toolCallId": tcid,
+                    "delta": f'{{"command":"echo {i} replay"}}',
+                },
+                {"type": "TOOL_CALL_END", "toolCallId": tcid},
+                {
+                    "type": "TOOL_CALL_RESULT",
+                    "toolCallId": tcid,
+                    "content": f"ok-{i}-replay",
+                    "status": "success",
+                },
+            ]
+        )
+    mirror.feed_events(tid, replay)
+    assert int(sess.seq) == seq_before, (
+        f"historical success replay flooded deltas: {seq_before} -> {sess.seq}"
+    )
+    tools = [r for r in _rows(tid) if r.get("kind") == "toolCall"]
+    assert len(tools) == 8
+    for i, tool in enumerate(sorted(tools, key=lambda r: int(r["rowId"]))):
+        assert tool["turnId"] == "run-hist"
+        assert tool["status"] == "success"
+        assert ((tool.get("output") or {}).get("text") or "") == f"ok-{i}"
+
+    # 本轮真正的新工具仍应落盘
+    mirror.feed_events(
+        tid,
+        [
+            {
+                "type": "TOOL_CALL_START",
+                "toolCallId": "tc-new",
+                "toolCallName": "bash",
+            },
+            {"type": "TOOL_CALL_END", "toolCallId": "tc-new"},
+            {
+                "type": "TOOL_CALL_RESULT",
+                "toolCallId": "tc-new",
+                "content": "fresh",
+                "status": "success",
+            },
+        ],
+    )
+    tools2 = [r for r in _rows(tid) if r.get("kind") == "toolCall"]
+    assert len(tools2) == 9
+    fresh = next(r for r in tools2 if r.get("toolCallId") == "tc-new")
+    assert fresh["turnId"] == "run-tip"
+    assert ((fresh.get("output") or {}).get("text") or "") == "fresh"
+
+
 def test_tool_call_start_does_not_duplicate_prior_turn_tcid(mirror_session: str) -> None:
     """失败轮重放上一轮 toolCallId 时，不得再开一张空 error 卡。"""
     tid = mirror_session + "-no-dup-tcid"
@@ -872,3 +1337,161 @@ def test_tool_call_start_does_not_duplicate_prior_turn_tcid(mirror_session: str)
     assert len(tools) == 1, tools
     assert tools[0]["status"] == "success"
     assert tools[0]["turnId"] == "run-1"
+
+
+def test_transcript_backfill_ignores_cross_thread_row(mirror_session: str) -> None:
+    """跨 thread 同 tool_call_id 不得被当命中采用。
+
+    【self-evolution-bot · 2026-11-21 · 第104轮 · 模型:deepseek-v4.1-flash-1017】
+    反证已做：去掉 `_transcript_tool_result_text` 里 row=None 的守卫，
+    本用例立刻红在我打印的断言上（实得 ('assets', '别的会话的工具正文')）。
+
+    现网实测（第104轮）：库里残留 tool_call_id=tc1 / tool_name=assets /
+    thread_id=probe-thread-perf 的探针行；本轮 TOOL_CALL_END 做 transcript 回填时
+    按 id 直接命中它，把 write 工具卡改名成 assets，卡面展开成另一个工具。
+    判据：跨会话同 id 只是巧合，宁可留空等真 RESULT，不许串数据。
+    """
+    import json as _json
+
+    from app.gateway.v4.agui_mirror import _transcript_tool_result_text
+    from evoflow.persistence.db import get_db
+
+    tcid = "tc-cross-thread-104"
+    other_tid = "probe-thread-cross-104"
+    my_tid = "mirror-thread-cross-104"
+    db = get_db()
+    db.execute("DELETE FROM evoflow_chat_messages WHERE tool_call_id = ?", (tcid,))
+    db.execute(
+        """
+        INSERT INTO evoflow_chat_messages
+            (session_key, seq, role, message_id, content_json,
+             tool_call_id, tool_name, thread_id, created_at, updated_at)
+        VALUES (?, 1, 'tool', ?, ?, ?, 'assets', ?, datetime('now'), datetime('now'))
+        """,
+        (
+            "probe__cross_thread_session",
+            f"tool-{tcid}",
+            _json.dumps({"content": "别的会话的工具正文"}),
+            tcid,
+            other_tid,
+        ),
+    )
+    db.commit()
+    try:
+        # 本 thread 没有该 id → 必须返回 None（不许拿别的 thread 的行顶上）
+        assert _transcript_tool_result_text(my_tid, tcid) is None
+        # 同一 thread 仍能正常回填（证明修的是串数据，不是把功能关掉）
+        got = _transcript_tool_result_text(other_tid, tcid)
+        assert got is not None, "同 thread 命中必须保留"
+        assert got[0] == "assets", got
+    finally:
+        db.execute("DELETE FROM evoflow_chat_messages WHERE tool_call_id = ?", (tcid,))
+        db.commit()
+
+
+def test_heal_stale_inflight_seals_streaming_on_failed_turn(
+    mirror_session: str,
+) -> None:
+    """终态轮上残留 streaming 思考 / running 工具：heal 必须收口（f2fdc69c）。
+
+    phase=idle + turnHeader=failed 仍「正在思考」——map 已清时 RUN_* seal 扫不到。
+    """
+    from app.gateway.v4.agui_mirror import mirror_heal_stale_inflight_rows, mirror_reset_thread
+
+    tid = mirror_session + "-stale-inflight"
+    if tid in getattr(HUB, "_sessions", {}):
+        del HUB._sessions[tid]  # noqa: SLF001
+    mirror = V4Mirror(HUB)
+    mirror.note_user_input(tid, "写童话")
+    mirror.feed_events(
+        tid,
+        [
+            {"type": "RUN_STARTED", "threadId": tid, "runId": "run-stale"},
+            {"type": "REASONING_MESSAGE_START", "messageId": "think-1"},
+            {
+                "type": "REASONING_MESSAGE_CONTENT",
+                "messageId": "think-1",
+                "delta": "先查磁盘内容",
+            },
+            {
+                "type": "TOOL_CALL_START",
+                "toolCallId": "tc-zombie",
+                "toolCallName": "bash",
+            },
+            {"type": "TOOL_CALL_END", "toolCallId": "tc-zombie"},
+            # 无 RESULT / 无 RUN_FINISHED：模拟断流后头被标 failed、map 被清
+        ],
+    )
+    sess = HUB.get_session(tid)
+    assert sess is not None
+    # 人工把轮头标 failed（catchup settle），并清 mirror 活写态
+    header = next(r for r in _rows(tid) if r.get("kind") == "turnHeader")
+    HUB.author_upsert_row(
+        tid,
+        {
+            **header,
+            "state": "failed",
+            "endedAt": header.get("startedAt") or 1,
+        },
+    )
+    mirror_reset_thread(tid)
+
+    thinking = next(r for r in _rows(tid) if r.get("kind") == "reasoning")
+    assert thinking["state"] == "streaming", thinking
+    tool = next(r for r in _rows(tid) if r.get("kind") == "toolCall")
+    assert tool["status"] in ("running", "inputStreaming"), tool
+
+    healed = mirror_heal_stale_inflight_rows(tid)
+    assert healed >= 2, healed
+    thinking2 = next(r for r in _rows(tid) if r.get("kind") == "reasoning")
+    assert thinking2["state"] == "complete", thinking2
+    tool2 = next(r for r in _rows(tid) if r.get("kind") == "toolCall")
+    assert tool2["status"] == "cancelled", tool2
+
+
+def test_heal_stale_inflight_seals_running_header_when_db_done(
+    mirror_session: str,
+) -> None:
+    """DB done + tip turnHeader 仍 running + 空 streaming 思考：必须收口。
+
+    压缩/remint 后常见：无终态头 → 旧 heal 直接 return 0，面板「正在思考」
+    与「已工作」计时钉死数小时（94b4bc83）。
+    """
+    from unittest.mock import patch
+
+    from app.gateway.v4.agui_mirror import mirror_heal_stale_inflight_rows, mirror_reset_thread
+
+    tid = mirror_session + "-stale-running-hdr"
+    if tid in getattr(HUB, "_sessions", {}):
+        del HUB._sessions[tid]  # noqa: SLF001
+    mirror = V4Mirror(HUB)
+    mirror.note_user_input(tid, "修知识库")
+    mirror.feed_events(
+        tid,
+        [
+            {"type": "RUN_STARTED", "threadId": tid, "runId": "run-hdr"},
+            {"type": "REASONING_MESSAGE_START", "messageId": "think-hdr"},
+            {
+                "type": "REASONING_MESSAGE_CONTENT",
+                "messageId": "think-hdr",
+                "delta": "先核对 bindings",
+            },
+        ],
+    )
+    mirror_reset_thread(tid)
+
+    header = next(r for r in _rows(tid) if r.get("kind") == "turnHeader")
+    assert header["state"] == "running", header
+    thinking = next(r for r in _rows(tid) if r.get("kind") == "reasoning")
+    assert thinking["state"] == "streaming", thinking
+
+    with patch(
+        "app.gateway.v4.hydration.read_run_status_row",
+        return_value={"status": "done", "updated_at_ms": 1, "run_id": "run-hdr"},
+    ):
+        healed = mirror_heal_stale_inflight_rows(tid)
+    assert healed >= 2, healed
+    header2 = next(r for r in _rows(tid) if r.get("kind") == "turnHeader")
+    assert header2["state"] == "completedSuccess", header2
+    thinking2 = next(r for r in _rows(tid) if r.get("kind") == "reasoning")
+    assert thinking2["state"] == "complete", thinking2

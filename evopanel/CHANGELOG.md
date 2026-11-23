@@ -6,6 +6,224 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.3.49] - 2026-11-23
+
+相对 **1.3.48** 的后续开发版本（未打正式包标签）。
+
+
+## [1.3.48] - 2026-11-23
+
+相对 **1.3.47**：语音音色与阿里云 / 火山套餐对齐；部门群语音设置更完整；右栏记录打开来源。
+GitHub Release 说明见 scripts/maintainer/windows/release-notes/PRODUCT-NOTES-1.3.48.md；升级横幅见 scripts/maintainer/update/latest.json。
+
+### Fixed
+
+- **阿里云语音音色**：Token Plan 与按量 CosyVoice 列表分开，预览与套餐匹配
+- **火山 Agent Plan 语音**：套餐落盘补齐语音端点与默认项
+- **工作区路径占位**：根路径占位与打开文件更稳
+- **右栏打开来源**：记录打开方，便于核对
+
+### Changed
+
+- **部门群对话**：轮次、值守与成员工作会话衔接更清楚
+- **小 V 语音**：提供商与默认音色配置更完整
+
+
+## [1.3.47] - 2026-11-23
+
+相对 **1.3.46**：主窗口内存不足时可自动恢复一次；员工面板排队发送更稳；创建 Agent 可自动入职。
+GitHub Release 说明见 scripts/maintainer/windows/release-notes/PRODUCT-NOTES-1.3.47.md；升级横幅见 scripts/maintainer/update/latest.json。
+
+### Added
+
+- **主窗口 OOM 自动恢复**：渲染进程因内存不足退出时自动 Reload 一次（冷却窗口内限一次）
+
+### Fixed
+
+- **员工面板排队发送**：忙碌时保留待发内容，空闲后再发；失败时保留便于重试
+- **创建 Agent 入职**：创建流程可自动完成入职绑定
+- **长对话裁窗与滚动**：投影窗口与跟底裁剪更稳定
+
+### Changed
+
+- **平台操作反馈**：动作标签与结果提示更清楚
+
+
+## [1.3.46] - 2026-11-22
+
+相对 **1.3.45**：停止会话后立即收回电脑控制；任务详情对话优先展示本任务执行记录；代码索引库损坏时可自动隔离并重建。
+GitHub Release 说明见 scripts/maintainer/windows/release-notes/PRODUCT-NOTES-1.3.46.md；升级横幅见 scripts/maintainer/update/latest.json。
+
+### Fixed
+
+- **停止会话后电脑控制未收回**：停止对话时立即释放控制权并关闭提示条
+- **任务详情对话来源**：优先读取本任务执行会话；仅在同属该执行人时才回退
+- **代码索引库损坏**：隔离旧库并触发重建，返回可读说明
+- **任务列表遇数据库繁忙**：返回可重试 503
+- **工具失败状态**：失败文案明确时标记为 error
+
+### Changed
+
+- **知识库解析**：解析失败时的兜底路径更稳定
+- **发送会话选择**：尽量避开正在忙碌的会话
+
+
+## [1.3.45] - 2026-11-22
+
+相对 **1.3.44**：历史平台成功提示不再反复弹出；后台任务轮询更稳；Agent 应用冷启动先开签再挂页面。
+GitHub Release 说明见 scripts/maintainer/windows/release-notes/PRODUCT-NOTES-1.3.45.md；升级横幅见 scripts/maintainer/update/latest.json。
+
+### Fixed
+
+- **历史平台 toast 重放**：加载旧会话不再重复弹已完成成功提示
+- **后台任务输出空转**：轮询增加冷却
+- **Agent 应用冷启动**：服务未就绪时 url 先空，避免挂死端口
+
+### Changed
+
+- **斜杠命令**：选择器提供 /goal 与 /workflow
+- **平台权限上限**：默认与破坏性选项一致
+
+
+## [1.3.44] - 2026-11-22
+
+相对 **1.3.43**：发消息先落用户气泡再开流，问答顺序不再颠倒；已完成回合的迟到「还在跑」心跳会被丢弃。
+GitHub Release 说明见 scripts/maintainer/windows/release-notes/PRODUCT-NOTES-1.3.44.md；升级横幅见 scripts/maintainer/update/latest.json。
+
+### Fixed
+
+- **答案渲染在提问之上**：先落用户行再开流
+- **已答完仍显示还在跑**：拒绝回合收尾后的迟到 running 心跳
+- **成功轮被记成错误**：避免迟到心跳污染已完成快照
+- **V4 catchup / 错误信息**：终态与错误展示更一致
+
+### Changed
+
+- **用户可见错误文案**：部分失败提示更直白
+
+
+## [1.3.43] - 2026-11-21
+
+相对 **1.3.42**：员工面板发消息不再串到任务时间线并实时出字；右栏布局与平台卡标题更清楚；长对话 catchup / soft-cap 更稳。
+GitHub Release 说明见 scripts/maintainer/windows/release-notes/PRODUCT-NOTES-1.3.43.md；升级横幅见 scripts/maintainer/update/latest.json。
+
+### Fixed
+
+- **员工面板发消息落错会话**：对话发送不用任务时间线；面板直发走 live 流
+- **客户端重连误停面板轮次**：attach/重启默认不停面板任务
+- **长对话 tip 脱节**：投影与库尾不一致时强制重灌；跟底 soft-cap 闩住防回灌
+- **平台工具卡假标题**：不用技术串冒充卡头
+- **右栏代码预览崩溃**：单卡失败不拖垮整栏
+
+### Changed
+
+- **右栏布局与会话记忆**：标签回流与跨会话记忆更稳
+- **员工面板发送桥**：后台触发也能走面板发送链路
+
+
+## [1.3.42] - 2026-11-21
+
+相对 **1.3.41**：离线向量权重随仓库提供，正式构建更稳；电脑控制截图不再串到其它会话；右栏跨会话与交班沉淀更准。
+GitHub Release 说明见 scripts/maintainer/windows/release-notes/PRODUCT-NOTES-1.3.42.md；升级横幅见 scripts/maintainer/update/latest.json。
+
+### Fixed
+
+- **正式包本地向量下载失败**：权重随仓提供，不必再临时拉网
+- **历史会话自动弹出电脑截图**：仅当前尾轮且正在跑时自动开右栏
+- **右栏跨会话展开**：切换会话时侧栏记忆更一致
+- **交班沉淀空壳**：无实质内容不再写入空 craft
+
+### Changed
+
+- **平台 / 右栏反馈**：截图与面板提示更清楚
+- **前台会话推流**：回前台时续流更稳
+
+
+## [1.3.41] - 2026-11-21
+
+相对 **1.3.40**：安装包自带本地向量模型，知识库与代码索引可离线使用；长对话时间线更省内存、裁窗更稳；右栏关签/挪签与会话记忆更顺。
+GitHub Release 说明见 `scripts/maintainer/windows/release-notes/PRODUCT-NOTES-1.3.41.md`；升级横幅见 `scripts/maintainer/update/latest.json`。
+
+### Added
+
+- **离线知识库 / 代码索引**：内置本地中文向量模型，首次使用不必再下载
+- **主窗口对话摘要导出**：面板通道可导出当前可见轮次文本
+
+### Fixed
+
+- **长对话越聊越卡**：相同消息内容复用，工具长文本少占内存
+- **直播轮 / 裁窗抖动**：投影窗口与轮导航更稳
+- **右栏关签 / 挪签**：关闭与移动标签更一致
+- **本地打包 Unicode 编译失败**：page-dump 回退脚本已修正
+
+### Changed
+
+- **会话冷启动补齐**：网关重启后尽量补回未落库尾部状态
+- **右栏状态上报**：收起/展开与当前签语义更清晰
+
+
+### Changed
+
+- **安装包默认捆绑本地向量模型**：`bge-small-zh` 权重 + torch/ST，知识库与代码索引可离线语义检索；精简构建用 `EVOFLOW_GATEWAY_LEAN=1` / `-LeanNoLocalEmbedding` 关闭
+
+## [1.3.40] - 2026-11-20
+
+相对 **1.3.39**：电脑控制提示条步骤与秒表恢复走动并换蓝白光标；右栏切签/后台刷新不再抢走视线，不支持面板不再永久转圈；长对话时间线裁窗更稳。
+GitHub Release 说明见 `scripts/maintainer/windows/release-notes/PRODUCT-NOTES-1.3.40.md`；升级横幅见 `scripts/maintainer/update/latest.json`。
+
+### Fixed
+
+- **电脑控制提示条**：步骤标题与秒表走动；圆形胶囊与步数/秒数显示正确
+- **右栏永久加载中**：不支持的面板立刻说明并可关闭
+- **右栏被后台刷新抢走**：钉住的标签不被其它面板 update 切走
+- **切签误关右栏**：激活标签不再当成收起
+- **长对话卡顿**：直播轮与窗口裁剪更稳
+
+### Changed
+
+- **电脑控制光标**：操作电脑时使用蓝白 AI 光标
+- **右栏状态同步**：当前签上报后端，减少乱开/抢视线
+- **员工对话发送**：发消息归属与置顶会话更稳
+- **主界面面板操控**：智能体可通过平台动作操作主窗口界面
+
+
+## [1.3.39] - 2026-11-20
+
+相对 **1.3.38**：bash 切到的目录对读文件/改文件同样生效；平台域名拼错会立刻提示；部门群唤醒与回复衔接更稳；长等任务输出有明确上限。
+GitHub Release 正文见 `scripts/maintainer/windows/release-notes/PRODUCT-NOTES-1.3.39.md`；升级横幅见 `scripts/maintainer/update/latest.json`。
+
+### Fixed
+
+- **读文件不认 bash 目录**：终端 `cd` 后读/改/搜跟同一工作目录
+- **`/tmp` 路径静默失效**：临时目录映射到本机可用路径
+- **写完立刻再读被误判**：同会话紧接着读不再当成未刷新
+- **平台 catalog/help 拼错白烧一轮**：域名写错立刻给可读建议
+- **任务输出干等过久**：单次等待硬封顶约 30 秒并说明原因
+
+### Changed
+
+- **长命令转后台**：已产出内容直接带回，少一次再读文件
+- **部门群对话**：唤醒排队与回复镜像更完整
+- **右栏 / 平台反馈**：侧栏与平台结果提示更齐
+- **电脑控制提示条**：建窗即可看见，复用更稳
+
+## [1.3.38] - 2026-11-19
+
+相对 **1.3.37**：发消息后历史平台通知不再重弹；对话跟底与工具串轮更稳；已装资源包 BOT 计数去重。
+GitHub Release 正文见 `scripts/maintainer/windows/release-notes/PRODUCT-NOTES-1.3.38.md`；升级横幅见 `scripts/maintainer/update/latest.json`。
+
+### Fixed
+
+- **平台通知重播**：发消息不再清空平台已见集合，历史 toast / 右上角「平台」卡不会再当新通知弹出
+- **旧工具串进当前轮**：平台 TOOL_CALL_RESULT 保留原 turnId；前端丢掉被误归到新用户轮的旧工具卡
+- **跟底猛跳与叠层**：程序化滚底加短 hold，减少误判用户上滚与开会话后卡片叠层
+- **已结束轮计时器**：密封轮不再因 sessionBusy 继续「已工作」计时
+
+### Improved
+
+- **视口调试异常锁定**：error/warn 出现后锁定展示（现/曾），避免时间窗刷新闪灭
+- **已装资源包产物标签**：employees+agents 合并为 BOT 去重；extensions 显示为「Agent应用」
+
 ## [1.3.37] - 2026-11-19
 
 相对 **1.3.36**：安全收口为主——查看已配模型不再把 API Key 明文带进会话与日志；混进正文回复的思考过程标签统一剥离；会话打开、代码检索、工具报错三处最常见的卡顿与误导信息改掉。
@@ -20,6 +238,8 @@ GitHub Release 正文见 `scripts/maintainer/windows/release-notes/PRODUCT-NOTES
 - **点开旧会话卡顿**：只取 `createdAt`/`title` 也重建全部会话行（547 会话冷 6976ms），改为单行读取（0.017ms）
 - **数据库报错误导**：`database is locked` 实为本进程 RLock 未抢到（0.5s 抛，非 sqlite busy），文案改为自曝真成因 + 重试
 - **检索工具必崩**：批量提交把反向验证留在工作区的占位函数名一起提交，`search_code_index` 每次调用 NameError（`py_compile`/`ruff` 语法级检不出）；已复原
+- **启动后空白转圈**：Windows 下启动不再在主进程暖本地向量模型，会话列表可立刻返回
+- **午后整机卡死**：大数据库清理不再进程内长时间独占；本地向量探测改走索引子进程，避免整机卡 1–2 分钟
 
 ### Improved
 

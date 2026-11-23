@@ -1064,6 +1064,7 @@ export function useChatAppController() {
       /* ignore */
     }
   }, [selectedSessionKey])
+
   // 已选会话但还没有 threadId：主动 ensure，否则 V4 会停在 no-thread→「加载中…」
   // 部门群聊是本地 IM 面（dept:{id}:chat），不要 ensure-thread / 建假会话，否则会卡住导航。
   useEffect(() => {
@@ -2026,7 +2027,9 @@ export function useChatAppController() {
   const [turnPlatformEntries, setTurnPlatformEntries] = useState<PlatformRunEntry[]>([])
   const [turnArtifacts, setTurnArtifacts] = useState<ChatArtifact[]>([])
   const [artifactFocusId, setArtifactFocusId] = useState('')
-  const publishPlatformEntriesRef = useRef<(entries: PlatformRunEntry[], focusEntryId?: string) => void>(() => {})
+  const publishPlatformEntriesRef = useRef<
+    (entries: PlatformRunEntry[], focusEntryId?: string, opts?: { announce?: boolean }) => void
+  >(() => {})
   const publishArtifactsRef = useRef<
     (opts?: { focusId?: string; hint?: string; force?: boolean }) => void
   >(() => {})
@@ -2459,6 +2462,7 @@ export function useChatAppController() {
       setTurnArtifacts,
       setArtifactFocusId,
       setTurnPlatformEntries,
+      platformFeedbackSeenRef,
       evoflowInvokeGatewayJson,
       normalizeChatArtifacts,
       platformRunEntriesFromChatArtifacts,
@@ -2482,6 +2486,54 @@ export function useChatAppController() {
     selectedSessionKey,
     selectedSessionRowForExec,
   )
+
+  // Main-panel CDP bridge: /main-cdp/action sendMessage|selectSession without DOM scraping.
+  useEffect(() => {
+    let cancelled = false
+    void import('../../lib/panel-cdp/panel-bridge.ts')
+      .then((m) => {
+        if (cancelled) return
+        m.registerPanelChatBridge({
+          sendMessage: (text) => handleSendRef.current(text),
+          selectSession: (sessionKey) => selectSessionFromShellRef.current(sessionKey),
+          focusComposer: () => {
+            try {
+              document
+                .querySelector<HTMLElement>(
+                  '[data-composer-input], textarea.composer-input, .chat-composer textarea',
+                )
+                ?.focus?.()
+            } catch {
+              /* ignore */
+            }
+          },
+          setComposerText: (text) => {
+            try {
+              const el = document.querySelector<HTMLTextAreaElement>(
+                '[data-composer-input], textarea.composer-input, .chat-composer textarea',
+              )
+              if (!el) return
+              const desc = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')
+              desc?.set?.call(el, text)
+              el.dispatchEvent(new Event('input', { bubbles: true }))
+            } catch {
+              /* ignore */
+            }
+          },
+          isStreaming: () => !!selectedTurnBusy,
+        })
+      })
+      .catch(() => {
+        /* panel CDP optional */
+      })
+    return () => {
+      cancelled = true
+      void import('../../lib/panel-cdp/panel-bridge.ts')
+        .then((m) => m.clearPanelChatBridge())
+        .catch(() => {})
+    }
+  }, [selectedTurnBusy])
+
   // V4 时间线仍有 streaming/工具时，sse_final 可能已关 selectedTurnBusy——Composer 齿轮/停止要并上。
   const v4TimelineBusyEpoch = useSyncExternalStore(
     subscribeV4TimelineBusy,
@@ -2930,7 +2982,11 @@ export function useChatAppController() {
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps -- mount: drop leftover summary tab
   }, [])
-  const publishPlatformEntries = useCallback((entries: PlatformRunEntry[], focusEntryId?: string) => {
+  const publishPlatformEntries = useCallback((
+    entries: PlatformRunEntry[],
+    focusEntryId?: string,
+    opts?: { announce?: boolean },
+  ) => {
     publishPlatformEntriesImpl(
       {
         turnPlatformEntriesRef,
@@ -2946,6 +3002,7 @@ export function useChatAppController() {
       },
       entries,
       focusEntryId,
+      opts,
     )
   }, [setChatPanelDisplayMode])
   // 同步挂 ref：流式首帧若等 useEffect，publish 仍是 noop，平台通知会丢
@@ -4322,6 +4379,9 @@ export function useChatAppController() {
       setSessionTitle,
       syncSessionRowRef,
       wsClient,
+      // 【self-evolution-bot · 2026-11-19 · 第68轮 · 模型:deepseek-v4.1-flash-1017】
+      // 提示条「解除控制」要用真正的停止入口（ref 在下方 controller 里赋值）。
+      stopSessionExecutionRef,
     })
   }, [refreshSessions, scheduleRefreshSessions, loadModelCatalog, refreshSpeechConfigured])
 
@@ -6209,7 +6269,6 @@ export function useChatAppController() {
       setExpectedChatRunId,
       setLiveTurnAssistantRunId,
       setLiveTurnTokens,
-      setPlatformFocusEntryId,
       setPluginComposerPillsVisible,
       setPreferHomeDashboard,
       setPendingOptimisticUserText,
@@ -6643,7 +6702,7 @@ export function useChatAppController() {
   const selectSessionFromShellRef = useRef<(sessionKey: string) => void>(() => {})
   const selectSessionFromShell = useCallback(
     (sessionKey: string) => {
-      // 点击先于 flushSync 强制预热：KeepAlive miss 时也尽量带着快照进 host。
+      // 点击先于状态更新强制预热：KeepAlive miss 时也尽量带着快照进 host。
       warmV4OnSessionSelect(sessionKey)
       selectSessionFromShellImpl(
         {

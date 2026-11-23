@@ -16,8 +16,10 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from typing import Annotated
 
-from langchain.tools import InjectedToolCallId, ToolRuntime, tool
+from langchain_core.tools import InjectedToolCallId, tool
 from langgraph.typing import ContextT
+
+from evoflow.core.tool_runtime_type import ToolRuntime
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +180,33 @@ def _normalize_asset_rel(path: str, entity=None) -> str:
         return f"memory/{rel}"
     return rel
 
+def _path_required_payload(action: str) -> str:
+    """【self-evolution-bot · 2026-11-19 · 第67轮 · 模型:deepseek-v4.1-flash-1017】
+
+    ``path`` 缺失时的错误信封，带上**该动作合法路径长什么样**。
+
+    为什么：旧实现只回 ``{"ok": false, "error": "path_required"}``——不带动作、
+    不带示例、不带落点，调用方唯一的出路是再猜一次入参（现网 7 天 7 次）。
+    报错文案要给下一步动作，这一条同样适用。
+    """
+    examples = {
+        "read": "craft/某配方.md（或用 action=list / action=search 先确认文件名）",
+        "write": "craft/某配方.md；或裸文件名 + kind=<craft|episodic|journal> 自动补目录",
+        "delete": "craft/某配方.md（先用 action=list 确认要删的是哪个）",
+        "rename": "craft/旧名.md（新名放 content 参数）",
+    }
+    hint = examples.get(action, "craft/某配方.md 这类带目录前缀的相对路径")
+    return json.dumps(
+        {
+            "ok": False,
+            "error": "path_required",
+            "action": action,
+            "hint": f"action={action} 需要 path 参数，形如 {hint}。可写范围：craft / memory/episodic / memory/journal / memory/standing* / memory/MEMORY.md / profile/affect*",
+        },
+        ensure_ascii=False,
+    )
+
+
 def _not_found_payload(entity, rel: str) -> dict:
     """read/delete/list 命中不到文件时，给出**相近候选**而不是光说 not_found。
 
@@ -235,8 +264,18 @@ def _not_found_payload(entity, rel: str) -> dict:
                 f"目录 {parent or 'memory'} 是空的或不存在。"
                 "用 action=list 看实际有哪些文件，或 action=search 按关键词找。"
             )
-    except Exception:  # noqa: BLE001 - 提示生成失败绝不能盖掉主错误
-        out["hint"] = "该路径不存在。可用 action=list 或 action=search 确认实际文件名。"
+    except Exception as exc:  # noqa: BLE001 - 提示生成失败绝不能盖掉主错误
+        # 【self-evolution-bot · 2026-11-19 · 第67轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：兜底文案里带上**失败原因的类型与首行**，不再只有一句「可用 list 确认」。
+        # 为什么：第59轮加的候选列表曾因 `entity` 传成 str 而整体抛 AttributeError，
+        # 被这里吞掉后**外观与"目录里没有相近文件"一模一样**——我自己本轮就据此误判成
+        # "第59轮没生效"，白绕了 3 次调用。静默兜底必须留下可辨的痕迹：
+        # 有这句 `原因:` 就能一眼分出「机制挂了」与「确实没候选」。
+        reason = f"{type(exc).__name__}: {str(exc).splitlines()[0][:160]}"
+        out["hint"] = (
+            "该路径不存在。可用 action=list 或 action=search 确认实际文件名。"
+            f"（相近候选生成失败 → 原因: {reason}）"
+        )
     return out
 
 
@@ -404,7 +443,7 @@ def assets_tool(
     if act == "read":
         rel = _normalize_asset_rel(path, entity)
         if not rel:
-            return json.dumps({"ok": False, "error": "path_required"}, ensure_ascii=False)
+            return _path_required_payload("read")
         try:
             data = read_text_file(entity, rel)
             try:
@@ -593,7 +632,7 @@ def assets_tool(
         rel = _normalize_asset_rel(path, entity)
         text = str(content or "").strip()
         if not rel:
-            return json.dumps({"ok": False, "error": "path_required"}, ensure_ascii=False)
+            return _path_required_payload("write")
         if not text:
             return json.dumps({"ok": False, "error": "content_required"}, ensure_ascii=False)
         _KIND_DIRS = {
@@ -613,6 +652,23 @@ def assets_tool(
         # 并在回执里明写 resolved_path，不静默改址。
         kind_dir = _KIND_DIRS.get(str(kind or "").strip().lower(), "")
         resolved_from_kind = False
+        # 【self-evolution-bot · 2026-11-21 · 第102轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：裸文件名 + 没传 kind 时，默认落 craft/ 并**在回执里明写** resolved_path
+        #   与 kind_defaulted，不再直接拒写。
+        # 为什么（本轮现网 obs 取证，近 7 天 ``assets·write_path_not_allowed`` 后半 16 次 /
+        #   前半 5 次，在涨）：把 18 条真实失败行的 input_json 摊开看，形状只有一种 ——
+        #     {"action":"write","path":"gateway与langgraph是两个进程-….md","content":…}
+        #   即「裸文件名 + 没给 kind」。而 standing 里我自己早就写了禁令「必须带 kind」，
+        #   写了照样涨 —— 说明这条靠记性治不住，得让**默认路径**不再需要记性。
+        #   判据不变的部分：只要调用方给了 kind 或带目录前缀，一律走原逻辑，不猜；
+        #   只有「无目录 + 无 kind + 盘上不存在同名文件」这一种才落到默认 craft/。
+        #   风险与兜底：万一它本来是 journal 条目，回执里有 kind_defaulted 标记，
+        #   一次 rename 就能改回，比每次多跑一轮「被拒→补 kind→重发」便宜。
+        if not kind_dir and rel and "/" not in rel:
+            kind_dir = _KIND_DIRS["craft"]
+            kind_defaulted = True
+        else:
+            kind_defaulted = False
         if kind_dir and not rel.startswith(("craft/", "memory/episodic/", "memory/journal/", "memory/standing")):
             if "/" not in rel:
                 rel = f"{kind_dir}{rel}"
@@ -762,6 +818,10 @@ def assets_tool(
                     # 【self-evolution-bot · 2026-11-16 · 第20轮】按 kind 补目录时必须回显，
                     # 否则调用方以为自己写的是 path=裸名，下次 update_path 又得猜一遍。
                     **({"resolved_path": rel, "resolved_from_kind": True} if resolved_from_kind else {}),
+                    # 【self-evolution-bot · 2026-11-21 · 第102轮 · 模型:deepseek-v4.1-flash-1017】
+                    # 默认落点必须显式标注：调用方没给 kind 时我替它选了 craft/，
+                    # 不标出来就是"静默改址"，它下次 read 还是拿裸名，又要落空一次。
+                    **({"resolved_path": rel, "kind_defaulted": "craft"} if kind_defaulted else {}),
                     # 【self-evolution-bot · 2026-11-18 · 第55轮 · 模型:deepseek-v4.1-flash-1017】
                     # 补后缀必须回显：否则调用方以为落的是 `memory/journal/x`（无后缀），
                     # 下次 update_path / read 又拿原串来查，落空一次再猜一次。
@@ -770,11 +830,14 @@ def assets_tool(
                     "mode": write_mode,
                     "hint": (
                         (
-                            f"已按 kind 补全目录后覆盖写入 {rel}。"
+                            "未指定 kind，已按默认落 craft/ 写入 "
+                            f"{rel}；若应属 journal/episodic，传 kind 重写或 rename 移过去。"
+                            if kind_defaulted
+                            else f"已按 kind 补全目录后覆盖写入 {rel}。"
                             if write_mode == "replace"
                             else f"已按 kind 补全目录后追加到 {rel}（追加模式）。要整份覆盖请显式传 mode=replace。"
                         )
-                        if resolved_from_kind
+                        if (kind_defaulted or resolved_from_kind)
                         else (
                             f"已覆盖写入 {rel}。"
                             if write_mode == "replace"
@@ -790,7 +853,7 @@ def assets_tool(
     if act == "delete":
         rel = _normalize_asset_rel(path, entity)
         if not rel:
-            return json.dumps({"ok": False, "error": "path_required"}, ensure_ascii=False)
+            return _path_required_payload("delete")
         try:
             from evoflow.assets.hub import delete_text_file
 
@@ -827,7 +890,7 @@ def assets_tool(
     if act == "rename":
         rel = _normalize_asset_rel(path, entity)
         if not rel:
-            return json.dumps({"ok": False, "error": "path_required"}, ensure_ascii=False)
+            return _path_required_payload("rename")
         new_name = str(content or "").strip() or str(query or "").strip()
         if not new_name:
             return json.dumps(

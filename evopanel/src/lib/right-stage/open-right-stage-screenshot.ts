@@ -11,6 +11,14 @@ export type OpenRightStageScreenshotOpts = {
   sessionKey?: string | null
   title?: string
   mimeType?: string
+  /**
+   * 【self-evolution-bot · 2026-11-23 · 第128轮 · 模型:deepseek-v4.1-flash】
+   * 改了什么：新增「谁打开的」来源标记，透传给 store.show。
+   * 为什么：截图既可能由智能体跑电脑控制时自动开，也可能用户自己点开；
+   *   缺省让 store 兜底成 `session:<归属会话>`，不猜成 user。
+   */
+  openedBy?: string
+
   layout?: 'half' | 'wide' | 'narrow' | 'workspace-write'
   /** 去重键；默认用 uri */
   dedupeKey?: string
@@ -46,11 +54,27 @@ export function showRightStageScreenshot(
   const layout = opts?.layout || 'half'
   const key = `screenshot:${id}`
 
+  // 【self-evolution-bot · 2026-11-21 · 第105轮 · 模型:deepseek-v4.1-flash-1017】
+  // 改了什么：没有会话归属时直接拒绝开截图标签。
+  // 为什么：截图是严格会话级内容，但 store.show 的归属兜底会退回
+  //   getCurrentRightStageSessionKey()，而冷启动/切会话中间态里它是空串，
+  //   于是标签**不带 sessionKey** 落地。可见性规则对无归属标签一律放行
+  //   (right-stage-session-visibility 里 `if (!tabSk) return true`)，
+  //   表现为「A 会话的截图，B/C 会话右栏也能看到」。
+  //   宁可这一帧不显示，也不能让一张图变成全局可见。
+  if (!sessionKey) {
+    logRightStage('showRightStageScreenshot:skip 无会话归属', {
+      uri: raw.slice(0, 120),
+      key,
+    })
+    return ''
+  }
+
   logRightStage('showRightStageScreenshot', {
     uri: raw.slice(0, 120),
     title,
     key,
-    sessionKey: sessionKey || '(空)',
+    sessionKey,
     layout,
   })
 
@@ -60,6 +84,7 @@ export function showRightStageScreenshot(
     title,
     layout,
     sessionKey,
+    openedBy: opts?.openedBy,
     data: {
       uri: raw,
       mimeType,

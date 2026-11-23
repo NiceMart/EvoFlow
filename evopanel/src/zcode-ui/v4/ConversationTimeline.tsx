@@ -14,9 +14,10 @@ import {
   type TouchEvent as ReactTouchEvent,
   type WheelEvent as ReactWheelEvent,
 } from "react";
+import { flushSync } from "react-dom";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { ArrowDownIcon } from "lucide-react";
-import { TID_V4_TIMELINE, TID_V4_TIMELINE_BOTTOM } from "@zcode/shared";
+import { TID_V4_TIMELINE, TID_V4_TIMELINE_BOTTOM, TID_V4_TURN_NAVIGATOR } from "@zcode/shared";
 import type {
   ApiRetryState,
   AttachmentRef,
@@ -44,19 +45,20 @@ import {
   getConversationStatusPanelOffsetClassName,
 } from "@/v4/conversationLayout.js";
 import {
-  buildConversationTurnRenderUnits,
-  tryAppendTrailingUserInputUnit,
+  createConversationTurnRenderUnitsSelector,
   type ConversationTurnRenderUnit,
+  type ConversationTurnRenderUnitsPartition,
 } from "@/v4/conversationTurnRenderUnits.js";
+import { getConversationRowsPartition } from "@/v4/conversationProjectionStore.js";
 import {
   inspectConversationTurnFoldHealth,
   summarizeFoldHealthFindings,
 } from "@/v4/conversationTurnFoldHealth.js";
 import { logV4Life } from "../../react/lib/v4-lifecycle-log.js";
 import {
+  createConversationTurnNavigatorQueryRowIdsSelector,
   resolveConversationTurnNavigatorActiveQueryRowId,
   resolveConversationTurnNavigatorHydrationRetryDelayMs,
-  shouldHydrateConversationTurnNavigatorDirectory,
   type ConversationTurnNavigatorHydrationResult,
   type ConversationTurnNavigatorQueryPosition,
   type ConversationTurnNavigatorVirtualItem,
@@ -101,7 +103,9 @@ import type { ConversationSelectionReference } from "@/lib/conversationSelection
 // 让未传该属性的渲染绕过稳定引用边界；共享只读空数组可保持默认值恒定。
 const EMPTY_PENDING_GUIDES: readonly QueueItem[] = [];
 
-const ROW_OVERSCAN = 8;
+// 对齐 ZCode（:121）：overscan 8 会把搜索跳转/长会话锚定变成数十屏的布局工作。
+// 每屏上下各多挂 2 行即可覆盖快速滚动的预渲染需求，其余交给虚拟化按需挂载。
+const ROW_OVERSCAN = 2;
 const RUNNING_WORK_DURATION_TICK_MS = 1000;
 const COMPOSER_MESSAGE_MASK_FADE_PX = 24;
 /** sticky bottomDock 叠在滚动视口内时，为 composer 预留的透明高度。 */
@@ -113,6 +117,12 @@ const COMPOSER_MESSAGE_MASK_TRANSPARENT_HEIGHT_PX = 96;
 const COMPOSER_MESSAGE_MASK_TRANSPARENT_HEIGHT_EXTERNAL_PX = 20;
 const USER_SCROLL_INTENT_TTL_MS = 1200;
 const LAYOUT_SCROLL_GUARD_MS = 250;
+/**
+ * 程序化贴底 / 恢复后的 scroll 归因窗。
+ * 旧逻辑只靠「下一帧 rAF + |Δ|&lt;1」：内容暴涨时 scrollToBottom 的后续测高/前插
+ * 会在 rAF 清掉后被当成 user → follow=0 → 预取雪崩 → 估高叠字（现场 #856）。
+ */
+const PROGRAMMATIC_SCROLL_HOLD_MS = 400;
 const CONTENT_WIDTH_RESIZE_SETTLE_MS = 120;
 const SCROLL_MEMORY_RESTORE_TOLERANCE_PX = 1;
 
@@ -296,6 +306,11 @@ interface ConversationTimelineProps {
   loadingOlder?: boolean;
   /** 拉取更早一窗历史（接近顶部时自动预取）。 */
   onLoadOlder?: () => Promise<void> | void;
+  /**
+   * 跟底 / 回底部钩子（宿主 releaseBalloon 已退役；保留调用点）。
+   * 仅在 following 从 false→true 时调用；上滚阅读时不要调。
+   */
+  onFollowingTip?: () => void;
   /** 宽屏问题目录挂载后一次补齐当前有效分支的全部历史。 */
   onLoadAllOlder?: () => Promise<ConversationTurnNavigatorHydrationResult>;
   /**
@@ -392,6 +407,7 @@ function ConversationTimelineImpl({
   canLoadOlder = false,
   loadingOlder = false,
   onLoadOlder,
+  onFollowingTip,
   onLoadAllOlder,
   turnNavigatorDirectoryRevision = 0,
   bottomDock,
@@ -444,43 +460,28 @@ function ConversationTimelineImpl({
     return () => observer.disconnect();
   }, [hasHeaderSlot]);
   const [liveNowMs, setLiveNowMs] = useState(() => Date.now());
-  /** 乐观追加：复用上帧 units，避免整窗 rebuild（send 路径 ~300ms longtask）。 */
-  const renderUnitsCacheRef = useRef<{
-    rows: readonly ConversationRow[];
-    liveNowMs: number;
-    sessionPhase: SessionPhase | undefined;
-    sessionBusy: boolean;
-    units: ConversationTurnRenderUnit[];
-  } | null>(null);
-  const renderUnits = useMemo(() => {
-    const options = { nowMs: liveNowMs, sessionPhase, sessionBusy };
-    const cached = renderUnitsCacheRef.current;
-    if (
-      cached &&
-      cached.liveNowMs === liveNowMs &&
-      cached.sessionPhase === sessionPhase &&
-      cached.sessionBusy === sessionBusy &&
-      cached.rows !== rows
-    ) {
-      const appended = tryAppendTrailingUserInputUnit(cached.units, cached.rows, rows, options);
-      if (appended) {
-        renderUnitsCacheRef.current = {
-          rows,
-          liveNowMs,
-          sessionPhase,
-          sessionBusy,
-          units: appended,
-        };
-        return appended;
-      }
-    }
-    const built = buildConversationTurnRenderUnits(rows, options);
-    renderUnitsCacheRef.current = { rows, liveNowMs, sessionPhase, sessionBusy, units: built };
-    return built;
-  }, [liveNowMs, rows, sessionBusy, sessionPhase]);
+  // 派生走缓存选择器：rows 按「历史 + 尾轮」分区，流式帧/时钟 tick 只 materialize 尾轮，
+  // 历史 unit 身份不变（下游 memo、virtualizer、目录都不随 token 重建）。分区由 store 的
+  // delta 增量推进，仅新轮/历史变化时整窗重切。
+  const selectRenderUnits = useMemo(() => createConversationTurnRenderUnitsSelector(), []);
+  const rowsPartition = getConversationRowsPartition(rows);
+  const renderUnitsPartition = useMemo(
+    () =>
+      selectRenderUnits(rowsPartition, {
+        nowMs: liveNowMs,
+        sessionPhase,
+        sessionBusy,
+      }),
+    [selectRenderUnits, rowsPartition, liveNowMs, sessionPhase, sessionBusy],
+  );
+  // 查找/诊断/目录 hydrate 等平面消费者仍拿扁平数组（引用逐项复用，重建成本只是数组拷贝）。
+  const renderUnits = useMemo(
+    () => [...renderUnitsPartition.history, ...renderUnitsPartition.tail],
+    [renderUnitsPartition],
+  );
   const { virtualizedUnits, liveUnit, liveUnitIndex } = useMemo(
-    () => splitConversationTimelineLiveTail(renderUnits),
-    [renderUnits],
+    () => splitConversationTimelineLiveTail(renderUnitsPartition),
+    [renderUnitsPartition],
   );
   // 「已工作」折叠乱套时打 fold_anomaly，避免再靠截图肉眼猜。
   const foldHealthSigRef = useRef("");
@@ -506,14 +507,14 @@ function ConversationTimelineImpl({
     });
   }, [renderUnits, rowContext.sessionId]);
   const hasRunningUnit = useMemo(() => renderUnits.some((unit) => unit.isRunning), [renderUnits]);
+  // 按分区收集目录成员：流式帧只看尾轮，成员不变时保持同一个 Set（锚点登记按它的身份失效）。
+  const selectTurnNavigatorQueryRowIds = useMemo(
+    () => createConversationTurnNavigatorQueryRowIdsSelector(),
+    [],
+  );
   const turnNavigatorQueryRowIds = useMemo(
-    () =>
-      new Set(
-        renderUnits.flatMap((unit) =>
-          unit.visibleUserInputs.filter((row) => row.origin === "realUser").map((row) => row.rowId),
-        ),
-      ),
-    [renderUnits],
+    () => selectTurnNavigatorQueryRowIds(renderUnitsPartition),
+    [selectTurnNavigatorQueryRowIds, renderUnitsPartition],
   );
   const turnNavigatorQueryRowIdsRef = useRef(turnNavigatorQueryRowIds);
   turnNavigatorQueryRowIdsRef.current = turnNavigatorQueryRowIds;
@@ -532,10 +533,14 @@ function ConversationTimelineImpl({
   const stableContentWidthRef = useRef<number | null>(null);
   const contentWidthResizeActiveRef = useRef(false);
   const contentWidthResizeSettleTimerRef = useRef<number | null>(null);
+  const committingMeasuredLayoutRef = useRef(false);
+  const contentMeasurementPendingRef = useRef(false);
+  const messageLayerMaskObserverRef = useRef<ResizeObserver | null>(null);
   const isContentWidthChanging = useCallback(() => {
     const currentContentWidth = virtualHistoryRef.current?.clientWidth ?? null;
     const stableContentWidth = stableContentWidthRef.current;
     return (
+      committingMeasuredLayoutRef.current ||
       contentWidthResizeActiveRef.current ||
       (currentContentWidth !== null &&
         stableContentWidth !== null &&
@@ -581,7 +586,6 @@ function ConversationTimelineImpl({
     viewportHeightPx: 0,
     activeQueryRowId: undefined as number | undefined,
   });
-  const [turnNavigatorContainerWidthPx, setTurnNavigatorContainerWidthPx] = useState(0);
   const turnNavigatorJumpFrameRef = useRef<number | null>(null);
   const turnNavigatorHydrationAttemptRef = useRef<{
     attemptCount: number;
@@ -590,6 +594,36 @@ function ConversationTimelineImpl({
     status: "idle" | "in-flight" | "waiting" | "terminal";
   }>({ attemptCount: 0, key: null, retryTimer: null, status: "idle" });
   const [turnNavigatorHydrationRetryRevision, setTurnNavigatorHydrationRetryRevision] = useState(0);
+  /**
+   * 数据补拉 vs rail 显隐拆开：
+   * - 补拉：有更早 rows 就 `loadAllOlder`（不看宽；否则永远尾窗，滚动条突然撑高）
+   * - rail：等目录补齐 + ≥2 query 才挂载（避免半截刻度）。**不再用 ≥864 JS 门闸**——
+   *   evopanel 未产出 `@min-[864px]/conversation` utility，真显隐由 styles-bridge
+   *   对可见 host 强制露出；JS 再卡 864 会在常见窄主栏（~475）永远不挂载，
+   *   表现为「有时有进度条、有时要上拉等一会儿才出 / 刻度不准」。
+   */
+  const needsTurnNavigatorHydration =
+    !hideTurnNavigator && Boolean(onLoadAllOlder) && canLoadOlder;
+  const turnNavigatorHydrationKey = `${sessionKey}:${rowContext.logEpoch ?? "unknown"}:${turnNavigatorDirectoryRevision}`;
+  const [turnNavigatorReadyKey, setTurnNavigatorReadyKey] = useState<string | null>(null);
+  /** 目录补拉结束后贴底（坏记忆 top=0 / 前插丢 follow 时收回）。 */
+  const followAtLoadOlderStartRef = useRef(false);
+  const pinBottomAfterDirectoryHydrationRef = useRef(false);
+  /** 与 pin 分离：loadingOlder 边沿贴底后不清，等 hydrated epoch 再清。 */
+  const directoryStickRequestedRef = useRef(false);
+  const prevLoadingOlderRef = useRef(loadingOlder);
+  const [directoryStickEpoch, setDirectoryStickEpoch] = useState(0);
+  const turnNavigatorDirectoryReady =
+    !needsTurnNavigatorHydration || turnNavigatorReadyKey === turnNavigatorHydrationKey;
+  const turnNavigatorEnabled =
+    !hideTurnNavigator &&
+    turnNavigatorQueryRowIds.size >= 2 &&
+    turnNavigatorDirectoryReady;
+  /** 补拉中占位：让用户知道左侧轨还在，而不是「进度条消失了」。 */
+  const turnNavigatorHydratingPlaceholder =
+    !hideTurnNavigator &&
+    !turnNavigatorEnabled &&
+    needsTurnNavigatorHydration;
   const timelineRootRef = useRef<HTMLDivElement>(null);
   const composerDockRef = useRef<HTMLDivElement>(null);
   const shareSelectionPanelLayoutRef = useRef<{
@@ -671,51 +705,25 @@ function ConversationTimelineImpl({
     return () => window.clearInterval(timer);
   }, [hasRunningUnit]);
 
-  useLayoutEffect(() => {
-    const element = timelineRootRef.current;
-    if (!element) return;
-
-    // rail 改由 CSS container query 隐藏后，完整历史补拉失去了同一宽度
-    // 资格边界，手机远控与窄分屏也会请求全部 rows。这里仅同步只读分页资格；
-    // rail 的显隐、占位与过渡仍完全由 CSS 裁决，不恢复 composer 几何测量。
-    const commitWidth = (width: number) => {
-      const normalizedWidth = Math.max(0, Math.round(width));
-      setTurnNavigatorContainerWidthPx((current) =>
-        current === normalizedWidth ? current : normalizedWidth,
-      );
-    };
-    const readWidth = () => commitWidth(element.clientWidth);
-    readWidth();
-
-    if (typeof ResizeObserver !== "undefined") {
-      const observer = new ResizeObserver((entries) => {
-        const entry = entries[0];
-        const borderBox = entry?.borderBoxSize?.[0];
-        commitWidth(borderBox?.inlineSize ?? entry?.contentRect.width ?? element.clientWidth);
-      });
-      observer.observe(element);
-      return () => observer.disconnect();
-    }
-
-    window.addEventListener("resize", readWidth);
-    return () => window.removeEventListener("resize", readWidth);
-  }, []);
+  useEffect(() => {
+    // 切会话清 ready，避免上一会话 terminal key 在 canLoadOlder 抖动时误开半截目录。
+    setTurnNavigatorReadyKey(null);
+  }, [sessionKey]);
 
   useEffect(() => {
+    // EvoFlow：补拉不看 864 宽（主栏常更窄）；ZCode 原 helper 用宽门闸避免手机远控白拉。
     if (
-      !shouldHydrateConversationTurnNavigatorDirectory({
-        canLoadOlder,
-        containerWidthPx: turnNavigatorContainerWidthPx,
-        hasLoadHandler: Boolean(onLoadAllOlder),
-        loadingOlder,
-      })
+      hideTurnNavigator ||
+      !canLoadOlder ||
+      loadingOlder ||
+      !onLoadAllOlder
     ) {
       return;
     }
     // terminal key 必须与 store turnNavigatorDirectoryRevision 同步。
     // 仅用 sessionKey + logEpoch 时，real-user query 增删不换 epoch，
     // 组件层 terminal 永久拦截，store 即使失效缓存也无法重新探测。
-    const hydrationKey = `${sessionKey}:${rowContext.logEpoch ?? "unknown"}:${turnNavigatorDirectoryRevision}`;
+    const hydrationKey = turnNavigatorHydrationKey;
     const attempt = turnNavigatorHydrationAttemptRef.current;
     if (attempt.key !== hydrationKey) {
       if (attempt.retryTimer !== null) window.clearTimeout(attempt.retryTimer);
@@ -725,9 +733,29 @@ function ConversationTimelineImpl({
         retryTimer: null,
         status: "idle" as const,
       });
+    } else if (attempt.status === "terminal" && canLoadOlder) {
+      // 同 session 再进：组件级 terminal 仍在，但投影可能已退回尾窗 → 允许重拉。
+      attempt.status = "idle";
+      attempt.attemptCount = 0;
     }
     if (attempt.status !== "idle" || !onLoadAllOlder) return;
     attempt.status = "in-flight";
+    // 目录补拉开局：默认结束后贴底。仅当记忆明确「离底且 scrollTop>8」才保留锚点。
+    // 坏记忆 top=0 + wasPinned=false 仍贴底（现场 selectSession 后 top=0）。
+    {
+      const el = scrollRef.current;
+      const scrollTop = el?.scrollTop ?? 0;
+      const memory = readChatSessionScrollMemoryState(scrollMemoryKey);
+      const memoryTop = memory?.scrollTop ?? 0;
+      const readingHistory =
+        memory != null &&
+        memory.wasPinnedToBottom === false &&
+        Math.max(scrollTop, memoryTop) > 8;
+      if (!readingHistory) {
+        pinBottomAfterDirectoryHydrationRef.current = true;
+        directoryStickRequestedRef.current = true;
+      }
+    }
     logger.debug("[v4-turn-navigator] 目录请求补齐完整历史", {
       attempt: attempt.attemptCount + 1,
       loadedRows: rows.length,
@@ -738,18 +766,25 @@ function ConversationTimelineImpl({
       if (attempt.key !== hydrationKey) return;
       if (result.status === "hydrated" || result.status === "not-enough-queries") {
         attempt.status = "terminal";
+        setTurnNavigatorReadyKey(hydrationKey);
+        if (directoryStickRequestedRef.current) {
+          setDirectoryStickEpoch((epoch) => epoch + 1);
+        }
         return;
       }
-      if (result.status === "stale") {
-        attempt.status = "idle";
-        return;
-      }
+      // stale/retryable：sticky 先画而 store 仍 error/无 snapshot（subscribe timeout）时
+      // 不可 idle 停死——否则 canLoadOlder=true 却永远停在尾窗（现场 120/1476）。
       attempt.attemptCount += 1;
       const retryDelayMs = resolveConversationTurnNavigatorHydrationRetryDelayMs(
         attempt.attemptCount,
       );
       if (retryDelayMs === null) {
         attempt.status = "terminal";
+        // 重试耗尽：仍展示当前窗，避免目录永远空白。
+        setTurnNavigatorReadyKey(hydrationKey);
+        if (directoryStickRequestedRef.current) {
+          setDirectoryStickEpoch((epoch) => epoch + 1);
+        }
         return;
       }
       attempt.status = "waiting";
@@ -762,14 +797,16 @@ function ConversationTimelineImpl({
     });
   }, [
     canLoadOlder,
+    hideTurnNavigator,
     loadingOlder,
     onLoadAllOlder,
     rowContext.logEpoch,
     rows,
+    scrollMemoryKey,
     sessionKey,
     totalCount,
-    turnNavigatorContainerWidthPx,
     turnNavigatorDirectoryRevision,
+    turnNavigatorHydrationKey,
     turnNavigatorHydrationRetryRevision,
   ]);
 
@@ -839,6 +876,7 @@ function ConversationTimelineImpl({
     return resolved;
   }, []);
 
+  const [measuredLayoutRevision, commitMeasuredLayout] = useState(0);
   const virtualizer = useVirtualizer({
     count: virtualizedUnits.length,
     getScrollElement,
@@ -893,43 +931,97 @@ function ConversationTimelineImpl({
           virtualizer.resizeItem(i, size);
         }
       }
-      // 仅在「仍跟随 / 记忆贴底」时首帧恢复跟底；rAF 只在 following 仍为 true 时补贴，
-      // 不得再用陈旧 wasPinnedToBottom 把用户已上滚的历史拽回底部。
-      const memoryPinned =
-        !!scrollMemoryKey &&
-        readChatSessionScrollMemoryState(scrollMemoryKey)?.wasPinnedToBottom === true;
-      if (followingRef.current || memoryPinned) {
+      // 仅在「仍跟随 / 记忆贴底」时首帧恢复跟底；用户已明确上滚则不得用陈旧
+      // wasPinnedToBottom 把历史拽回底部。此处直接读 intent ref（getActiveUserScrollIntent
+      // 声明在后，layout effect 依赖里引用会 TDZ）。
+      const intentObserved = userScrollIntentRef.current;
+      const awayIntent =
+        intentObserved.intent === "awayFromBottom" &&
+        Date.now() - intentObserved.observedAt <= USER_SCROLL_INTENT_TTL_MS;
+      const memory = scrollMemoryKey
+        ? readChatSessionScrollMemoryState(scrollMemoryKey)
+        : null;
+      const oldMax = memory
+        ? Math.max(0, memory.scrollHeight - memory.clientHeight)
+        : 0;
+      const memoryWasAtBottom =
+        memory != null &&
+        (memory.wasPinnedToBottom === true || memory.scrollTop >= oldMax - 48);
+      const memoryPinned = !awayIntent && memoryWasAtBottom;
+      // 先只恢复 following 标记，勿立刻 scrollToBottom——切回首帧 DOM/估高常未对齐，
+      // 贴底会把 scrollTop 钳到塌缩后的 scrollHeight（半屏白）。等双 rAF+measure 后再贴。
+      if (!awayIntent && (followingRef.current || memoryPinned)) {
         if (!followingRef.current) {
           followingRef.current = true;
           setBackToBottomVisible(false);
         }
-        becomeVisibleFollowBottomRef.current?.();
+        // KeepAlive 隐藏态可能误置 userAdjusted；跟底切回必须允许贴底。
+        userAdjustedScrollSinceRestoreRef.current = false;
       }
       let cancelled = false;
       let raf2 = 0;
+      let settleTimer: number | null = null;
+      const stickIfFollowing = () => {
+        if (cancelled) return;
+        const later = userScrollIntentRef.current;
+        const laterAway =
+          later.intent === "awayFromBottom" &&
+          Date.now() - later.observedAt <= USER_SCROLL_INTENT_TTL_MS;
+        if (followingRef.current && !laterAway) {
+          becomeVisibleFollowBottomRef.current?.();
+        }
+      };
       const raf1 = window.requestAnimationFrame(() => {
         raf2 = window.requestAnimationFrame(() => {
           if (cancelled) return;
           virtualizer.measure();
-          layoutScrollGuardUntilRef.current = Date.now() + LAYOUT_SCROLL_GUARD_MS;
-          if (followingRef.current) {
-            becomeVisibleFollowBottomRef.current?.();
+          // 再扫一遍挂载行：首帧 querySelector 可能还是隐藏态矮高
+          const root2 = scrollRef.current;
+          if (root2) {
+            root2.querySelectorAll("[data-v4-turn-unit][data-index]").forEach((node) => {
+              const idx = Number((node as HTMLElement).getAttribute("data-index"));
+              if (!Number.isFinite(idx)) return;
+              const h = Math.round((node as HTMLElement).getBoundingClientRect().height);
+              if (h <= DEFAULT_ROW_HEIGHT_ESTIMATE_PX) return;
+              const key = getUnitHeightCacheKey(units[idx]);
+              if (key !== undefined) cache?.set(key, h);
+              virtualizer.resizeItem(idx, h);
+            });
           }
+          layoutScrollGuardUntilRef.current = Date.now() + LAYOUT_SCROLL_GUARD_MS;
+          stickIfFollowing();
+          // 估高→实高常滞后双 rAF；跟底时再补几次，避免 follow=1 却 dist 上千
+          // （现场 KeepAlive 切回 dist≈2996）。
+          let settleN = 0;
+          const settle = () => {
+            if (cancelled) return;
+            stickIfFollowing();
+            settleN += 1;
+            if (settleN < 4) {
+              settleTimer = window.setTimeout(settle, 80 * settleN);
+            } else {
+              settleTimer = null;
+            }
+          };
+          settleTimer = window.setTimeout(settle, 80);
         });
       });
       return () => {
         cancelled = true;
         window.cancelAnimationFrame(raf1);
         if (raf2) window.cancelAnimationFrame(raf2);
+        if (settleTimer !== null) window.clearTimeout(settleTimer);
       };
     }
-    return undefined;
+  return undefined;
   }, [layoutActive, virtualizer, scrollMemoryKey]);
 
   // 可见态持续 heal：浮层已实证「DOM h=383 但 gap→72」——virtualizer 仍信估高，
   // 仅靠 RO/切会话 heal 不够。挂载行若 rect 明显大于当前 size，强制 resizeItem。
+  // 批测高在途时让位 ZCode 同步提交路径，避免上滚/流式帧里与 stickToBottom 互抢。
   const healMountedTurnHeights = useCallback(() => {
     if (!layoutActiveRef.current) return 0;
+    if (contentMeasurementPendingRef.current || committingMeasuredLayoutRef.current) return 0;
     const root = scrollRef.current;
     if (!root) return 0;
     const cache = heightCacheRef.current;
@@ -957,24 +1049,54 @@ function ConversationTimelineImpl({
   }, [virtualizer]);
 
   virtualizer.shouldAdjustScrollPositionOnItemSizeChange = (item) => {
+    // 此处在 getActiveUserScrollIntent 声明之前赋值，直接读 ref（同 TTL）。
+    const intentObserved = userScrollIntentRef.current;
+    const interactionActive =
+      touchClientYRef.current !== null || scrollbarPointerIdRef.current !== null;
+    const liveIntent: TimelineUserScrollIntent = interactionActive
+      ? intentObserved.intent === "none"
+        ? "unknown"
+        : intentObserved.intent
+      : Date.now() - intentObserved.observedAt <= USER_SCROLL_INTENT_TTL_MS
+        ? intentObserved.intent
+        : "none";
     const adjust = shouldAdjustVirtualizerForItemSizeChange({
-      suppressAdjustment: suppressVirtualizerAdjustmentDuringRestoreRef.current,
+      // 前插批次由下方 prepend 锚点统一补偿；逐行测高再补一次会把阅读位置推到底部。
+      suppressAdjustment:
+        suppressVirtualizerAdjustmentDuringRestoreRef.current ||
+        (contentMeasurementPendingRef.current &&
+          prependAnchorRef.current.firstRowId !== null &&
+          (rowsRef.current[0]?.rowId ?? Infinity) < prependAnchorRef.current.firstRowId),
       following: followingRef.current,
       contentWidthChanging: isContentWidthChanging(),
       itemEnd: item.end,
-      scrollTop: scrollRef.current?.scrollTop ?? 0,
+      // 同批 RO 的 item 坐标尚未重算，原生 scrollTop 已含前一行补偿；混用会把目标之后
+      // 的行也判为视口上方。比较 virtualizer 同一测量批次的偏移，再由原生 scroll 入账。
+      scrollTop: virtualizer.scrollOffset ?? scrollRef.current?.scrollTop ?? 0,
+      // CUA 截图长高时：往下划不要抬 scrollTop（否则像整窗往上抽）。
+      userScrollIntent: liveIntent,
     });
     if (adjust) recordScrollWrite("virtualizerItemSizeAdjust", scrollRef.current);
     return adjust;
   };
   const virtualRows = virtualizer.getVirtualItems();
   const totalSize = virtualizer.getTotalSize();
+  // 目录高亮要用「全窗」unit 几何，不能只用 overscan 的 getVirtualItems()——
+  // 否则长会话里多数 query 不在缓存窗，active 刻度会跳错/贴错（进会话刻度不准）。
   const turnNavigatorVirtualItems: ConversationTurnNavigatorVirtualItem[] = useMemo(() => {
-    const historyItems = virtualRows.map((row) => ({
-      index: row.index,
-      size: row.size,
-      start: row.start,
-    }));
+    const cache = virtualizer.measurementsCache;
+    const historyItems =
+      cache.length > 0
+        ? cache.map((row) => ({
+            index: row.index,
+            size: row.size,
+            start: row.start,
+          }))
+        : virtualRows.map((row) => ({
+            index: row.index,
+            size: row.size,
+            start: row.start,
+          }));
     if (liveUnitIndex === null) return historyItems;
     return [
       ...historyItems,
@@ -985,14 +1107,15 @@ function ConversationTimelineImpl({
         size: Number.MAX_SAFE_INTEGER - totalSize,
       },
     ];
-  }, [liveUnitIndex, totalSize, virtualRows]);
+  }, [liveUnitIndex, totalSize, virtualRows, virtualizer.measurementsCache]);
   const mountedRowsKey = useMemo(
     () =>
       [
-        ...virtualRows.map((row) => String(row.key)),
+        measuredLayoutRevision,
+        ...virtualRows.map((row) => `${row.key}:${row.start}:${row.size}`),
         ...(liveUnit === null ? [] : [String(liveUnit.key)]),
       ].join(":"),
-    [liveUnit, virtualRows],
+    [liveUnit, measuredLayoutRevision, virtualRows],
   );
 
   useLayoutEffect(() => {
@@ -1016,7 +1139,10 @@ function ConversationTimelineImpl({
     const el = scrollRef.current;
     if (!el) return;
     let raf = 0;
+    // 跟底时流式/测高会持续变高，滚动中补一次 heal 即可。
+    // 离底上滚时禁止 scroll 联动 heal：每帧 resizeItem + 逐行补偿会把阅读位置推飞。
     const onScroll = () => {
+      if (!followingRef.current) return;
       if (raf) return;
       raf = window.requestAnimationFrame(() => {
         raf = 0;
@@ -1024,7 +1150,9 @@ function ConversationTimelineImpl({
       });
     };
     el.addEventListener("scroll", onScroll, { passive: true });
+    // 周期 heal 只在跟底时跑；离底靠 batch measure + 切回可见 heal 纠偏。
     const timer = window.setInterval(() => {
+      if (!followingRef.current) return;
       healMountedTurnHeights();
     }, 1000);
     return () => {
@@ -1035,19 +1163,41 @@ function ConversationTimelineImpl({
   }, [layoutActive, healMountedTurnHeights, sessionKey]);
 
 
+  const programmaticScrollUntilRef = useRef(0);
   const markProgrammaticScroll = useCallback(() => {
+    programmaticScrollUntilRef.current = performance.now() + PROGRAMMATIC_SCROLL_HOLD_MS;
     if (programmaticScrollFrameRef.current !== null) {
       window.cancelAnimationFrame(programmaticScrollFrameRef.current);
     }
-    programmaticScrollFrameRef.current = window.requestAnimationFrame(() => {
+    const tick = () => {
+      if (performance.now() < programmaticScrollUntilRef.current) {
+        programmaticScrollFrameRef.current = window.requestAnimationFrame(tick);
+        return;
+      }
       programmaticScrollFrameRef.current = null;
-    });
+    };
+    programmaticScrollFrameRef.current = window.requestAnimationFrame(tick);
   }, []);
+  const isProgrammaticScrollActive = useCallback(
+    () => performance.now() < programmaticScrollUntilRef.current,
+    [],
+  );
+
+  const onFollowingTipRef = useRef(onFollowingTip);
+  onFollowingTipRef.current = onFollowingTip;
 
   const commitFollowing = useCallback((following: boolean) => {
     if (followingRef.current === following) return;
     followingRef.current = following;
     setBackToBottomVisible(shouldShowBackToBottom(following, unitsRef.current.length));
+    // 跟底恢复：收回上滚 balloon，避免 800+ 行全进窗拖死 virtualizer。
+    if (following) {
+      try {
+        onFollowingTipRef.current?.();
+      } catch {
+        /* best-effort */
+      }
+    }
   }, []);
 
   const clearUserScrollIntent = useCallback(() => {
@@ -1088,11 +1238,64 @@ function ConversationTimelineImpl({
     [commitFollowing],
   );
 
+  /**
+   * 预取更早行。scroll 与「到顶继续上滚」的 wheel 共用：几何顶 scrollTop=0 时
+   * 继续 wheel 不再产生 scroll 事件，只靠 onScroll 会永远卡住（轨迹 auto=1 /
+   * loading=0 / winFirst 不前进）。
+   */
+  const tryLoadOlderNearTop = useCallback((element: HTMLDivElement, following: boolean) => {
+    const loadOlder = loadOlderRef.current;
+    const triggerPx = historyPrefetchTriggerPx(element.clientHeight);
+    const distanceFromBottom = Math.max(
+      0,
+      element.scrollHeight - element.scrollTop - element.clientHeight,
+    );
+    if (
+      !shouldTriggerLoadOlder({
+        scrollTop: element.scrollTop,
+        canLoadOlder: loadOlder.canLoadOlder,
+        loadingOlder: loadOlder.loadingOlder,
+        triggerPx,
+        following,
+        distanceFromBottom,
+        viewportHeight: element.clientHeight,
+        // 往下划读 CUA 截图时禁止预取带 loadOlder，否则 prependAnchorAdjust 会把视口往上拽。
+        userScrollIntent: getActiveUserScrollIntent(),
+      })
+    ) {
+      return false;
+    }
+    const anchorMeasurement = virtualizer.getVirtualItemForOffset(element.scrollTop);
+    const anchorUnit = anchorMeasurement
+      ? virtualizedUnitsRef.current[anchorMeasurement.index]
+      : undefined;
+    pendingPrependVirtualAnchorRef.current =
+      anchorMeasurement && anchorUnit?.key === anchorMeasurement.key
+        ? {
+            key: anchorUnit.key,
+            offsetTop: anchorMeasurement.start - element.scrollTop,
+            start: anchorMeasurement.start,
+          }
+        : null;
+    logger.debug("[v4-timeline] 接近历史窗口顶部，自动预取更早行", {
+      scrollTop: element.scrollTop,
+      triggerPx,
+    });
+    void loadOlder.onLoadOlder?.();
+    return true;
+  }, [getActiveUserScrollIntent, virtualizer]);
+
   const handleWheelCapture = useCallback(
     (event: ReactWheelEvent<HTMLDivElement>) => {
-      markUserScrollIntent(timelineWheelScrollIntent(event.deltaY));
+      const intent = timelineWheelScrollIntent(event.deltaY);
+      markUserScrollIntent(intent);
+      // 到顶后继续上滚：没有 scroll Δ，必须在 wheel 上补一次 loadOlder。
+      if (intent !== "awayFromBottom") return;
+      const element = scrollRef.current;
+      if (!element) return;
+      tryLoadOlderNearTop(element, false);
     },
-    [markUserScrollIntent],
+    [markUserScrollIntent, tryLoadOlderNearTop],
   );
 
   const handleTouchStartCapture = useCallback((event: ReactTouchEvent<HTMLDivElement>) => {
@@ -1235,9 +1438,15 @@ function ConversationTimelineImpl({
     sync();
     if (typeof ResizeObserver !== "undefined") {
       const observer = new ResizeObserver(sync);
+      messageLayerMaskObserverRef.current = observer;
       observer.observe(scrollElement);
       observer.observe(messageLayer);
-      return () => observer.disconnect();
+      return () => {
+        observer.disconnect();
+        if (messageLayerMaskObserverRef.current === observer) {
+          messageLayerMaskObserverRef.current = null;
+        }
+      };
     }
 
     window.addEventListener("resize", sync);
@@ -1251,11 +1460,16 @@ function ConversationTimelineImpl({
         viewportHeight: element.clientHeight,
         contentHeight: element.scrollHeight,
       };
-      const wasPinnedToBottom = reconcileFollowingForContentAnchor({
-        following: followingRef.current,
-        metrics,
-        lastObservedScrollTop: lastObservedScrollTopRef.current,
-      });
+      // 几何已贴底必须记 pinned：尾窗底 scrollTop 在全量恢复时会被 clamp 成「中部」，
+      // 若只信 followingRef（曾被前插打成 false）会把人钉在半截（现场 dist≈273）。
+      const geometricallyPinned = isAtBottom(metrics);
+      const wasPinnedToBottom =
+        geometricallyPinned ||
+        reconcileFollowingForContentAnchor({
+          following: followingRef.current,
+          metrics,
+          lastObservedScrollTop: lastObservedScrollTopRef.current,
+        });
       return {
         scrollTop: element.scrollTop,
         scrollHeight: element.scrollHeight,
@@ -1312,13 +1526,31 @@ function ConversationTimelineImpl({
     [],
   );
 
+  /** 上一帧 scrollHeight；骤降时禁止贴底，避免钳到 top≈0 半屏空白。 */
+  const lastStickScrollHeightRef = useRef(0);
   // 贴底必须 instant（scrollTop 赋值）：smooth 的中间帧会被 scroll 判定误读为「离底」。
   const scrollToBottom = useCallback(() => {
     const element = scrollRef.current;
     if (!element) return;
     markProgrammaticScroll();
+    markLayoutScrollGuard();
     // 草稿安全居中允许内容在低高度下向下溢出；若沿用真实会话吸底，
     // 顶部安全留白会被滚走。草稿始终展示顶部，真实会话继续吸底。
+    const nextHeight = element.scrollHeight;
+    const prevHeight = lastStickScrollHeightRef.current;
+    // KeepAlive 切回 / 软顶裁窗时 scrollHeight 先掉几百～上千再涨回来。
+    // 骤降帧若仍 scrollTop=scrollHeight，会被钳到接近 0 → 半屏白；等测高恢复后再贴。
+    if (
+      !responsiveCenteredEmptyLayout &&
+      prevHeight > 0 &&
+      nextHeight < prevHeight - 400
+    ) {
+      recordScrollWrite("scrollToBottom", element);
+      lastStickScrollHeightRef.current = nextHeight;
+      lastObservedScrollTopRef.current = element.scrollTop;
+      return;
+    }
+    lastStickScrollHeightRef.current = nextHeight;
     recordScrollWrite("scrollToBottom", element);
     element.scrollTop = responsiveCenteredEmptyLayout ? 0 : element.scrollHeight;
     // 回读取钳制后的落点入账（浏览器会把赋值钳到最大可滚动距离）。
@@ -1329,6 +1561,7 @@ function ConversationTimelineImpl({
     notifyScrollObserversAfterCommit(element);
   }, [
     cacheCurrentScrollMemoryState,
+    markLayoutScrollGuard,
     responsiveCenteredEmptyLayout,
     markProgrammaticScroll,
     notifyScrollObserversAfterCommit,
@@ -1338,21 +1571,176 @@ function ConversationTimelineImpl({
   // KeepAlive 切回贴底：只在 following 仍成立时执行。
   // 禁止读陈旧 wasPinnedToBottom 再 commitFollowing(true)——用户上滚看历史后
   // rAF/measure 会把人拽回底部，表现为「往上滚历史不显示」。
+  // 隐藏态 clientHeight≈0 可能把 scroll 记成「用户调过」；跟底切回时清掉该闩。
   becomeVisibleFollowBottomRef.current = () => {
     if (!followingRef.current) return;
-    if (userAdjustedScrollSinceRestoreRef.current) return;
+    if (
+      userAdjustedScrollSinceRestoreRef.current &&
+      getActiveUserScrollIntent() === "awayFromBottom"
+    ) {
+      return;
+    }
+    userAdjustedScrollSinceRestoreRef.current = false;
     markLayoutScrollGuard();
     commitFollowing(true);
     scrollToBottom();
   };
+
+  /**
+   * loadAllOlder / loadOlder 结束贴底。
+   * 现场（selectSession → 1476 行）：补拉前插后 scrollTop 停在 0、follow=false，
+   * 离底上万 px。目录补拉默认贴底；用户明确离底阅读（scrollTop>8）不抢。
+   */
+  useLayoutEffect(() => {
+    const was = prevLoadingOlderRef.current;
+    prevLoadingOlderRef.current = loadingOlder;
+    if (!was && loadingOlder) {
+      followAtLoadOlderStartRef.current = followingRef.current;
+      const el = scrollRef.current;
+      const scrollTop = el?.scrollTop ?? 0;
+      const memory = readChatSessionScrollMemoryState(scrollMemoryKey);
+      const memoryTop = memory?.scrollTop ?? 0;
+      const readingHistory =
+        memory != null &&
+        memory.wasPinnedToBottom === false &&
+        Math.max(scrollTop, memoryTop) > 8;
+      if (!readingHistory || followingRef.current) {
+        pinBottomAfterDirectoryHydrationRef.current = true;
+        directoryStickRequestedRef.current = true;
+      }
+    }
+    if (!(was && !loadingOlder)) return;
+    if (getActiveUserScrollIntent() === "awayFromBottom") {
+      pinBottomAfterDirectoryHydrationRef.current = false;
+      directoryStickRequestedRef.current = false;
+      return;
+    }
+    if (
+      !followAtLoadOlderStartRef.current &&
+      !pinBottomAfterDirectoryHydrationRef.current &&
+      !directoryStickRequestedRef.current
+    ) {
+      return;
+    }
+    pinBottomAfterDirectoryHydrationRef.current = false;
+    followAtLoadOlderStartRef.current = false;
+    markLayoutScrollGuard();
+    commitFollowing(true);
+    scrollToBottom();
+  }, [
+    commitFollowing,
+    getActiveUserScrollIntent,
+    loadingOlder,
+    markLayoutScrollGuard,
+    scrollMemoryKey,
+    scrollToBottom,
+  ]);
+
+  useLayoutEffect(() => {
+    if (directoryStickEpoch <= 0) return;
+    if (getActiveUserScrollIntent() === "awayFromBottom") {
+      directoryStickRequestedRef.current = false;
+      pinBottomAfterDirectoryHydrationRef.current = false;
+      return;
+    }
+    // epoch 由目录 hydrated 触发：内容已合并后再贴，兜底 loadingOlder 边沿时高度未齐。
+    directoryStickRequestedRef.current = false;
+    pinBottomAfterDirectoryHydrationRef.current = false;
+    markLayoutScrollGuard();
+    commitFollowing(true);
+    scrollToBottom();
+  }, [
+    commitFollowing,
+    directoryStickEpoch,
+    getActiveUserScrollIntent,
+    markLayoutScrollGuard,
+    scrollToBottom,
+  ]);
 
   useLayoutEffect(() => {
     const contentColumn = virtualHistoryRef.current;
     if (!contentColumn || typeof ResizeObserver === "undefined") return;
 
     stableContentWidthRef.current = contentColumn.clientWidth;
+    let observedViewportHeight = scrollRef.current?.clientHeight ?? 0;
+    let observeContentFrame: number | null = null;
+    let disposed = false;
     const observer = new ResizeObserver(() => {
       const nextWidth = contentColumn.clientWidth;
+      const element = scrollRef.current;
+      if (!element) return;
+      const viewportHeightChanged = observedViewportHeight !== element.clientHeight;
+      observedViewportHeight = element.clientHeight;
+      if (nextWidth === stableContentWidthRef.current && !viewportHeightChanged) return;
+      markLayoutScrollGuard();
+      commitFollowing(
+        reconcileFollowingForContentAnchor({
+          following: followingRef.current,
+          metrics: {
+            scrollTop: element.scrollTop,
+            viewportHeight: element.clientHeight,
+            contentHeight: element.scrollHeight,
+          },
+          lastObservedScrollTop: lastObservedScrollTopRef.current,
+          userScrollIntent: getActiveUserScrollIntent(),
+        }),
+      );
+      if (followingRef.current) {
+        if (contentWidthResizeSettleTimerRef.current !== null) {
+          window.clearTimeout(contentWidthResizeSettleTimerRef.current);
+          contentWidthResizeSettleTimerRef.current = null;
+        }
+        // 本批次统一提交布局与吸底，其间其他内容 effect 不得按中间高度吸底。
+        observer.unobserve(contentColumn);
+        const messageLayer = messageLayerRef.current;
+        const maskObserver = messageLayerMaskObserverRef.current;
+        // 同步占位高度也会改变父消息层的高度；其蒙层观察器需要一起暂停，
+        // 否则在更深层的 RO 通知中改变父层，会产生 undelivered notifications。
+        if (messageLayer) maskObserver?.unobserve(messageLayer);
+        committingMeasuredLayoutRef.current = true;
+        try {
+          // virtualizer 的 ResizeObserver 默认异步提交 React；先吸底会使用旧占位高度，
+          // 下一帧测高提交后再跳一次。仅在 observer 内批量测高并同步提交，避免跨帧追赶。
+          const measurements = Array.from(
+            contentColumn.querySelectorAll(":scope > [data-index]"),
+            (node) => ({
+              index: Number(node.getAttribute("data-index")),
+              height: measureElement(node, undefined),
+            }),
+          );
+          flushSync(() => {
+            for (const item of measurements) virtualizer.resizeItem(item.index, item.height);
+            // 缓存可能已经更新且没有差量，仍需明确提交，不能依赖空回调冲刷旧任务。
+            commitMeasuredLayout((revision) => revision + 1);
+          });
+        } finally {
+          committingMeasuredLayoutRef.current = false;
+          // 暂停的是本批次会写入高度的观察目标，不推迟测高或吸底。下一帧继续
+          // 观察内容列宽度，以覆盖视口停止后仍在进行的 CSS 宽度过渡。
+          if (observeContentFrame !== null) window.cancelAnimationFrame(observeContentFrame);
+          if (!disposed) {
+            observeContentFrame = window.requestAnimationFrame(() => {
+              observeContentFrame = null;
+              observer.observe(contentColumn);
+              if (
+                messageLayer &&
+                messageLayerRef.current === messageLayer &&
+                messageLayerMaskObserverRef.current === maskObserver
+              ) {
+                maskObserver?.observe(messageLayer);
+              }
+            });
+          }
+        }
+        if (disposed) return;
+        stableContentWidthRef.current = contentColumn.clientWidth;
+        contentWidthResizeActiveRef.current = false;
+        // 同步提交可能触发其他布局处理；用户上滚或定位始终优先。
+        if (followingRef.current && getActiveUserScrollIntent() !== "awayFromBottom") {
+          scrollToBottom();
+        }
+        return;
+      }
       if (nextWidth === stableContentWidthRef.current) return;
 
       // 宽度变化会让虚拟行分批重新测高；逐行补偿或逐批追底都会
@@ -1365,22 +1753,35 @@ function ConversationTimelineImpl({
         stableContentWidthRef.current = contentColumn.clientWidth;
         contentWidthResizeActiveRef.current = false;
         contentWidthResizeSettleTimerRef.current = null;
+        // 宽度校正期间禁用测高补偿；发布既有生命周期的结束，使待定位搜索此时接管。
+        commitMeasuredLayout((revision) => revision + 1);
         if (followingRef.current) {
           scrollToBottom();
         }
       }, CONTENT_WIDTH_RESIZE_SETTLE_MS);
     });
     observer.observe(contentColumn);
+    if (scrollRef.current) observer.observe(scrollRef.current);
 
     return () => {
+      disposed = true;
       observer.disconnect();
+      if (observeContentFrame !== null) window.cancelAnimationFrame(observeContentFrame);
       if (contentWidthResizeSettleTimerRef.current !== null) {
         window.clearTimeout(contentWidthResizeSettleTimerRef.current);
         contentWidthResizeSettleTimerRef.current = null;
       }
       contentWidthResizeActiveRef.current = false;
     };
-  }, [renderUnits.length === 0, scrollToBottom]);
+  }, [
+    commitFollowing,
+    getActiveUserScrollIntent,
+    markLayoutScrollGuard,
+    measureElement,
+    renderUnits.length === 0,
+    scrollToBottom,
+    virtualizer,
+  ]);
 
   useLayoutEffect(() => {
     const element = liveTailRef.current;
@@ -1418,9 +1819,15 @@ function ConversationTimelineImpl({
         userScrollIntent: getActiveUserScrollIntent(),
       });
       commitFollowing(following);
-      if (anchorActionAfterContentChange(following, isContentWidthChanging()) === "stickToBottom") {
-        scrollToBottom();
+      if (anchorActionAfterContentChange(following, isContentWidthChanging()) !== "stickToBottom") {
+        return;
       }
+      // 已在贴底容差内就别反复 scrollToBottom——流式行高抖动时跟底+滚轮会上下抖
+      // （现场 follow=1、gap 在 1–35 间来回、src=wheel→scroll）。
+      const gap =
+        scrollElement.scrollHeight - scrollElement.scrollTop - scrollElement.clientHeight;
+      if (gap <= 2) return;
+      scrollToBottom();
     });
     observer.observe(element);
     return () => observer.disconnect();
@@ -1475,9 +1882,9 @@ function ConversationTimelineImpl({
   const handleScroll = useCallback(() => {
     const element = scrollRef.current;
     if (!element) return;
-    const programmaticScroll =
-      programmaticScrollFrameRef.current !== null &&
-      Math.abs(element.scrollTop - lastObservedScrollTopRef.current) < 1;
+    // 程序化窗内一律认 programmatic（含大 Δ）：勿要求 |Δ|&lt;1，否则贴底后的
+    // 测高/前插 scroll 会被误判 user → 丢 follow → loadOlder 雪崩叠字。
+    const programmaticScroll = isProgrammaticScrollActive();
     const userScrollIntent = getActiveUserScrollIntent();
     // 用户输入优先；guard 内且仍近底的未分类 scroll 视为布局补偿（heal/measure）。
     // 已离底时不得再当 layout——否则切会话后滚动条上翻会被 450ms remount guard
@@ -1521,44 +1928,16 @@ function ConversationTimelineImpl({
       userAdjustedScrollSinceRestoreRef.current = true;
       saveCurrentScrollMemory();
     }
-    // 只在 64px 顶边才补页时，用户会先撞到窗口边界再看到内容跳入；提前两个
-    // 视口预取，让桌面和手机 Web 共用的 renderer 在用户抵达边界前完成补页。
-    const loadOlder = loadOlderRef.current;
-    const triggerPx = historyPrefetchTriggerPx(element.clientHeight);
-    if (
-      shouldTriggerLoadOlder({
-        scrollTop: element.scrollTop,
-        canLoadOlder: loadOlder.canLoadOlder,
-        loadingOlder: loadOlder.loadingOlder,
-        triggerPx,
-      })
-    ) {
-      // 前插超过 viewport + overscan 后旧可见 turn 会被卸载，DOM 不能作为跨
-      // commit 锚点；这里保存 virtualizer 按稳定 turn key 维护的 measurement 起点。
-      const anchorMeasurement = virtualizer.getVirtualItemForOffset(element.scrollTop);
-      const anchorUnit = anchorMeasurement
-        ? virtualizedUnitsRef.current[anchorMeasurement.index]
-        : undefined;
-      pendingPrependVirtualAnchorRef.current =
-        anchorMeasurement && anchorUnit?.key === anchorMeasurement.key
-          ? {
-              key: anchorUnit.key,
-              offsetTop: anchorMeasurement.start - element.scrollTop,
-              start: anchorMeasurement.start,
-            }
-          : null;
-      logger.debug("[v4-timeline] 接近历史窗口顶部，自动预取更早行", {
-        scrollTop: element.scrollTop,
-        triggerPx,
-      });
-      loadOlder.onLoadOlder?.();
-    }
+    // 跟底时禁止预取：短尾窗 scrollTop 永远落在 2×视口预取带，会与 soft-cap /
+    // scrollToBottom 互殴（轨迹 !JUMP src=scrollToBottom + loading 抖动）。
+    tryLoadOlderNearTop(element, following);
   }, [
     commitFollowing,
     getActiveUserScrollIntent,
+    isProgrammaticScrollActive,
     saveCurrentScrollMemory,
     syncTurnNavigatorViewport,
-    virtualizer,
+    tryLoadOlderNearTop,
   ]);
 
   const handleBackToBottom = useCallback(() => {
@@ -1771,7 +2150,17 @@ function ConversationTimelineImpl({
           }
         : null;
     const restore = () => {
-      if (!restoredState || restoredState.wasPinnedToBottom === true) {
+      const oldMax = restoredState
+        ? Math.max(0, restoredState.scrollHeight - restoredState.clientHeight)
+        : 0;
+      // 旧窗底（含尾窗贴底）在全量内容上不能再按绝对 scrollTop 恢复——会停中部。
+      const wasAtOldBottom =
+        restoredState != null && restoredState.scrollTop >= oldMax - 48;
+      if (
+        !restoredState ||
+        restoredState.wasPinnedToBottom === true ||
+        wasAtOldBottom
+      ) {
         suppressVirtualizerAdjustmentDuringRestoreRef.current = false;
         followingRef.current = initialFollowing();
         setBackToBottomVisible(false);
@@ -1807,7 +2196,49 @@ function ConversationTimelineImpl({
     virtualizer,
   ]);
 
+  // 冷恢复先展示末尾窗口，再补齐同一 turnId 的正文；稳定 ref 不会重新测高，
+  // 只等 ResizeObserver 会先画出新正文和旧坐标，造成一帧重叠。提交后批量读取
+  // 已挂载轮次，在 layout 阶段更新既有 virtualizer；下一次同步提交后再对账锚点。
+  //
+  // 禁止依赖 virtualRows：resizeItem / commitMeasuredLayout 每帧都会换新数组引用，
+  // 再叠 1px 测高抖动就会 Maximum update depth（React #185）。窗缘 + 行数够触发重测。
   useLayoutEffect(() => {
+    if (committingMeasuredLayoutRef.current) return;
+    const renderedSizes = new Map(
+      virtualizer.getVirtualItems().map((row) => [row.index, row.size]),
+    );
+    const measurements = Array.from(
+      virtualHistoryRef.current?.querySelectorAll(":scope > [data-index]") ?? [],
+      (node) => ({
+        index: Number(node.getAttribute("data-index")),
+        height: measureElement(node, undefined),
+      }),
+    ).filter((item) => {
+      if (!Number.isFinite(item.index) || item.height <= 0) return false;
+      const prev = renderedSizes.get(item.index);
+      if (prev === undefined) return true;
+      // 允许 1px 误差，避免亚像素/滚动条 gutter 来回顶
+      return Math.abs(prev - item.height) > 1;
+    });
+    contentMeasurementPendingRef.current = measurements.length > 0;
+    if (measurements.length === 0) return;
+    committingMeasuredLayoutRef.current = true;
+    try {
+      for (const item of measurements) {
+        virtualizer.resizeItem(item.index, item.height);
+      }
+      // RO 可能已写入缓存但尚未提交 DOM；此时 resizeItem 无差量，也要提交坐标。
+      commitMeasuredLayout((revision) => revision + 1);
+    } finally {
+      // 同一次 layout 链路里勿再入；微任务后再放行 heal / 下一批测高。
+      void Promise.resolve().then(() => {
+        committingMeasuredLayoutRef.current = false;
+      });
+    }
+  }, [measureElement, rowWindowKey, virtualizedUnits.length, virtualizer]);
+
+  useLayoutEffect(() => {
+    if (contentMeasurementPendingRef.current) return;
     const pendingRestore = pendingDetachedScrollRestoreRef.current;
     if (rowCount === 0 || !pendingRestore || pendingRestore.key !== scrollMemoryKey) {
       return;
@@ -1854,6 +2285,7 @@ function ConversationTimelineImpl({
     restoreScrollMemory,
     rowCount,
     rowWindowKey,
+    measuredLayoutRevision,
     scrollMemoryKey,
     totalCount,
     totalSize,
@@ -1864,6 +2296,7 @@ function ConversationTimelineImpl({
   // 即恢复锚点（绘制前完成，无闪动）；本效应声明在会话切换效应之后，切换 commit 上
   // 先重置基线再对账，防跨会话 rowId 误判为前插。
   useLayoutEffect(() => {
+    if (contentMeasurementPendingRef.current) return;
     const prev = prependAnchorRef.current;
     const nextFirstRowId = rowsRef.current[0]?.rowId ?? null;
     const nextTotalSize = virtualizer.getTotalSize();
@@ -1933,7 +2366,9 @@ function ConversationTimelineImpl({
   // 依赖用 rowWindowKey（窗缘 rowId）+ totalSize，禁止绑 rows 数组引用：
   // 投影每帧都是新 window 数组，layout 里再 setState（following / viewport）会与
   // 侧栏开合 / 切会话叠成 React #185（Maximum update depth）。流式长高靠 totalSize。
+  // measuredLayoutRevision：批测高提交后再贴底，避免中间估高帧抢吸底。
   useLayoutEffect(() => {
+    if (contentMeasurementPendingRef.current) return;
     const element = scrollRef.current;
     markLayoutScrollGuard();
     if (element) {
@@ -1961,6 +2396,7 @@ function ConversationTimelineImpl({
     markLayoutScrollGuard,
     commitFollowing,
     headerSlotHeight,
+    measuredLayoutRevision,
     pendingGuideKey,
     rowCount,
     rowWindowKey,
@@ -1973,6 +2409,29 @@ function ConversationTimelineImpl({
       syncTurnNavigatorViewport(scrollRef.current);
     }
   }, [pendingGuideKey, rowCount, syncTurnNavigatorViewport, totalSize]);
+
+  // 尾窗暴涨（切会话 catchup / soft-cap 合并）：跟底中强制再测高+贴底，
+  // 避免估高 72 叠字；并拉长 programmatic 窗挡住误判 user。
+  const prevRowsLengthForBalloonRef = useRef(0);
+  useLayoutEffect(() => {
+    const prev = prevRowsLengthForBalloonRef.current;
+    prevRowsLengthForBalloonRef.current = rows.length;
+    if (!followingRef.current) return;
+    if (prev <= 0 || rows.length < prev + 40) return;
+    markProgrammaticScroll();
+    markLayoutScrollGuard();
+    remountMeasureGuardUntilRef.current = performance.now() + 450;
+    healMountedTurnHeights();
+    virtualizer.measure();
+    scrollToBottom();
+  }, [
+    healMountedTurnHeights,
+    markLayoutScrollGuard,
+    markProgrammaticScroll,
+    rows.length,
+    scrollToBottom,
+    virtualizer,
+  ]);
 
   // 行清空（如 editUserQuery 大范围 rewind）：重置为跟随并收起按钮，
   // 后续重新出现的行走上面的锚定 effect 贴底。
@@ -2019,10 +2478,12 @@ function ConversationTimelineImpl({
       />
       {/* 分享选择流程无论面板展开还是收起，左 rail 都由分享面板或 reopen 按钮独占，
           必须隐藏对话轮导航，避免两个绝对定位控件互相覆盖。退出分享选择后自动恢复。 */}
-      {hideTurnNavigator ? null : (
+      {hideTurnNavigator ? null : turnNavigatorEnabled ? (
         <ConversationTurnNavigator
-          renderUnits={renderUnits}
-          isHydratingDirectory={loadingOlder}
+          key={turnNavigatorHydrationKey}
+          enabled
+          renderUnits={renderUnitsPartition}
+          isHydratingDirectory={loadingOlder || needsTurnNavigatorHydration}
           scrollOffsetPx={virtualizer.scrollOffset ?? turnNavigatorViewport.scrollOffsetPx}
           viewportHeightPx={
             virtualizer.scrollRect?.height ?? turnNavigatorViewport.viewportHeightPx
@@ -2031,7 +2492,23 @@ function ConversationTimelineImpl({
           activeQueryRowId={turnNavigatorViewport.activeQueryRowId}
           onJumpToQuery={scrollToQuery}
         />
-      )}
+      ) : turnNavigatorHydratingPlaceholder ? (
+        <nav
+          aria-busy="true"
+          aria-label="问题目录加载中"
+          data-testid={TID_V4_TURN_NAVIGATOR}
+          data-v4-turn-navigator="true"
+          data-item-count="0"
+          data-hydrating="true"
+          className="pointer-events-none absolute inset-y-0 left-0 z-10 w-12"
+        >
+          <div className="absolute left-3 top-1/2 flex max-h-[calc(100%-6rem)] w-9 -translate-y-1/2 flex-col justify-center gap-2 py-1 opacity-40">
+            <span className="block h-0.5 w-3 rounded-full bg-foreground-subtlest" />
+            <span className="block h-0.5 w-3 rounded-full bg-foreground-subtlest" />
+            <span className="block h-0.5 w-3 rounded-full bg-foreground-subtlest" />
+          </div>
+        </nav>
+      ) : null}
       <div
         ref={scrollRef}
         data-testid={TID_V4_TIMELINE}
@@ -2063,14 +2540,15 @@ function ConversationTimelineImpl({
           // 横向跳动；稳定预留 gutter，让桌面与手机 Web 共用的滚动区宽度保持不变。
           // 只声明 overflow-y-auto 会让浏览器把横轴计算为 auto，宽内容会把
           // 整条 Conversation 撑出横向滚动；表格和代码块应由各自内部容器滚动。
-          "min-h-0 flex-1 overflow-x-hidden overflow-y-auto [scrollbar-gutter:stable] overscroll-behavior-y-contain [--markdown-table-layout-left-inset:16px] [--markdown-table-layout-right-inset:16px] max-md:[--markdown-table-layout-left-inset:8px] max-md:[--markdown-table-layout-right-inset:8px]",
+          // 对齐 ZCode：stable_both-edges，滚动条出现时左右都不挤内容（右侧高度/宽度不抖）。
+          "min-h-0 flex-1 overflow-x-hidden overflow-y-auto [scrollbar-gutter:stable_both-edges] overscroll-behavior-y-contain [--markdown-table-layout-left-inset:16px] [--markdown-table-layout-right-inset:16px] max-md:[--markdown-table-layout-left-inset:8px] max-md:[--markdown-table-layout-right-inset:8px]",
           // 分享选择面板展开时改为 overflow-hidden：scrollTop 与 scrollbar-gutter 都保持不变，
           // 但原生滚动条、滚轮和键盘翻页都不再能移动背景，勾选目标不会漂走。
           backgroundScrollLocked && "!overflow-y-hidden",
           // Conversation turn map 覆盖 timeline 左侧 48px；表格增强滚动如果仍按
           // 普通 16px 边距借位，会有 32px 落到 turn map 下方，必须把完整占用计入左边界。
-          turnNavigatorQueryRowIds.size >= 2 &&
-            "@min-[864px]/conversation:[--markdown-table-layout-left-inset:48px]",
+          // styles-bridge 已强制露出 rail；有目录时一律给表格拉开左 inset，勿再靠未产出的 @min-864。
+          turnNavigatorEnabled && "[--markdown-table-layout-left-inset:48px]",
         )}
       >
         <div
@@ -2145,7 +2623,9 @@ function ConversationTimelineImpl({
                   if (!unit) return null;
                   return (
                     <div
-                      key={`${virtualRow.key}:${rowContext.logEpoch ?? ""}`}
+                      // index 入 key：同 turnId 重复时（或 logEpoch 空）也不撞 React key；
+                      // 历史行与 live tail 也用不同前缀，避免兄弟节点 `run-xxx:` 双挂。
+                      key={`hist:${virtualRow.index}:${String(virtualRow.key)}:${rowContext.logEpoch ?? "0"}`}
                       ref={virtualizer.measureElement}
                       data-index={virtualRow.index}
                       data-v4-turn-unit="true"
@@ -2174,7 +2654,7 @@ function ConversationTimelineImpl({
               </div>
               {liveUnit !== null && liveUnitIndex !== null ? (
                 <div
-                  key={`${liveUnit.key}:${rowContext.logEpoch ?? ""}`}
+                  key={`live:${liveUnitIndex}:${liveUnit.key}:${rowContext.logEpoch ?? "0"}`}
                   ref={liveTailRef}
                   data-index={liveUnitIndex}
                   data-v4-running-live-tail="true"

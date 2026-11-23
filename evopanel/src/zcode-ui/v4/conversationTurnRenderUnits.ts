@@ -1,6 +1,7 @@
 import type {
   AssistantTextRow,
   ConversationRow,
+  ConversationRowsPartition,
   HookInvocationRow,
   SessionPhase,
   TimelineMarkerRow,
@@ -137,9 +138,10 @@ function isHookInvocationRow(row: ConversationRow): row is HookInvocationRow {
 
 function isVisibleAssistantWorkRow(row: AssistantWorkRow): boolean {
   if (row.kind === "reasoning" && row.text.trim().length === 0) {
-    // reasoning_start/reasoning_end 可能形成空的终态 block；只在共享
-    // render-unit 边界裁掉它，避免 completed 状态绕过 streaming renderer 的空行过滤。
-    return false;
+    // 完成态空壳裁掉；流式空正文仍要可见（「正在思考」），否则 START 后首 token 前空白。
+    if (row.state !== "streaming") {
+      return false;
+    }
   }
   // EnterPlanMode 只是内部模式切换边界，把它当普通工具放进“已工作”，
   // 会显示一条没有用户价值的“工具调用已执行”。只在 render unit 过滤，不改写协议投影，
@@ -152,6 +154,56 @@ function isVisibleConversationRow(row: ConversationRow): boolean {
   if (isTurnHeaderRow(row)) return false;
   if (isHookInvocationRow(row)) return false;
   return isVisibleAssistantWorkRow(row);
+}
+
+/**
+ * 同一 turnId 下 tool/正文 rowId &lt; realUser.rowId = 历史工具被错误挂靠（mirror
+ * 迟到 RESULT 用新 turnId 覆盖旧行；钉尾后又排到用户气泡后面）。
+ * 丢掉这些错挂行，只保留轻边界 + 用户及 rowId ≥ 用户的本轮产物。
+ */
+export function normalizeOrderedRowsUserFirst(
+  rows: readonly ConversationRow[],
+): ConversationRow[] {
+  if (!Array.isArray(rows) || rows.length < 2) {
+    return Array.isArray(rows) ? [...rows] : [];
+  }
+  let firstUser: UserInputRow | null = null;
+  for (const row of rows) {
+    if (!isUserInputRow(row) || isHiddenProviderContextUserInput(row)) continue;
+    if (row.origin !== "realUser") continue;
+    if (!String(row.text || "").trim()) continue;
+    firstUser = row;
+    break;
+  }
+  if (!firstUser) return [...rows];
+
+  const userRowId = Number(firstUser.rowId) || 0;
+  const leadingBoundaries: ConversationRow[] = [];
+  const kept: ConversationRow[] = [];
+  let dropped = 0;
+  for (const row of rows) {
+    if (
+      row.kind === "timelineMarker" &&
+      (row as TimelineMarkerRow).lane === "lightBoundary"
+    ) {
+      leadingBoundaries.push(row);
+      continue;
+    }
+    if (
+      row.rowId !== firstUser.rowId &&
+      !isUserInputRow(row) &&
+      !isTurnHeaderRow(row) &&
+      (Number(row.rowId) || 0) < userRowId
+    ) {
+      dropped += 1;
+      continue;
+    }
+    kept.push(row);
+  }
+  if (dropped === 0 && leadingBoundaries.length === 0) {
+    return [...rows];
+  }
+  return [...leadingBoundaries, ...kept];
 }
 
 // 落位语义（lane）由 CLI 投影裁决下发（UI 不得按 marker type 自行推断）。
@@ -252,6 +304,48 @@ function isCompletionBlockingWorkRowRunning(row: AssistantWorkRow): boolean {
   }
 }
 
+/**
+ * 轮次已终态（!isRunning）时，把仍 streaming/running 的孤儿行改成完成态展示。
+ * 后端 seal 漏扫 / remint 清 map 后，phase=idle 仍会「正在思考/正在执行」（f2fdc69c）。
+ * 只影响渲染副本，不写回 store。
+ */
+export function sealZombieInflightRowForSettledTurn(
+  row: ConversationRow,
+  settled: boolean,
+): ConversationRow {
+  if (!settled) return row;
+  if (row.kind === "reasoning" && row.state === "streaming") {
+    const startedAt = Number(row.startedAt || row.createdAt || 0);
+    const endedAt = Number(row.endedAt || 0) || Date.now();
+    const durationMs =
+      row.durationMs ??
+      (startedAt > 0 ? Math.max(0, endedAt - startedAt) : undefined);
+    return {
+      ...row,
+      state: "complete",
+      endedAt: row.endedAt ?? endedAt,
+      ...(durationMs !== undefined ? { durationMs } : {}),
+    };
+  }
+  if (row.kind === "assistantText" && row.state === "streaming") {
+    return { ...row, state: "complete", endedAt: row.endedAt ?? Date.now() };
+  }
+  if (row.kind === "toolCall") {
+    const status = String(row.status || "");
+    if (
+      status === "inputStreaming" ||
+      status === "running" ||
+      status === "in_progress"
+    ) {
+      return { ...row, status: "cancelled", endedAt: row.endedAt ?? Date.now() };
+    }
+  }
+  if (row.kind === "subagent" && row.status === "running" && row.backgrounded !== true) {
+    return { ...row, status: "cancelled" };
+  }
+  return row;
+}
+
 function resolveTurnRunning(
   draft: DraftTurnRenderUnit,
   options: BuildConversationTurnRenderUnitsOptions,
@@ -261,17 +355,22 @@ function resolveTurnRunning(
 
   // 末轮以宿主停止按钮（sessionBusy）为权威，避免：
   // - 停按钮灭了、turnHeader 仍 running → 左下角齿轮空转
-  // - 停按钮亮着、header 已 completed → 齿轮熄灭
+  // - 停按钮亮着、缺 header / header 仍 running → 齿轮熄灭
+  // 注意：不要把已 sealed 的末轮（completedSuccess）重新推成 running——
+  // 用户刚发送下一句时 sessionBusy 会先亮，若仍用旧 header.startedAt 算「已工作」，
+  // 计时会接着上一轮继续走，而不是从 0 起。
   if (isLastTurn && options.sessionBusy === false) {
     return false;
   }
-  if (
-    isLastTurn &&
-    options.sessionBusy === true &&
-    draft.header?.state !== "failed" &&
-    draft.header?.state !== "completedInterrupted"
-  ) {
-    return true;
+  if (isLastTurn && options.sessionBusy === true) {
+    const headerState = draft.header?.state;
+    if (headerState === "failed" || headerState === "completedInterrupted") {
+      return false;
+    }
+    if (!draft.header || headerState === "running") {
+      return true;
+    }
+    return false;
   }
 
   if (draft.header) {
@@ -302,6 +401,72 @@ function shouldForceOpenAbnormalHistory(
   return sessionPhase === "completedInterrupted" || sessionPhase === "error";
 }
 
+/** 与 gateway EMPTY_RUN_NOTICE_TEXT 同文案（仅识别/测试；勿在渲染层再注入）。 */
+export const EMPTY_RUN_NOTICE_TEXT =
+  "本轮未产出可见回复（空流或过早收尾）。若随后仍有模型输出，会继续挂在本轮；也可再发一条重试。";
+
+function isEmptyRunAssistantRow(row: ConversationRow): boolean {
+  if (row.kind !== "assistantText") return false;
+  const eid = String(row.entityId || "");
+  return eid.startsWith("empty-run-") && !eid.startsWith("empty-run-cleared-");
+}
+
+function draftHasRealAssistantWork(draft: DraftTurnRenderUnit): boolean {
+  return draft.assistantWorkRows.some((row) => {
+    if (isEmptyRunAssistantRow(row)) return false;
+    if (row.kind === "assistantText") return Boolean(String(row.text || "").trim());
+    return row.kind === "reasoning" || row.kind === "toolCall" || row.kind === "subagent";
+  });
+}
+
+/** 过早 FINISHED→占位→迟到正文：占位落盘后数秒内先不展示，避免闪一下。 */
+const EMPTY_RUN_UI_HIDE_MS = 3_000;
+
+function shouldHideEmptyRunRow(row: ConversationRow, nowMs: number): boolean {
+  if (!isEmptyRunAssistantRow(row)) return false;
+  const created = Number((row as AssistantTextRow).createdAt) || 0;
+  if (created > 0 && nowMs - created < EMPTY_RUN_UI_HIDE_MS) return true;
+  return false;
+}
+
+/**
+ * 重启/过早 FINISHED 常先落下 empty-run，随后对话续上——占位还挂着像「假空跑」。
+ * - 后方已有真实助手产出 → 撤掉前方空跑
+ * - 占位刚写入 <3s → 先藏住（真回复常在这窗口内到达）
+ */
+function stripStaleEmptyRunNotices(
+  drafts: readonly DraftTurnRenderUnit[],
+  nowMs: number,
+  // 选择器分区化后，历史段与尾段分开成组；原始实现按「历史 ++ 尾轮」整窗反向扫描，
+  // 尾轮的真实产出会撤掉更早轮的空跑占位。历史段扫描以尾段扫描的最终状态作种子，语义不变。
+  seedLaterHasReal = false,
+): DraftTurnRenderUnit[] {
+  let laterHasReal = seedLaterHasReal;
+  const out: DraftTurnRenderUnit[] = new Array(drafts.length);
+  for (let i = drafts.length - 1; i >= 0; i -= 1) {
+    const draft = drafts[i]!;
+    const drop = (row: ConversationRow) =>
+      isEmptyRunAssistantRow(row) &&
+      (laterHasReal || shouldHideEmptyRunRow(row, nowMs));
+    const keptWork = draft.assistantWorkRows.filter((row) => !drop(row));
+    const keptOrdered = draft.orderedRows.filter((row) => !drop(row));
+    if (
+      keptWork.length !== draft.assistantWorkRows.length ||
+      keptOrdered.length !== draft.orderedRows.length
+    ) {
+      out[i] = {
+        ...draft,
+        assistantWorkRows: keptWork,
+        orderedRows: keptOrdered,
+      };
+    } else {
+      out[i] = draft;
+    }
+    if (draftHasRealAssistantWork(out[i]!)) laterHasReal = true;
+  }
+  return out;
+}
+
 function materializeDraftUnit(
   draft: DraftTurnRenderUnit,
   index: number,
@@ -317,7 +482,16 @@ function materializeDraftUnit(
   const visibleUserInputs = renderedRows.filter(
     (row): row is UserInputRow => isUserInputRow(row) && !isHiddenProviderContextUserInput(row),
   );
-  const visibleAssistantWorkRows = draft.assistantWorkRows.filter(isVisibleAssistantWorkRow);
+  const firstRealUserRowId =
+    visibleUserInputs.find(
+      (row) => row.origin === "realUser" && String(row.text || "").trim(),
+    )?.rowId ?? 0;
+  // 与 normalizeOrderedRowsUserFirst 同语义：丢掉 rowId < 用户气泡的错挂历史工具。
+  const visibleAssistantWorkRows = draft.assistantWorkRows.filter((row) => {
+    if (!isVisibleAssistantWorkRow(row)) return false;
+    if (!firstRealUserRowId) return true;
+    return (Number(row.rowId) || 0) >= Number(firstRealUserRowId);
+  });
   const visibleOrderedRows = renderedRows.filter(isVisibleConversationRow);
   const timelineOnly =
     visibleUserInputs.length === 0 &&
@@ -361,9 +535,28 @@ function materializeDraftUnit(
   // 尾窗缺 header 时才回退 session phase，desktop continuous 与 mobile replayable 共用此边界。
   const forceOpenHistory = shouldForceOpenAbnormalHistory(draft.header, options.sessionPhase);
 
+  // 终态轮：展示层收口僵尸 streaming/running，避免「正在思考」钉死。
+  const settledDisplay = !isRunning;
+  const bodyRowsSealed = settledDisplay
+    ? bodyRows.map((row) => sealZombieInflightRowForSettledTurn(row, true) as AssistantWorkRow)
+    : bodyRows;
+  const flowRowsSealed = settledDisplay
+    ? flowRows.map((row) => sealZombieInflightRowForSettledTurn(row, true) as AssistantWorkRow)
+    : flowRows;
+  const browserTurnEndRowsSealed = settledDisplay
+    ? browserTurnEndRows.map(
+        (row) => sealZombieInflightRowForSettledTurn(row, true) as AssistantWorkRow,
+      )
+    : browserTurnEndRows;
+  const assistantTailRowsSealed = settledDisplay
+    ? assistantTailRows.map(
+        (row) => sealZombieInflightRowForSettledTurn(row, true) as AssistantWorkRow,
+      )
+    : assistantTailRows;
+
   // 折叠边界以「段/轮末正文」为准；fork/retry 只挂在真正带 actions 的那条上，
   // 但绝不能让中间带 canFork 的答复冒充 latest，否则后续工具会掉到折叠外。
-  const assistantTextRows = flowRows.filter(isAssistantTextRow);
+  const assistantTextRows = flowRowsSealed.filter(isAssistantTextRow);
   const actionAssistantTextRow = assistantTextRows.find(
     (row) => row.actions?.canFork === true || row.actions?.canRetry === true,
   );
@@ -380,22 +573,27 @@ function materializeDraftUnit(
   );
   const workStatus = resolveConversationTurnWorkStatus(
     draft.header,
-    bodyRows,
+    bodyRowsSealed,
     isRunning,
     workDurationMs,
     isInterrupted,
   );
-  const browserTurnEndRowIds = new Set(browserTurnEndRows.map((row) => row.rowId));
-  const orderedBodyRows = visibleOrderedRows.filter(
-    // main 的 workSegments 会从 orderedRows 重建 flow；如果这里只从
-    // bodyRows 抽取截图，它仍会被塞回正文流并在轮尾再次渲染，造成重复和顺序错乱。
-    (row) => !leadingBoundaryRowIds.has(row.rowId) && !browserTurnEndRowIds.has(row.rowId),
+  const browserTurnEndRowIds = new Set(browserTurnEndRowsSealed.map((row) => row.rowId));
+  const visibleOrderedSealed = settledDisplay
+    ? visibleOrderedRows.map((row) => sealZombieInflightRowForSettledTurn(row, true))
+    : visibleOrderedRows;
+  const orderedBodyRows = normalizeOrderedRowsUserFirst(
+    visibleOrderedSealed.filter(
+      // main 的 workSegments 会从 orderedRows 重建 flow；如果这里只从
+      // bodyRows 抽取截图，它仍会被塞回正文流并在轮尾再次渲染，造成重复和顺序错乱。
+      (row) => !leadingBoundaryRowIds.has(row.rowId) && !browserTurnEndRowIds.has(row.rowId),
+    ),
   );
   const workSegments = buildConversationTurnWorkSegments({
     key: draft.key,
     header: draft.header,
     orderedRows: orderedBodyRows,
-    assistantTailRows,
+    assistantTailRows: assistantTailRowsSealed,
     latestAssistantTextRow,
     isRunning,
     isLastTurn,
@@ -417,11 +615,11 @@ function materializeDraftUnit(
     ...(draft.header ? { header: draft.header } : {}),
     visibleUserInputs,
     // 轻边界已经由 leadingBoundaryRows 独立承载，不能再算作 assistant work。
-    assistantWorkRows: bodyRows,
+    assistantWorkRows: bodyRowsSealed,
     assistantHistoryRows: orderedAssistantHistoryRows,
     assistantFollowingRows,
-    assistantTailRows,
-    browserTurnEndRows,
+    assistantTailRows: assistantTailRowsSealed,
+    browserTurnEndRows: browserTurnEndRowsSealed,
     hookInvocations: draft.hookInvocations,
     assistantTextRows,
     leadingBoundaryRows,
@@ -429,7 +627,7 @@ function materializeDraftUnit(
     flowItems,
     workSegments,
     // renderRows 是查找/诊断用的平面视图，也必须服从 CLI row 全序。
-    renderRows: visibleOrderedRows,
+    renderRows: visibleOrderedSealed,
     isLastTurn,
     isRunning,
     assistantHistoryDefaultOpen: mustOpenHistory,
@@ -488,28 +686,28 @@ function normalizeRenderUnitPosition(
         (forceOpenHistory ||
           (isLastTurn && unit.workStatus?.state === "running") ||
           (unit.latestAssistantTextRow === undefined && unit.assistantWorkRows.length > 0));
-  const workSegments = unit.workSegments?.map((segment, segmentIndex, segments) =>
-    segmentIndex === segments.length - 1
-      ? {
-          ...segment,
-          assistantHistoryDefaultOpen:
-            !unit.timelineOnly &&
-            (forceOpenHistory ||
-              (isLastTurn && segment.workStatus?.state === "running") ||
-              (segments.length === 1 &&
-                unit.latestAssistantTextRow === undefined &&
-                segment.assistantWorkRows.length > 0)),
-        }
-      : segment,
-  );
+  const lastSegment = unit.workSegments?.at(-1);
+  const lastSegmentDefaultOpen = lastSegment
+    ? !unit.timelineOnly &&
+      (forceOpenHistory ||
+        (isLastTurn && lastSegment.workStatus?.state === "running") ||
+        (unit.workSegments?.length === 1 &&
+          unit.latestAssistantTextRow === undefined &&
+          lastSegment.assistantWorkRows.length > 0))
+    : undefined;
   if (
     unit.isLastTurn === isLastTurn &&
     unit.assistantHistoryDefaultOpen === assistantHistoryDefaultOpen &&
-    workSegments?.at(-1)?.assistantHistoryDefaultOpen ===
-      unit.workSegments?.at(-1)?.assistantHistoryDefaultOpen
+    lastSegmentDefaultOpen === lastSegment?.assistantHistoryDefaultOpen
   ) {
     return unit;
   }
+  // 旧实现在判定未变化之前就复制所有轮的 segment；长历史每帧会产生大量随后丢弃的对象。
+  const workSegments = unit.workSegments?.map((segment) =>
+    segment === lastSegment && segment.assistantHistoryDefaultOpen !== lastSegmentDefaultOpen
+      ? { ...segment, assistantHistoryDefaultOpen: lastSegmentDefaultOpen === true }
+      : segment,
+  );
   return {
     ...unit,
     isLastTurn,
@@ -522,6 +720,30 @@ export function buildConversationTurnRenderUnits(
   rows: readonly ConversationRow[],
   options: BuildConversationTurnRenderUnitsOptions = {},
 ): ConversationTurnRenderUnit[] {
+  return buildRenderUnits(rows, options);
+}
+
+// Bug 根因：整窗 builder 每帧都对全部 rows 分组并逐轮 materialize，unit 身份每帧全变，
+// 下游所有按 unit 引用比较的 memo 全部失效；长会话流式输出明显卡顿（上游 2026-10 同根因修复）。
+// 复用只需要逐项引用比较，因此不分配对象。
+export function sameItems<T>(a: readonly T[], b: readonly T[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let index = 0; index < a.length; index += 1) {
+    if (a[index] !== b[index]) return false;
+  }
+  return true;
+}
+
+/** 与 rows 分区对应的 render unit（分区见 conversationProjectionStore.getConversationRowsPartition）。 */
+export interface ConversationTurnRenderUnitsPartition {
+  /** 历史段的 unit；只在历史派生结果变化时更换引用。 */
+  readonly history: readonly ConversationTurnRenderUnit[];
+  /** 尾轮的 unit（通常 0–1 个）。 */
+  readonly tail: readonly ConversationTurnRenderUnit[];
+}
+
+function groupRenderDrafts(rows: readonly ConversationRow[]): DraftTurnRenderUnit[] {
   const units: DraftTurnRenderUnit[] = [];
   const unitByTurnId = new Map<string, DraftTurnRenderUnit>();
 
@@ -553,9 +775,19 @@ export function buildConversationTurnRenderUnits(
     }
     unit.assistantWorkRows.push(row);
   }
+  return units;
+}
 
-  const materializedUnits = units.map((unit, index) =>
-    materializeDraftUnit(unit, index, units.length, options),
+function buildRenderUnits(
+  rows: readonly ConversationRow[],
+  options: BuildConversationTurnRenderUnitsOptions,
+): ConversationTurnRenderUnit[] {
+  const drafts = stripStaleEmptyRunNotices(
+    groupRenderDrafts(rows),
+    options.nowMs ?? Date.now(),
+  );
+  const materializedUnits = drafts.map((unit, index) =>
+    materializeDraftUnit(unit, index, drafts.length, options),
   );
   const keptUnits = materializedUnits.filter(shouldKeepRenderUnit);
   return keptUnits.map((unit, index) =>
@@ -564,36 +796,234 @@ export function buildConversationTurnRenderUnits(
 }
 
 /**
- * 发送乐观气泡：rows 仅尾部多一行同引用前缀的 userInput 时，复用既有 units，
- * 只 materialize 新 turn，避免整窗 rebuild（主因 ~300ms send longtask）。
+ * 输出与对 history ++ tail 整窗构建逐项相等，但每帧只 materialize 尾轮。
+ *
+ * 历史段结果按 history rows 数组引用缓存；只有历史中存在无 header 的轮次（读 phase）、
+ * 仍在运行的轮次（读时钟）、会话忙闲翻转（读 sessionBusy）或存在空跑占位（读尾轮产出/
+ * 3s 隐藏窗口）时，缓存键才额外带上对应输入。跨段规则在合并时处理：
+ * - 尾轮 unit 被过滤掉时，历史末项按最后一轮重新归一化（tailDropped）；
+ * - 尾轮给历史段提供 empty-run 撤销种子（stripStaleEmptyRunNotices 的 seed）。
+ * EvoFlow 相对上游的语义差异（sessionBusy 末轮权威、隐藏 provider context、错挂行丢弃、
+ * CUA/platform 媒体轮尾上提、empty-run 占位）都在 materializeDraftUnit/resolveTurnRunning/
+ * strip 内部消化，选择器只负责「哪一段需要重算」。
  */
-export function tryAppendTrailingUserInputUnit(
-  prevUnits: readonly ConversationTurnRenderUnit[],
-  prevRows: readonly ConversationRow[],
-  nextRows: readonly ConversationRow[],
-  options: BuildConversationTurnRenderUnitsOptions = {},
-): ConversationTurnRenderUnit[] | null {
-  if (nextRows.length !== prevRows.length + 1) return null;
-  for (let i = 0; i < prevRows.length; i++) {
-    if (prevRows[i] !== nextRows[i]) return null;
-  }
-  const added = nextRows[nextRows.length - 1];
-  if (!added || !isUserInputRow(added)) return null;
+export function createConversationTurnRenderUnitsSelector() {
+  type Entry = {
+    draft: DraftTurnRenderUnit;
+    isLast: boolean;
+    phase: SessionPhase | undefined;
+    clock: number | undefined;
+    unit: ConversationTurnRenderUnit;
+  };
+  type HistoryCache = {
+    rows: readonly ConversationRow[];
+    draftCount: number;
+    phaseDependent: boolean;
+    phase: SessionPhase | undefined;
+    clockDependent: boolean;
+    clock: number;
+    // sessionBusy 只影响 isLastTurn 轮；历史段多数时候与它无关，但缓存按引用复用时
+    // 必须把 busy 翻转当作失效信号（轮次开始/结束各一帧，代价可忽略）。
+    busy: boolean | undefined;
+    // 历史段含空跑占位时，strip 结果依赖「尾轮是否有真实产出」与 3s 隐藏窗口。
+    stripSeedRelevant: boolean;
+    stripSeed: boolean;
+    hidePendingUntil: number | null;
+    // 已过滤并按“后面还有一个尾轮”归一化。
+    units: ConversationTurnRenderUnit[];
+    /**
+     * 尾轮 unit 全部被过滤时，历史末项按最后一轮重新归一化后的历史数组。
+     * 归一化只读 unit 与 session phase，所以按 phase 缓存即可。
+     */
+    tailDropped?: { phase: SessionPhase | undefined; units: readonly ConversationTurnRenderUnit[] };
+  };
+  // materialize 复用表按 turn key 分历史段与尾段；轮次在两段之间迁移时两边都查。
+  let historyEntries = new Map<string, Entry>();
+  let tailEntries = new Map<string, Entry>();
+  let history: HistoryCache | null = null;
 
-  const draft = createDraftUnit(added.turnId);
-  draft.userInputs.push(added);
-  draft.orderedRows.push(added);
-  const total = prevUnits.length + 1;
-  const rawNew = materializeDraftUnit(draft, prevUnits.length, total, options);
-  if (!shouldKeepRenderUnit(rawNew)) return null;
-  const newUnit = normalizeRenderUnitPosition(rawNew, prevUnits.length, total, options);
+  const materializeReusing = (
+    draft: DraftTurnRenderUnit,
+    index: number,
+    total: number,
+    options: BuildConversationTurnRenderUnitsOptions & { nowMs: number },
+    lookup: (key: string) => Entry | undefined,
+    next: Map<string, Entry>,
+  ): Entry => {
+    const old = lookup(draft.key);
+    const isLast = index === total - 1;
+    const phase = draft.header ? undefined : options.sessionPhase;
+    const clock = resolveTurnRunning(draft, options, isLast) ? options.nowMs : undefined;
+    const unchanged =
+      old &&
+      old.draft.header === draft.header &&
+      sameItems(old.draft.orderedRows, draft.orderedRows) &&
+      old.isLast === isLast &&
+      old.phase === phase &&
+      old.clock === clock;
+    const entry: Entry = {
+      draft,
+      isLast,
+      phase,
+      clock,
+      unit: unchanged ? old.unit : materializeDraftUnit(draft, index, total, options),
+    };
+    next.set(draft.key, entry);
+    return entry;
+  };
 
-  if (prevUnits.length === 0) return [newUnit];
+  const isHistoryReusable = (
+    cache: HistoryCache | null,
+    rows: readonly ConversationRow[],
+    options: BuildConversationTurnRenderUnitsOptions & { nowMs: number },
+    tailHasReal: boolean,
+  ): cache is HistoryCache =>
+    cache !== null &&
+    cache.rows === rows &&
+    (!cache.phaseDependent || cache.phase === options.sessionPhase) &&
+    (!cache.clockDependent || cache.clock === options.nowMs) &&
+    cache.busy === options.sessionBusy &&
+    (!cache.stripSeedRelevant ||
+      (cache.stripSeed === tailHasReal &&
+        (cache.hidePendingUntil === null || options.nowMs < cache.hidePendingUntil)));
 
-  const out: ConversationTurnRenderUnit[] = new Array(total);
-  for (let i = 0; i < prevUnits.length; i++) {
-    out[i] = normalizeRenderUnitPosition(prevUnits[i]!, i, total, options);
-  }
-  out[prevUnits.length] = newUnit;
-  return out;
+  /** 历史段 strip 结果的时间依赖：仍有占位处于 3s 隐藏窗口时，窗口到期必须重算。 */
+  const resolveHidePendingUntil = (
+    drafts: readonly DraftTurnRenderUnit[],
+    nowMs: number,
+  ): number | null => {
+    let pending: number | null = null;
+    for (const draft of drafts) {
+      for (const row of draft.orderedRows) {
+        if (!isEmptyRunAssistantRow(row) || !shouldHideEmptyRunRow(row, nowMs)) continue;
+        const created = Number((row as AssistantTextRow).createdAt) || 0;
+        pending = Math.max(pending ?? 0, created + EMPTY_RUN_UI_HIDE_MS);
+      }
+    }
+    return pending;
+  };
+
+  return (
+    partition: ConversationRowsPartition,
+    options: BuildConversationTurnRenderUnitsOptions = {},
+  ): ConversationTurnRenderUnitsPartition => {
+    const currentOptions = { ...options, nowMs: options.nowMs ?? Date.now() };
+    const previousHistoryEntries = historyEntries;
+    const previousTailEntries = tailEntries;
+    // 尾段先成组并 strip（seed=false，与整窗反向扫描在尾段内的状态一致）；
+    // 尾段的真实产出作为历史段 empty-run 撤销的种子。
+    const tailDrafts = stripStaleEmptyRunNotices(
+      groupRenderDrafts(partition.tail),
+      currentOptions.nowMs,
+    );
+    const tailHasReal = tailDrafts.some(draftHasRealAssistantWork);
+
+    // 历史段缓存判定：显式产出局部变量而非依赖谓词收窄（嵌套闭包的 let 上收窄不可靠）。
+    let currentHistory: HistoryCache;
+    if (
+      history !== null &&
+      isHistoryReusable(history, partition.history, currentOptions, tailHasReal)
+    ) {
+      currentHistory = history;
+    } else {
+      const drafts = stripStaleEmptyRunNotices(
+        groupRenderDrafts(partition.history),
+        currentOptions.nowMs,
+        tailHasReal,
+      );
+      // 尾轮非空时历史 draft 都不是最后一个；窗口为空时两段都为空。
+      const total = drafts.length + tailDrafts.length;
+      const next = new Map<string, Entry>();
+      let clockDependent = false;
+      const materialized = drafts.map((draft, index) => {
+        const entry = materializeReusing(
+          draft,
+          index,
+          total,
+          currentOptions,
+          (key) => previousHistoryEntries.get(key) ?? previousTailEntries.get(key),
+          next,
+        );
+        if (entry.clock !== undefined) clockDependent = true;
+        return entry.unit;
+      });
+      historyEntries = next;
+      const kept = materialized.filter(shouldKeepRenderUnit);
+      // 先按“后面还有一个尾轮 unit”归一化；尾轮被过滤掉的情况在下面合并时处理。
+      const units = kept.map((unit, index) =>
+        normalizeRenderUnitPosition(unit, index, kept.length + 1, currentOptions),
+      );
+      const stripSeedRelevant = drafts.some((draft) =>
+        draft.orderedRows.some(isEmptyRunAssistantRow),
+      );
+      currentHistory = {
+        rows: partition.history,
+        draftCount: drafts.length,
+        phaseDependent: drafts.some((draft) => !draft.header),
+        phase: currentOptions.sessionPhase,
+        clockDependent,
+        clock: currentOptions.nowMs,
+        busy: currentOptions.sessionBusy,
+        stripSeedRelevant,
+        stripSeed: tailHasReal,
+        hidePendingUntil: stripSeedRelevant
+          ? resolveHidePendingUntil(drafts, currentOptions.nowMs)
+          : null,
+        units,
+      };
+      history = currentHistory;
+    }
+
+    const historyDraftCount = currentHistory.draftCount;
+    const tailNext = new Map<string, Entry>();
+    const tailKept = tailDrafts
+      .map(
+        (draft, index) =>
+          materializeReusing(
+            draft,
+            historyDraftCount + index,
+            historyDraftCount + tailDrafts.length,
+            currentOptions,
+            (key) => previousTailEntries.get(key) ?? previousHistoryEntries.get(key),
+            tailNext,
+          ).unit,
+      )
+      .filter(shouldKeepRenderUnit);
+    tailEntries = tailNext;
+    const historyCount = currentHistory.units.length;
+    const tailUnits = tailKept.map((unit, index) =>
+      normalizeRenderUnitPosition(
+        unit,
+        historyCount + index,
+        historyCount + tailKept.length,
+        currentOptions,
+      ),
+    );
+
+    let historyUnits: readonly ConversationTurnRenderUnit[] = currentHistory.units;
+    const lastIndex = historyCount - 1;
+    if (tailUnits.length === 0 && lastIndex >= 0) {
+      if (
+        !currentHistory.tailDropped ||
+        currentHistory.tailDropped.phase !== currentOptions.sessionPhase
+      ) {
+        // 归一化只改 isLastTurn 与默认展开，且只读其他字段，所以对已归一化的 unit 再做一次即可。
+        const last = normalizeRenderUnitPosition(
+          currentHistory.units[lastIndex]!,
+          lastIndex,
+          historyCount,
+          currentOptions,
+        );
+        currentHistory.tailDropped = {
+          phase: currentOptions.sessionPhase,
+          units:
+            last === currentHistory.units[lastIndex]
+              ? currentHistory.units
+              : [...currentHistory.units.slice(0, -1), last],
+        };
+      }
+      historyUnits = currentHistory.tailDropped.units;
+    }
+    return { history: historyUnits, tail: tailUnits };
+  };
 }

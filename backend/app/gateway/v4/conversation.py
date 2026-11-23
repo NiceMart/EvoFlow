@@ -54,15 +54,18 @@ V4_WIRE_PROTOCOL_VERSION = 3
 #
 # Priority gate: user open (intent=open) jumps ahead of prefetch/hover warm
 # so "two chats running → click another stuck connecting" stops being FIFO.
-_hydrate_gate: "_HydratePriorityGate | None" = None
+_hydrate_gate: _HydratePriorityGate | None = None
 
 
 def _hydrate_concurrency_limit() -> int:
-    raw = (os.environ.get("EVOFLOW_V4_HYDRATE_CONCURRENCY") or "1").strip()
+    # 默认 2：两路点击 hydrate 可并行（快速连点两个会话不再排队等前一路完成）。
+    # 预热侧由 _pump 限制为最多 1 路并发——「parallel hover-warm contended SQLite」
+    # 的教训针对的是无上限的 hover warm，不是有界的点击并发。
+    raw = (os.environ.get("EVOFLOW_V4_HYDRATE_CONCURRENCY") or "2").strip()
     try:
         n = int(raw)
     except ValueError:
-        n = 1
+        n = 2
     return max(1, min(n, 4))
 
 
@@ -82,12 +85,21 @@ class _HydratePriorityGate:
                 candidate = self._hi.pop(0)
                 if not candidate.done():
                     fut = candidate
-            while fut is None and self._lo:
-                candidate = self._lo.pop(0)
-                if not candidate.done():
-                    fut = candidate
             if fut is None:
-                return
+                # 预热只在「无点击等待」时启动，且 limit>1 时最多占 limit-1 个槽，
+                # 永远给点击留一个空槽：旧行为会把所有槽填满 hover warm，点击 hydrate
+                # 仍要等一轮预热做完，表现为「点了没反应」。预热慢一点无妨（后台）。
+                # limit=1 退化为旧语义：有点击等待就不启动预热（排队次序仍点击优先）。
+                if self._hi:
+                    return
+                if self._limit > 1 and self._active >= self._limit - 1:
+                    return
+                while self._lo and fut is None:
+                    candidate = self._lo.pop(0)
+                    if not candidate.done():
+                        fut = candidate
+                if fut is None:
+                    return
             self._active += 1
             fut.set_result(None)
 
@@ -125,7 +137,7 @@ class _hydrate_slot:
         self._high = high_priority
         self._gate = _get_hydrate_gate()
 
-    async def __aenter__(self) -> "_hydrate_slot":
+    async def __aenter__(self) -> _hydrate_slot:
         await self._gate.acquire(high_priority=self._high)
         return self
 
@@ -366,6 +378,15 @@ class V4ConversationHub:
         self._lock = asyncio.Lock()
         self._write_lock = threading.RLock()
         self._loop: asyncio.AbstractEventLoop | None = None
+        # 同会话双订阅冷开曾并行 hydrate+durable（8e4715ba：3764+3745 双份尾差）。
+        self._cold_hydrate_locks: dict[str, asyncio.Lock] = {}
+
+    def _cold_hydrate_lock(self, session_id: str) -> asyncio.Lock:
+        lock = self._cold_hydrate_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._cold_hydrate_locks[session_id] = lock
+        return lock
 
     # -- 查询 ---------------------------------------------------------------
 
@@ -576,11 +597,42 @@ class V4ConversationHub:
             except ValueError:
                 sess.log_epoch = f"{sess.log_epoch}+r"
 
+    @staticmethod
+    def _hub_tip_row_id(sess: "_SessionState") -> int | None:
+        tip = 0
+        for key, row in (sess.rows or {}).items():
+            try:
+                rid = int(row.get("rowId") if isinstance(row, dict) else key)
+            except (TypeError, ValueError):
+                continue
+            if rid > tip:
+                tip = rid
+        return tip or None
+
+    def _subscriber_count(self, session_id: str) -> int:
+        tid = str(session_id or "").strip()
+        if not tid:
+            return 0
+        return sum(1 for s in self._subscriptions.values() if s.session_id == tid)
+
+    def _catchup_meta(self, sess: "_SessionState", **extra: Any) -> dict[str, Any]:
+        """统一带 tipRowId / logEpoch / subscriberCount，方便 FE 根因对账。"""
+        out = dict(extra)
+        out.setdefault("rows", len(sess.rows) if sess.rows else 0)
+        out.setdefault("logEpoch", sess.log_epoch)
+        out.setdefault("tipRowId", self._hub_tip_row_id(sess))
+        # 无论是否 broadcast：面板要能看见「hub 上这会话有没有活订阅」。
+        # notified=0 + subscriberCount=0 → 根因是无订户，不是 catchup 逻辑本身。
+        out.setdefault("subscriberCount", self._subscriber_count(sess.session_id))
+        return out
+
     def catchup_from_transcript(
         self,
         session_id: str,
         *,
         prefer_settle_only: bool = False,
+        client_tip_row_id: int | None = None,
+        client_log_epoch: str | None = None,
     ) -> dict[str, Any]:
         """飞书/IM 旁观：用 DB transcript 强制重建投影（hydrate 仅空 session 时会跳过）。
 
@@ -588,17 +640,20 @@ class V4ConversationHub:
         - 频道 live mirror 本轮仍在写 → 禁止 wipe（否则 240 行 live 被打回 ~130 行 DB）
         - ``prefer_settle_only``：客户端已有投影（切回校准）时只 settle phase / 更新指纹，
           禁止 ``clear_projection_for_rehydrate``（对齐 ZCode：有投影继续显示）。
+        - ``client_tip_row_id`` / ``client_log_epoch``：FE 本机 tip；若高于 hub tip 或
+          epoch 不一致，说明客户端错过了 recovery（现场 tip=2055 vs hub=2042），
+          再广播一次 recovery 让 FE 收敛，不必整页 wipe。
         """
         tid = str(session_id or "").strip()
         if not tid or tid.startswith("v4-"):
             return {"ok": False, "changed": False, "reason": "bad-session-id"}
         try:
+            from app.gateway.v4.agui_mirror import mirror_thread_is_live
             from app.gateway.v4.hydration import (
                 force_rehydrate_session_from_transcript,
                 read_run_status_row,
                 transcript_fingerprint_for_thread,
             )
-            from app.gateway.v4.agui_mirror import mirror_thread_is_live
         except Exception as exc:
             logger.exception("[v4.catchup] import failed session=%s", tid)
             return {"ok": False, "changed": False, "reason": str(exc)}
@@ -610,7 +665,7 @@ class V4ConversationHub:
             logger.exception("[v4.catchup] fingerprint failed session=%s", tid)
             return {"ok": False, "changed": False, "reason": "fingerprint-failed"}
 
-        # ── 活写手判定 + 陈旧 running 收口 ────────────────────────────────
+        # ── 活写手判定 + 陈旧 running / draft+inflight 收口 ──────────────
         # mirror 标志是「有活写手」的权威信号，必须先判：mirror 活着 = 本轮
         # 真有流在喂投影，phase/收口都归它管，下面一切修复都不许碰。
         mirror_live = mirror_thread_is_live(tid)
@@ -619,11 +674,26 @@ class V4ConversationHub:
         # 投影被死钉在 running（2026-11-15 实锤：任务 12:26 已 finalize，用户
         # 13:28 还在对它点停止）。唯一可靠证据是 DB run_status；「running 且
         # 超窗疑似 zombie」在这条路径上不收口，交 zombie sweeper。
+        #
+        # 另：压缩/remint 后常见 phase=draft + canStop=false，但 tip 仍留
+        # streaming「正在思考」/ running turnHeader（94b4bc83：DB done、面板
+        # 已工作 2h+）。前端 draft 分支走行扫描 heuristic → sessionBusy 钉死，
+        # 展示层 seal 永不触发。DB 终态 + 有 inflight 时也必须 settle。
         settled_phase = ""
-        if not mirror_live and _PHASE_RUNNING in (
-            str(sess.phase or ""),
-            str((sess.control_override or {}).get("phase") or ""),
-        ):
+        phase_now = str(sess.phase or "").strip()
+        override_phase = str((sess.control_override or {}).get("phase") or "").strip()
+        inflight_rows = bool(sess.rows) and self._rows_have_inflight(list(sess.rows.values()))
+        phase_is_running = _PHASE_RUNNING in (phase_now, override_phase)
+        phase_already_terminal = phase_now in (
+            _PHASE_COMPLETED,
+            _PHASE_ERROR,
+            _PHASE_INTERRUPTED,
+        ) or override_phase in (
+            _PHASE_COMPLETED,
+            _PHASE_ERROR,
+            _PHASE_INTERRUPTED,
+        )
+        if not mirror_live:
             run_status = str((read_run_status_row(tid) or {}).get("status") or "").strip().lower()
             mapped = _phase_for_run_status(run_status)
             # 工具授权闸仍 pending 时 DB 常被标 done/idle；不得把投影收成 completedSuccess，
@@ -645,33 +715,148 @@ class V4ConversationHub:
                         tid,
                         exc_info=True,
                     )
-            if mapped:
-                self.patch_phase(tid, mapped)
-                settled_phase = mapped
-                logger.info(
-                    "[v4.catchup] stale running settled session=%s db_status=%s phase=%s",
-                    tid,
-                    run_status,
-                    mapped,
-                )
+            if mapped and (
+                phase_is_running
+                or inflight_rows
+                or not phase_already_terminal
+            ):
+                if not phase_already_terminal:
+                    self.patch_phase(tid, mapped)
+                    settled_phase = mapped
+                    logger.info(
+                        "[v4.catchup] stale running settled session=%s db_status=%s phase=%s "
+                        "was_running=%s inflight=%s",
+                        tid,
+                        run_status,
+                        mapped,
+                        phase_is_running,
+                        inflight_rows,
+                    )
+                # 终态 phase 仍可能残留 streaming tip（heal 旧逻辑只扫终态头下的行）。
+                # DB 终态时无条件补封，避免「phase 已 completed 但面板仍正在思考」。
+                try:
+                    from app.gateway.v4.agui_mirror import mirror_heal_stale_inflight_rows
+
+                    healed_n = mirror_heal_stale_inflight_rows(tid)
+                    if healed_n and not settled_phase:
+                        logger.info(
+                            "[v4.catchup] healed stale inflight session=%s rows=%s "
+                            "phase=%s inflight=%s",
+                            tid,
+                            healed_n,
+                            phase_now or override_phase or "-",
+                            inflight_rows,
+                        )
+                except Exception:
+                    logger.debug(
+                        "[v4.catchup] heal after settle failed session=%s",
+                        tid,
+                        exc_info=True,
+                    )
             # run_status 仍 running/pending：后台 run 真在跑且无 mirror——DB
             # transcript 是唯一真源，继续放行下面的 rehydrate（否则「盯着看」
             # 也冻结）。status 空/未知：不动 control，由 shrink 守卫兜底。
 
-        if fp and sess.catchup_fp == fp and sess.rows:
-            return {
-                "ok": True,
-                "changed": False,
-                "reason": "fingerprint-unchanged",
-                "rows": len(sess.rows),
-                "settledPhase": settled_phase or None,
-                "logEpoch": sess.log_epoch,
-                "fingerprint": fp,
-            }
+        # 仅当指纹未变（本应 no-op）但 tip 已与库尾脱节时强制重灌。
+        # 394bc37f：DB tip=「两条都通了」，面板 tip=旧 run cancelled bash；
+        # fingerprint-unchanged + refuse-shrink 会把错误的「更胖」live tip 钉死。
+        # 指纹本身在变时走原有 rehydrate / settle-only / refuse-shrink 语义，不抢道。
+        tip_mismatch = bool(
+            sess.rows
+            and fp
+            and sess.catchup_fp == fp
+            and not self._projection_tip_matches_fingerprint(sess, fp)
+        )
+        if tip_mismatch:
+            logger.warning(
+                "[v4.catchup] tip mismatch vs transcript fingerprint session=%s "
+                "rows=%s fp=%s — force rehydrate",
+                tid,
+                len(sess.rows),
+                fp,
+            )
+
+        if fp and sess.catchup_fp == fp and sess.rows and not tip_mismatch:
+            hub_tip = self._hub_tip_row_id(sess)
+            client_tip = None
+            try:
+                if client_tip_row_id is not None:
+                    client_tip = int(client_tip_row_id)
+            except (TypeError, ValueError):
+                client_tip = None
+            client_epoch = str(client_log_epoch or "").strip() or None
+            hub_epoch = str(sess.log_epoch or "").strip() or None
+            # 本机 tip 高于 hub：错过 recovery 的幽灵膨胀（2055 vs 2042）。
+            # 本机 tip 低于 hub：live mirror 已写行但 frames 没送到页面（19:11 现场：
+            # AG-UI 在跑、v4行钉死 2041、streamMax=∅）——fingerprint 未变也会
+            # 一直 no-op，必须再广播 recovery。
+            # 直播中 catchup 采样常比 FE delta 慢 1～几行；微差不当 client-stale/behind
+            #（否则 recovery 打飞进行中订阅 → 开跑却等不到首字）。
+            _tip_diverge_min = 5
+            tip_diverged = bool(
+                sess.rows
+                and client_tip is not None
+                and hub_tip is not None
+                and abs(int(client_tip) - int(hub_tip)) >= _tip_diverge_min
+            )
+            epoch_diverged = bool(
+                tip_diverged
+                and client_epoch
+                and hub_epoch
+                and client_epoch != hub_epoch
+            )
+            client_ahead = bool(
+                tip_diverged
+                and client_tip is not None
+                and hub_tip is not None
+                and client_tip > hub_tip
+            )
+            client_behind = bool(
+                tip_diverged
+                and client_tip is not None
+                and hub_tip is not None
+                and client_tip < hub_tip
+            )
+            if client_ahead or client_behind or epoch_diverged:
+                notified = self.broadcast_recovery_snapshot(tid)
+                reason = (
+                    "client-stale-resync"
+                    if client_ahead or (epoch_diverged and not client_behind)
+                    else "client-behind-resync"
+                )
+                logger.warning(
+                    "[v4.catchup] %s session=%s client_tip=%s hub_tip=%s "
+                    "client_epoch=%s hub_epoch=%s notified=%s",
+                    reason,
+                    tid,
+                    client_tip,
+                    hub_tip,
+                    client_epoch,
+                    hub_epoch,
+                    notified,
+                )
+                return self._catchup_meta(
+                    sess,
+                    ok=True,
+                    changed=True,
+                    reason=reason,
+                    notified=notified,
+                    settledPhase=settled_phase or None,
+                    fingerprint=fp,
+                    clientTipRowId=client_tip,
+                )
+            return self._catchup_meta(
+                sess,
+                ok=True,
+                changed=False,
+                reason="fingerprint-unchanged",
+                settledPhase=settled_phase or None,
+                fingerprint=fp,
+            )
 
         # Same msg count + id, only tail content_len grew → DB streaming catch-up.
         # Full rehydrate every ~1.5s would flicker; advance fp and leave projection.
-        if fp and sess.catchup_fp and sess.rows:
+        if fp and sess.catchup_fp and sess.rows and not tip_mismatch:
             old_p = str(sess.catchup_fp).split(":")
             new_p = str(fp).split(":")
             if (
@@ -681,29 +866,66 @@ class V4ConversationHub:
                 and old_p[1] == new_p[1]
             ):
                 sess.catchup_fp = fp
-                return {
-                    "ok": True,
-                    "changed": False,
-                    "reason": "tail-growing",
-                    "rows": len(sess.rows),
-                    "settledPhase": settled_phase or None,
-                    "logEpoch": sess.log_epoch,
-                    "fingerprint": fp,
-                }
+                return self._catchup_meta(
+                    sess,
+                    ok=True,
+                    changed=False,
+                    reason="tail-growing",
+                    settledPhase=settled_phase or None,
+                    fingerprint=fp,
+                )
 
         # Live channel/AG-UI mirror owns the projection for this turn — wiping
         # replaces a rich live snapshot with a lagging DB hydrate (UI jitter).
         # phase==running 不再单独拒绝：后台 run 的 phase 只能由本函数收口，
         # 拿它拒客会把自己锁死（死锁闭环的另一半）。
-        if mirror_live:
-            return {
-                "ok": True,
-                "changed": False,
-                "reason": "live-mirror",
-                "rows": len(sess.rows),
-                "logEpoch": sess.log_epoch,
-                "fingerprint": fp,
-            }
+        #
+        # 例外：FE tip/行数已落后 hub（frames 丢了、双订阅错位）时仍广播 recovery，
+        # 不 wipe、不碰 mirror——只把当前 hub 快照再投一次。现场 21:19：
+        # hub=772 / FE=715 + WIRE_WITHOUT_V4_TIP，旧逻辑 live-mirror 直接放行走死。
+        if mirror_live and sess.rows:
+            hub_tip = self._hub_tip_row_id(sess)
+            client_tip = None
+            try:
+                if client_tip_row_id is not None:
+                    client_tip = int(client_tip_row_id)
+            except (TypeError, ValueError):
+                client_tip = None
+            if (
+                client_tip is not None
+                and hub_tip is not None
+                and hub_tip - client_tip >= 5
+            ):
+                notified = self.broadcast_recovery_snapshot(tid)
+                logger.warning(
+                    "[v4.catchup] client-behind under live-mirror session=%s "
+                    "client_tip=%s hub_tip=%s rows=%s notified=%s",
+                    tid,
+                    client_tip,
+                    hub_tip,
+                    len(sess.rows),
+                    notified,
+                )
+                return self._catchup_meta(
+                    sess,
+                    ok=True,
+                    changed=True,
+                    reason="client-behind-resync",
+                    notified=notified,
+                    settledPhase=settled_phase or None,
+                    fingerprint=fp,
+                    clientTipRowId=client_tip,
+                )
+            return self._catchup_meta(
+                sess,
+                ok=True,
+                changed=False,
+                reason="live-mirror",
+                settledPhase=settled_phase or None,
+                fingerprint=fp,
+                clientTipRowId=client_tip,
+            )
+        # mirror 标 live 但本 hub 尚无行：放行后面 hydrate（空投影不能靠 live-mirror 挡死）。
 
         prev_rows = len(sess.rows)
         # Panel already subscribed **且有活写手**（hub 自跑 turn，或最近 3s 有
@@ -715,22 +937,61 @@ class V4ConversationHub:
         hub_live_writing = sess.turn_running() or (
             time.time() * 1000 - sess.last_author_at_ms < 3000
         )
-        if prev_rows > 0 and sub_n > 0 and hub_live_writing and not settled_phase:
+        if (
+            prev_rows > 0
+            and sub_n > 0
+            and hub_live_writing
+            and not settled_phase
+            and not tip_mismatch
+        ):
+            hub_tip = self._hub_tip_row_id(sess)
+            client_tip = None
+            try:
+                if client_tip_row_id is not None:
+                    client_tip = int(client_tip_row_id)
+            except (TypeError, ValueError):
+                client_tip = None
+            if (
+                client_tip is not None
+                and hub_tip is not None
+                and hub_tip - client_tip >= 5
+            ):
+                notified = self.broadcast_recovery_snapshot(tid)
+                logger.warning(
+                    "[v4.catchup] client-behind under hub-subscribed session=%s "
+                    "client_tip=%s hub_tip=%s rows=%s notified=%s",
+                    tid,
+                    client_tip,
+                    hub_tip,
+                    prev_rows,
+                    notified,
+                )
+                return self._catchup_meta(
+                    sess,
+                    ok=True,
+                    changed=True,
+                    reason="client-behind-resync",
+                    notified=notified,
+                    settledPhase=settled_phase or None,
+                    fingerprint=fp,
+                    clientTipRowId=client_tip,
+                )
             sess.catchup_fp = fp
-            return {
-                "ok": True,
-                "changed": False,
-                "reason": "hub-subscribed",
-                "rows": prev_rows,
-                "subscribers": sub_n,
-                "logEpoch": sess.log_epoch,
-                "fingerprint": fp,
-            }
+            return self._catchup_meta(
+                sess,
+                ok=True,
+                changed=False,
+                reason="hub-subscribed",
+                settledPhase=settled_phase or None,
+                fingerprint=fp,
+                clientTipRowId=client_tip,
+            )
 
         # Probe hydrate on a throwaway hub first: never shrink a richer live/hybrid
         # projection (common: live ~300 rows → DB hydrate ~160). Advance fp so we
         # don't thrash every observer tick.
-        if prev_rows > 0:
+        # tip 与库尾脱节时「更胖」是假象——必须允许 shrink 回到 transcript。
+        if prev_rows > 0 and not tip_mismatch:
             try:
                 from app.gateway.v4.hydration import hydrate_session_from_transcript
 
@@ -761,7 +1022,49 @@ class V4ConversationHub:
                 }
 
         # 切回校准：客户端已有投影行 → 只 settle，绝不 wipe（避免 recovery 整窗替换闪烁）。
-        if prefer_settle_only and prev_rows > 0:
+        # tip 脱节例外：只 settle 治不好「面板 tip ≠ SQL tip」。
+        # 【self-evolution-bot · 2026-11-22】现场：FE tip=2155 / hub tip=1 + preferSettleOnly
+        # → 旧逻辑直接 settle-only，跳过 client-stale；subscriberCount=0 时更无人收。
+        # 本机 tip 与 hub tip 分叉时仍必须 broadcast recovery（不 wipe）。
+        if prefer_settle_only and prev_rows > 0 and not tip_mismatch:
+            hub_tip = self._hub_tip_row_id(sess)
+            client_tip = None
+            try:
+                if client_tip_row_id is not None:
+                    client_tip = int(client_tip_row_id)
+            except (TypeError, ValueError):
+                client_tip = None
+            if (
+                client_tip is not None
+                and hub_tip is not None
+                and abs(int(client_tip) - int(hub_tip)) >= 5
+            ):
+                notified = self.broadcast_recovery_snapshot(tid)
+                reason = (
+                    "client-stale-resync"
+                    if client_tip > hub_tip
+                    else "client-behind-resync"
+                )
+                logger.warning(
+                    "[v4.catchup] %s under settle-only session=%s "
+                    "client_tip=%s hub_tip=%s rows=%s notified=%s",
+                    reason,
+                    tid,
+                    client_tip,
+                    hub_tip,
+                    prev_rows,
+                    notified,
+                )
+                return self._catchup_meta(
+                    sess,
+                    ok=True,
+                    changed=True,
+                    reason=reason,
+                    notified=notified,
+                    settledPhase=settled_phase or None,
+                    fingerprint=fp,
+                    clientTipRowId=client_tip,
+                )
             sess.catchup_fp = fp
             logger.info(
                 "[v4.catchup] settle-only session=%s rows=%s settled=%s fp=%s",
@@ -770,39 +1073,54 @@ class V4ConversationHub:
                 settled_phase or "-",
                 fp,
             )
-            return {
-                "ok": True,
-                "changed": False,
-                "reason": "settle-only",
-                "rows": prev_rows,
-                "settledPhase": settled_phase or None,
-                "logEpoch": sess.log_epoch,
-                "fingerprint": fp,
-            }
+            return self._catchup_meta(
+                sess,
+                ok=True,
+                changed=False,
+                reason="settle-only",
+                settledPhase=settled_phase or None,
+                fingerprint=fp,
+            )
 
         # Catchup must not mirror_reset — that clears run_started mid-IM stream and
         # lets the next tick wipe again.
         loaded = force_rehydrate_session_from_transcript(
             self, tid, fingerprint=fp, reset_mirror=False
         )
+        # 重灌后再兜一次：热路径若刚 durable-replay 过，仍可能 tip 脱节。
+        sess = self._get_or_create_session(tid)
+        if fp and sess.rows and not self._projection_tip_matches_fingerprint(sess, fp):
+            trimmed = self._trim_projection_after_fingerprint_tip(sess, fp)
+            if trimmed:
+                loaded = len(sess.rows)
+                sess.catchup_fp = fp
+                logger.warning(
+                    "[v4.catchup] trimmed tip-after-transcript session=%s removed=%s "
+                    "rows_now=%s",
+                    tid,
+                    trimmed,
+                    loaded,
+                )
         notified = self.broadcast_recovery_snapshot(tid)
+        reason = "tip-mismatch-rehydrated" if tip_mismatch else "rehydrated"
         logger.info(
-            "[v4.catchup] session=%s rows=%s notified=%s fp=%s",
+            "[v4.catchup] session=%s rows=%s notified=%s fp=%s reason=%s",
             tid,
             loaded,
             notified,
             fp,
+            reason,
         )
-        return {
-            "ok": True,
-            "changed": True,
-            "reason": "rehydrated",
-            "rows": loaded,
-            "notified": notified,
-            "settledPhase": settled_phase or None,
-            "logEpoch": sess.log_epoch,
-            "fingerprint": fp,
-        }
+        return self._catchup_meta(
+            sess,
+            ok=True,
+            changed=True,
+            reason=reason,
+            rows=loaded,
+            notified=notified,
+            settledPhase=settled_phase or None,
+            fingerprint=fp,
+        )
 
     def reconcile_stale_running(self) -> dict[str, int]:
         """周期收口：陈旧 running 投影 + DB 已终态 → settle + rehydrate + 广播。
@@ -827,12 +1145,15 @@ class V4ConversationHub:
             for sess in self._sessions.values():
                 if sess.turn_running():
                     continue
-                if _PHASE_RUNNING not in (
+                if not sess.rows:
+                    continue
+                phase_running = _PHASE_RUNNING in (
                     str(sess.phase or ""),
                     str((sess.control_override or {}).get("phase") or ""),
-                ):
-                    continue
-                if not sess.rows:
+                )
+                # draft + 僵尸 streaming/running 行也要扫（压缩后 tip「正在思考」）。
+                inflight = self._rows_have_inflight(list(sess.rows.values()))
+                if not phase_running and not inflight:
                     continue
                 # 有活写手（最近 5s 有行/增量写入）→ 不是孤儿 run，跳过。
                 if now_ms - sess.last_author_at_ms < 5000:
@@ -893,39 +1214,122 @@ class V4ConversationHub:
         # Sync hydrate under the asyncio lock froze Gateway for multi‑second windows
         # on large transcripts (2026-11-08 formal package lockup: health/Feishu/UI
         # all stuck while one subscribe hydrated 700+ rows).
-        # Also serialize hydrates: parallel hover-warm of 1k+ row sessions
-        # contended SQLite + CPU and made every click feel dead.
+        # Hydrates run through the priority gate: clicks (intent=open) get a free
+        # slot immediately and may run 2-wide; hover prefetch is capped at 1 so it
+        # can never occupy both slots and make a click wait for a warm to finish
+        # (the old "parallel hover-warm contended SQLite + CPU, every click dead").
         hydrate_ms: float | None = None
         hydrate_rows = 0
         prebuilt_snapshot: dict[str, Any] | None = None
         if not resume_ok and not sess.rows:
-            try:
-                from app.gateway.v4.hydration import hydrate_session_from_transcript
-
-                hydrate_started = time.perf_counter()
-                async with _hydrate_slot(high_priority=high_priority):
-                    loaded = await asyncio.to_thread(
-                        hydrate_session_from_transcript, self, sess.session_id
-                    )
-                hydrate_ms = round((time.perf_counter() - hydrate_started) * 1000, 1)
-                hydrate_rows = int(loaded or 0)
-                if loaded:
-                    logger.info(
-                        "[v4.hydration] resubscribe recovered history session=%s rows=%s",
-                        sess.session_id,
-                        loaded,
-                    )
+            # 同会话双订阅串行冷开；进锁后再看 rows，避免并行 durable 双份尾差。
+            async with self._cold_hydrate_lock(sess.session_id):
+                if sess.rows:
+                    hydrate_ms = 0.0
+                    hydrate_rows = len(sess.rows)
                 else:
-                    logger.info(
-                        "[v4.hydration] subscribe hydrate produced no rows session=%s in %.1fms",
-                        sess.session_id,
-                        hydrate_ms,
-                    )
-            except Exception:
-                logger.exception(
-                    "[v4.hydration] subscribe hydration failed session=%s",
-                    sess.session_id,
-                )
+                    try:
+                        from app.gateway.v4.hydration import hydrate_session_from_transcript
+
+                        # durable 纪元接续（对齐 ZCode durable 语义）：档案里已有该会话的
+                        # (epoch, seq) 血统——冷启动续接而不是归位 "1"/0，否则新事件与旧档案
+                        # (sid, epoch, seq) 撞键被 INSERT OR IGNORE 静默丢弃，档案跨重启断代。
+                        try:
+                            from app.gateway.v4.durable_replay import read_durable_head
+
+                            head = await asyncio.to_thread(
+                                read_durable_head, self, sess.session_id
+                            )
+                            if head:
+                                if int(head.get("seq") or 0) > sess.seq:
+                                    sess.seq = int(head.get("seq") or 0)
+                                if str(head.get("epoch") or "") > str(sess.log_epoch or ""):
+                                    sess.log_epoch = str(head.get("epoch"))
+                        except Exception:
+                            logger.debug(
+                                "[v4.durable-replay] head seed skipped session=%s",
+                                sess.session_id,
+                                exc_info=True,
+                            )
+
+                        hydrate_started = time.perf_counter()
+                        async with _hydrate_slot(high_priority=high_priority):
+                            loaded = await asyncio.to_thread(
+                                hydrate_session_from_transcript, self, sess.session_id
+                            )
+                        hydrate_ms = round((time.perf_counter() - hydrate_started) * 1000, 1)
+                        hydrate_rows = int(loaded or 0)
+                        if loaded:
+                            logger.info(
+                                "[v4.hydration] resubscribe recovered history session=%s rows=%s",
+                                sess.session_id,
+                                loaded,
+                            )
+                        else:
+                            logger.info(
+                                "[v4.hydration] subscribe hydrate produced no rows session=%s in %.1fms",
+                                sess.session_id,
+                                hydrate_ms,
+                            )
+                        # durable 尾差补齐（对齐 ZCode durable 语义的读回侧）：水合只覆盖
+                        # transcript 落库过的消息；镜像 authored 的行（空流占位修正、迟到正文、
+                        # 断流瞬态、下一轮开头）从 evoflow_v4_event_log 按 seq 补放，
+                        # 网关重启/清投影后显示无损。镜像活写/已有内存投影（resume/热会话）不进这里。
+                        try:
+                            from app.gateway.v4.durable_replay import replay_durable_tail
+
+                            replayed = await asyncio.to_thread(
+                                replay_durable_tail, self, sess.session_id
+                            )
+                            if replayed:
+                                hydrate_rows += replayed
+                                logger.info(
+                                    "[v4.durable-replay] subscribe tail replayed session=%s rows=%s",
+                                    sess.session_id,
+                                    replayed,
+                                )
+                        except Exception:
+                            logger.exception(
+                                "[v4.durable-replay] subscribe replay failed session=%s",
+                                sess.session_id,
+                            )
+                        # durable 尾差若把更早 live 轮追加到库尾之后（394bc37f：
+                        # hydrate=630 → replay+2528 → tip=run-07cc…），按 fingerprint 裁掉。
+                        try:
+                            from app.gateway.v4.hydration import (
+                                transcript_fingerprint_for_thread,
+                            )
+
+                            fp_now = await asyncio.to_thread(
+                                transcript_fingerprint_for_thread, sess.session_id
+                            )
+                            if fp_now and sess.rows and not self._projection_tip_matches_fingerprint(
+                                sess, fp_now
+                            ):
+                                trimmed = self._trim_projection_after_fingerprint_tip(
+                                    sess, fp_now
+                                )
+                                if trimmed:
+                                    hydrate_rows = len(sess.rows)
+                                    sess.catchup_fp = fp_now
+                                    logger.warning(
+                                        "[v4.durable-replay] trimmed tip-after-transcript "
+                                        "session=%s removed=%s rows_now=%s fp=%s",
+                                        sess.session_id,
+                                        trimmed,
+                                        hydrate_rows,
+                                        fp_now,
+                                    )
+                        except Exception:
+                            logger.exception(
+                                "[v4.durable-replay] tip trim failed session=%s",
+                                sess.session_id,
+                            )
+                    except Exception:
+                        logger.exception(
+                            "[v4.hydration] subscribe hydration failed session=%s",
+                            sess.session_id,
+                        )
         elif not resume_ok:
             hydrate_ms = 0.0
             hydrate_rows = len(sess.rows)
@@ -1052,15 +1456,20 @@ class V4ConversationHub:
             return
         # JSON 尺寸编码在锁外完成：持锁逐条 json.dumps 是流式 worker 长时间
         # 占住 _write_lock 的主要来源，会让 loop 线程上的 rows_range /
-        # poll_frames 无界等待。
-        sizes = [len(json.dumps(d, ensure_ascii=False)) for d in deltas]
+        # poll_frames 无界等待。编码结果同时喂 durable 事件日志（一次序列化两用）。
+        encoded_deltas = [json.dumps(d, ensure_ascii=False) for d in deltas]
+        sizes = [len(e) for e in encoded_deltas]
+        durable_items: list[tuple[int, str, str]] = []
         with self._write_lock:
             sess = self._get_or_create_session(session_id)
             sess.last_author_at_ms = time.time() * 1000
             subs = [s for s in self._subscriptions.values() if s.session_id == sess.session_id]
-            for delta, encoded in zip(deltas, sizes):
+            for delta, encoded, size in zip(deltas, encoded_deltas, sizes):
                 sess.seq += 1
                 sess.delta_log.append((sess.seq, delta))
+                durable_items.append(
+                    (sess.seq, str(delta.get("op") or ""), encoded)
+                )
                 if len(sess.delta_log) > _DELTA_RETENTION_MAX:
                     evicted_seq = sess.delta_log.pop(0)[0]
                     floor = sess.delta_log[0][0] - 1 if sess.delta_log else evicted_seq
@@ -1069,9 +1478,18 @@ class V4ConversationHub:
                     continue
                 for sub in subs:
                     if sub.overflowed:
+                        # 已溢出：本批 delta 不再入队（recovery snapshot 会带上行），
+                        # 但仍要确保 flush 已排上——否则 overflowed 一直 true，
+                        # 后续直播增量全被 continue 掉，页面就「工作中但不涨字」。
+                        self._schedule_flush_threadsafe(sub)
                         continue
                     sub.pending_ops.append((sess.seq, delta))
-                    sub.pending_bytes += encoded
+                    # BUG（并行改动回归）：曾写成 `+= encoded`（JSON 字符串）——
+                    # pending_bytes 是 int 字节计数，int += str 在「有订阅者」时
+                    # 第一条 delta 就 TypeError，author_deltas 整批丢失 →
+                    # 客户端实时流全断（行已进 sess.rows，刷新才见）→
+                    # 表现为「发送后没反应」。恢复用字节数 size。
+                    sub.pending_bytes += size
                     if (
                         len(sub.pending_ops) > _SUBSCRIBER_BUFFER_MAX_OPS
                         or sub.pending_bytes > _SUBSCRIBER_BUFFER_MAX_BYTES
@@ -1080,6 +1498,7 @@ class V4ConversationHub:
                         sub.pending_ops = []
                         sub.pending_bytes = 0
                         sub.overflowed = True
+                        self._schedule_flush_threadsafe(sub)
                         continue
                     # authoring 可能来自 feed-to-thread worker 线程——必须走线程安全调度，
                     # 裸 loop.call_later 跨线程 push TimerHandle 会与 loop._run_once 竞争。
@@ -1091,6 +1510,14 @@ class V4ConversationHub:
                 sess.seq,
                 len(subs),
             )
+        # durable 事件档案（ZCode durable event 语义）：逐条权威 delta 落库（非阻塞），
+        # (session_id, log_epoch, seq) 唯一——事后审计「这条流/轮发生了什么、断在哪」。
+        # author_seed_rows 不入档：seed 是从 transcript 重建的历史（可再 derivation），
+        # 档案的独有价值 = 实时权威 delta 流。清空投影（log_epoch bump）后旧代际档案保留。
+        if durable_items:
+            from app.gateway.v4.event_log_writer import enqueue_v4_event_log
+
+            enqueue_v4_event_log(sess.session_id, sess.log_epoch, durable_items)
 
     def author_seed_rows(self, session_id: str, rows: list[dict[str, Any]]) -> int:
         """Cold-load history without per-row delta_log / ``_write_lock`` thrash.
@@ -1578,7 +2005,10 @@ class V4ConversationHub:
             }
             sub.queue.append(self._wrap_wire(sub, frame, "online"))
             sub.delivered_seq = to_seq
-        logger.info(
+        # 每 flush 一行曾是 INFO：流式会话 30ms 窗连发，实测 26.5 万行/天（75MB/天），
+        # 是 gateway 日志最大洪水源。降 DEBUG——排帧序对账时把 log_level 调到 debug 即可。
+        # snapshot / resume replay / overflow 仍为 INFO+（低频且是异常/首帧关键证据）。
+        logger.debug(
             "[v4.flush] session=%s sub=%s %d->%d ops=%d (raw=%d, %.1fKB) profile=%s",
             sess.session_id,
             sub.subscription_id,
@@ -1698,10 +2128,32 @@ class V4ConversationHub:
         return False
 
     def _build_snapshot(self, sess: _SessionState) -> dict[str, Any]:
+        # warm hub 上历史孤儿头（userInput 被挂走仍自称 origin=userInput）在出快照前降级，
+        # 否则订阅/切回仍见 !NO_USER / 左栏劈开。
+        try:
+            from app.gateway.v4.agui_mirror import mirror_heal_orphan_user_input_headers
+
+            mirror_heal_orphan_user_input_headers(str(sess.session_id or ""))
+        except Exception:
+            logger.exception(
+                "[v4.snapshot] heal orphan userInput headers failed session=%s",
+                sess.session_id,
+            )
+        try:
+            from app.gateway.v4.agui_mirror import mirror_heal_stale_inflight_rows
+
+            mirror_heal_stale_inflight_rows(str(sess.session_id or ""))
+        except Exception:
+            logger.exception(
+                "[v4.snapshot] heal stale inflight rows failed session=%s",
+                sess.session_id,
+            )
         rows = sorted(sess.rows.values(), key=lambda r: r["rowId"])
         # 流式进行中：尾窗截断会把本轮 userInput 挤出；多会话切回时只剩工具/助手尾巴，
         # 用户气泡「没了」但 AI 还在回（2026-11-15 实锤）。live 时把本轮锚点钉进窗口。
-        window = self._snapshot_tail_window(rows, pin_live_turn=self._session_turn_is_live(sess))
+        # 另：control 瞬态未标 running 但行上仍有 streaming/running 时也必须钉。
+        pin_live = self._session_turn_is_live(sess) or self._rows_have_inflight(rows)
+        window = self._snapshot_tail_window(rows, pin_live_turn=pin_live)
         return {
             "protocolVersion": 1,
             "sessionId": sess.session_id,
@@ -1796,33 +2248,308 @@ class V4ConversationHub:
         return start
 
     @staticmethod
-    def _live_turn_span(rows: list[dict[str, Any]]) -> tuple[int, int] | None:
-        """Latest non-empty realUser 的 (turnStartIdx, userIdx)。
+    def _trim_projection_after_fingerprint_tip(
+        sess: _SessionState, fingerprint: str
+    ) -> int:
+        """删掉库尾 message 之后的幽灵 tip 行（durable-replay 把旧 live 轮追加到末尾）。
 
-        turnStart = 该 turnId 的首行（含 turnHeader，也兼容 userInput 先于 header 的颠倒序）。
+        返回删除行数。库尾 id 不在投影里时不裁（避免误删整窗）。
         """
-        last_ui_idx: int | None = None
-        for i in range(len(rows) - 1, -1, -1):
-            if str(rows[i].get("kind") or "") != "userInput":
+        parts = str(fingerprint or "").split(":")
+        if len(parts) < 2 or not sess.rows:
+            return 0
+        last_mid = str(parts[1] or "").strip()
+        if not last_mid:
+            return 0
+        tip_rid = 0
+        for row in sess.rows.values():
+            if not isinstance(row, dict):
                 continue
-            if str(rows[i].get("origin") or "") != "realUser":
+            ids = (
+                str(row.get("entityId") or "").strip(),
+                str(row.get("messageId") or "").strip(),
+                str(row.get("assistantResponseId") or "").strip(),
+            )
+            if last_mid not in ids:
                 continue
-            if not str(rows[i].get("text") or "").strip():
+            try:
+                rid = int(row.get("rowId") or 0)
+            except (TypeError, ValueError):
                 continue
-            last_ui_idx = i
-            break
-        if last_ui_idx is None:
-            return None
-        turn_id = str(rows[last_ui_idx].get("turnId") or "").strip()
-        turn_start = last_ui_idx
+            if rid > tip_rid:
+                tip_rid = rid
+        if tip_rid <= 0:
+            return 0
+        removed = 0
+        for rid in list(sess.rows.keys()):
+            try:
+                irid = int(rid)
+            except (TypeError, ValueError):
+                continue
+            if irid <= tip_rid:
+                continue
+            sess.rows.pop(rid, None)
+            removed += 1
+        if removed and sess.rows:
+            sess.next_row_id = max(
+                int(sess.next_row_id or 1),
+                max(int(r.get("rowId") or 0) for r in sess.rows.values()) + 1,
+            )
+        return removed
+
+    @staticmethod
+    def _projection_tip_matches_fingerprint(sess: _SessionState, fingerprint: str) -> bool:
+        """库尾 message_id 是否仍是投影 tip（其后没有别的对话轮）。
+
+        fingerprint 形如 ``count:message_id:content_len``。hydrate 行用
+        ``entityId=message_id``。若库尾 id 不在投影里，或其后又挂了另一轮的
+        turnHeader/user/assistant/reasoning/tool，则视为 tip 脱节。
+        """
+        parts = str(fingerprint or "").split(":")
+        if len(parts) < 2:
+            return True
+        last_mid = str(parts[1] or "").strip()
+        if not last_mid or not sess.rows:
+            return True
+        matched_rids: list[int] = []
+        matched_turns: set[str] = set()
+        for row in sess.rows.values():
+            if not isinstance(row, dict):
+                continue
+            ids = (
+                str(row.get("entityId") or "").strip(),
+                str(row.get("messageId") or "").strip(),
+                str(row.get("assistantResponseId") or "").strip(),
+            )
+            if last_mid not in ids:
+                continue
+            try:
+                rid = int(row.get("rowId") or 0)
+            except (TypeError, ValueError):
+                continue
+            if rid <= 0:
+                continue
+            matched_rids.append(rid)
+            turn = str(row.get("turnId") or "").strip()
+            if turn:
+                matched_turns.add(turn)
+        if not matched_rids:
+            return False
+        tip_mid_rid = max(matched_rids)
+        tip_kinds = {
+            "turnHeader",
+            "userInput",
+            "assistantText",
+            "reasoning",
+            "toolCall",
+            "subagent",
+        }
+        for row in sess.rows.values():
+            if not isinstance(row, dict):
+                continue
+            try:
+                rid = int(row.get("rowId") or 0)
+            except (TypeError, ValueError):
+                continue
+            if rid <= tip_mid_rid:
+                continue
+            if str(row.get("kind") or "") not in tip_kinds:
+                continue
+            row_turn = str(row.get("turnId") or "").strip()
+            if matched_turns and row_turn and row_turn not in matched_turns:
+                return False
+            if not row_turn:
+                return False
+        return True
+
+    @staticmethod
+    def _row_is_inflight(row: dict[str, Any] | None) -> bool:
+        if not row:
+            return False
+        kind = str(row.get("kind") or "")
+        if kind == "turnHeader":
+            state = str(row.get("state") or "")
+            return state == "running" or state.startswith("running")
+        if kind in ("assistantText", "reasoning"):
+            return str(row.get("state") or "") == "streaming"
+        if kind == "toolCall":
+            status = str(row.get("status") or "")
+            return status in {
+                "inputStreaming",
+                "running",
+                "pendingApproval",
+                "awaitingInput",
+                "pending",
+                "executing",
+            }
+        if kind == "subagent":
+            status = str(row.get("status") or "")
+            return status in {"running", "streaming"}
+        return False
+
+    @staticmethod
+    def _rows_have_inflight(rows: list[dict[str, Any]]) -> bool:
+        return any(V4ConversationHub._row_is_inflight(r) for r in rows)
+
+    @staticmethod
+    def _turn_start_index(rows: list[dict[str, Any]], idx: int) -> int:
+        if idx < 0 or idx >= len(rows):
+            return max(0, idx)
+        turn_id = str(rows[idx].get("turnId") or "").strip()
         if turn_id:
             for i, row in enumerate(rows):
-                if str(row.get("turnId") or "").strip() == turn_id:
-                    turn_start = i
+                if i > idx:
                     break
-        elif last_ui_idx > 0 and str(rows[last_ui_idx - 1].get("kind") or "") == "turnHeader":
-            turn_start = last_ui_idx - 1
-        return turn_start, last_ui_idx
+                if str(row.get("turnId") or "").strip() == turn_id:
+                    return i
+        if idx > 0 and str(rows[idx - 1].get("kind") or "") == "turnHeader":
+            return idx - 1
+        if str(rows[idx].get("kind") or "") == "turnHeader":
+            return idx
+        return idx
+
+    @staticmethod
+    def _real_user_recency_key(row: dict[str, Any] | None) -> int:
+        """对齐前端 realUserRecencyKey：createdAt 优先，其次 rowId。"""
+        if not row:
+            return -1
+        try:
+            created = int(row.get("createdAt") or 0)
+        except (TypeError, ValueError):
+            created = 0
+        try:
+            rid = int(row.get("rowId") or 0)
+        except (TypeError, ValueError):
+            rid = 0
+        return created * 1_000_000 + (rid % 1_000_000) if created > 0 else rid
+
+    @staticmethod
+    def _rows_for_turn_id(rows: list[dict[str, Any]], turn_id: str) -> list[dict[str, Any]]:
+        tid = str(turn_id or "").strip()
+        if not tid:
+            return []
+        return [r for r in rows if str(r.get("turnId") or "").strip() == tid]
+
+    @staticmethod
+    def _resolve_live_turn_user_idx(
+        rows: list[dict[str, Any]], turn_id: str, turn_start: int
+    ) -> int:
+        user_idx = -1
+        best_user_key = -1
+        for i, row in enumerate(rows):
+            if str(row.get("turnId") or "").strip() != turn_id:
+                continue
+            if str(row.get("kind") or "") != "userInput":
+                continue
+            if str(row.get("origin") or "") != "realUser":
+                continue
+            if not str(row.get("text") or "").strip():
+                continue
+            key = V4ConversationHub._real_user_recency_key(row)
+            if key >= best_user_key:
+                best_user_key = key
+                user_idx = i
+        if user_idx >= 0:
+            return user_idx
+        user_idx = turn_start
+        for i, row in enumerate(rows):
+            if str(row.get("turnId") or "").strip() != turn_id:
+                continue
+            if str(row.get("kind") or "") == "userInput":
+                return i
+        return user_idx
+
+    @staticmethod
+    def _live_turn_span(rows: list[dict[str, Any]]) -> tuple[int, int] | None:
+        """直播锚点 (turnStartIdx, userIdx)。
+
+        对齐前端 ``liveTurnSpan``：
+        1) 多 inflight 按 tip（最大 rowId）打分；
+        2) 若最新 realUser 属于另一轮且比 inflight 轮用户更新 → demote 僵尸旧 inflight
+           （现场 bash@80 永久 running 钉旧轮 → !STREAM_AHEAD_OF_WINDOW）。
+        """
+        inflight_by_turn: dict[str, tuple[int, int]] = {}
+        latest_ui_idx: int | None = None
+        latest_ui_key = -1
+        for i, row in enumerate(rows):
+            if V4ConversationHub._row_is_inflight(row):
+                tid = str(row.get("turnId") or "").strip()
+                if tid:
+                    try:
+                        rid = int(row.get("rowId") or 0)
+                    except (TypeError, ValueError):
+                        rid = 0
+                    prev = inflight_by_turn.get(tid)
+                    if prev is None or rid > prev[0]:
+                        inflight_by_turn[tid] = (rid, i)
+            if str(row.get("kind") or "") != "userInput":
+                continue
+            if str(row.get("origin") or "") != "realUser":
+                continue
+            if not str(row.get("text") or "").strip():
+                continue
+            key = V4ConversationHub._real_user_recency_key(row)
+            if key >= latest_ui_key:
+                latest_ui_key = key
+                latest_ui_idx = i
+
+        best_inflight_tid = ""
+        best_inflight_score = -1.0
+        best_inflight_idx = -1
+        best_inflight_user_key = -1
+        for tid, (max_rid, any_idx) in inflight_by_turn.items():
+            user_score = -1
+            for row in V4ConversationHub._rows_for_turn_id(rows, tid):
+                if str(row.get("kind") or "") != "userInput":
+                    continue
+                if str(row.get("origin") or "") != "realUser":
+                    continue
+                if not str(row.get("text") or "").strip():
+                    continue
+                user_score = max(
+                    user_score, V4ConversationHub._real_user_recency_key(row)
+                )
+            score = float(max_rid) * 1e15 + max(0, user_score)
+            if score > best_inflight_score:
+                best_inflight_score = score
+                best_inflight_tid = tid
+                best_inflight_idx = any_idx
+                best_inflight_user_key = user_score
+
+        if (
+            best_inflight_tid
+            and latest_ui_idx is not None
+            and str(rows[latest_ui_idx].get("turnId") or "").strip() != best_inflight_tid
+            and latest_ui_key > best_inflight_user_key
+        ):
+            latest_tid = str(rows[latest_ui_idx].get("turnId") or "").strip()
+            latest_turn_max = 0
+            for row in V4ConversationHub._rows_for_turn_id(rows, latest_tid):
+                try:
+                    latest_turn_max = max(latest_turn_max, int(row.get("rowId") or 0))
+                except (TypeError, ValueError):
+                    pass
+            inflight_tip = inflight_by_turn.get(best_inflight_tid, (0, -1))[0]
+            try:
+                latest_created = int(rows[latest_ui_idx].get("createdAt") or 0)
+            except (TypeError, ValueError):
+                latest_created = 0
+            # 必须有 createdAt：否则高 rowId 的「上一问晚到 append」会误 demote 直播轮。
+            if latest_created > 0 and latest_turn_max > inflight_tip:
+                turn_start = V4ConversationHub._turn_start_index(rows, latest_ui_idx)
+                return turn_start, V4ConversationHub._resolve_live_turn_user_idx(
+                    rows, latest_tid, turn_start
+                )
+
+        if best_inflight_tid and best_inflight_idx >= 0:
+            turn_start = V4ConversationHub._turn_start_index(rows, best_inflight_idx)
+            return turn_start, V4ConversationHub._resolve_live_turn_user_idx(
+                rows, best_inflight_tid, turn_start
+            )
+
+        if latest_ui_idx is None:
+            return None
+        return V4ConversationHub._turn_start_index(rows, latest_ui_idx), latest_ui_idx
 
     @staticmethod
     def _pin_live_turn_into_window(
@@ -1831,25 +2558,91 @@ class V4ConversationHub:
         *,
         soft_cap: int,
     ) -> list[dict[str, Any]]:
-        """软顶裁掉直播轮时：保住 turnHeader+user+轮尾，避免已流出正文蒸发。"""
+        """软顶裁掉直播轮时：保住 turnHeader+user+in-flight+轮尾，避免已流出正文蒸发。
+
+        只取本 turn 行（对齐前端 ``rowsForTurnId``），绝不用 ``rows[turn_start:]``——
+        否则会把后写旧轮工具误收进直播段，或在旧轮仍 running 时把新 tip 挤出预算。
+        in-flight 顶满时硬保最大 rowId tip（对齐 ``selectLiveTurnWithinBudget``）。
+        """
         span = V4ConversationHub._live_turn_span(rows)
         if span is None:
             return window
         turn_start, user_idx = span
+        live_turn_id = str(rows[turn_start].get("turnId") or "").strip()
+        live_turn = (
+            V4ConversationHub._rows_for_turn_id(rows, live_turn_id)
+            if live_turn_id
+            else rows[turn_start:]
+        )
+        if not live_turn:
+            return window
         present = {int(r.get("rowId") or 0) for r in window}
-        live_turn = rows[turn_start:]
         if all(int(r.get("rowId") or 0) in present for r in live_turn):
             return window
         cap = max(_SNAPSHOT_MIN_TAIL_ROWS, int(soft_cap))
+        live_ids = {int(r.get("rowId") or 0) for r in live_turn}
+        # user_idx 可能因交错行落在 turn 外；钳到本 turn 行序。
+        live_user_pos = 0
+        user_rid = int(rows[user_idx].get("rowId") or 0) if 0 <= user_idx < len(rows) else 0
+        matched_user = False
+        for i, row in enumerate(live_turn):
+            if int(row.get("rowId") or 0) == user_rid:
+                live_user_pos = i
+                matched_user = True
+                break
+        if not matched_user:
+            for i, row in enumerate(live_turn):
+                if str(row.get("kind") or "") == "userInput":
+                    live_user_pos = i
+                    break
         if len(live_turn) <= cap:
             older_budget = max(0, cap - len(live_turn))
             older_start = max(0, turn_start - older_budget)
-            return rows[older_start:]
-        head = rows[turn_start : user_idx + 1]
-        after_user = rows[user_idx + 1 :]
-        tail_budget = max(0, cap - len(head))
-        tail = after_user[-tail_budget:] if tail_budget else []
-        return [*head, *tail]
+            # 对齐到 turnHeader，禁止 older 从 mid-tool 起刀（会丢上一问用户气泡）
+            older_start = V4ConversationHub._align_snapshot_window_start(rows, older_start)
+            if older_start > turn_start:
+                older_start = turn_start
+            older = [r for r in rows[older_start:] if int(r.get("rowId") or 0) not in live_ids]
+            return [*older, *live_turn]
+        head = live_turn[: live_user_pos + 1]
+        after_user = live_turn[live_user_pos + 1 :]
+        if not after_user:
+            older_budget = max(0, cap - len(head))
+            older_start = max(0, turn_start - older_budget)
+            older_start = V4ConversationHub._align_snapshot_window_start(rows, older_start)
+            if older_start > turn_start:
+                older_start = turn_start
+            older = [r for r in rows[older_start:] if int(r.get("rowId") or 0) not in live_ids]
+            return [*older, *head]
+        tip = after_user[0]
+        tip_id = int(tip.get("rowId") or 0)
+        for row in after_user[1:]:
+            rid = int(row.get("rowId") or 0)
+            if rid >= tip_id:
+                tip = row
+                tip_id = rid
+        inflight = [r for r in after_user if V4ConversationHub._row_is_inflight(r)]
+        inflight_ids = {int(r.get("rowId") or 0) for r in inflight}
+        settled = [r for r in after_user if int(r.get("rowId") or 0) not in inflight_ids]
+        tip_is_inflight = tip_id in inflight_ids
+        after_budget = max(0, cap - len(head))
+        reserved = len(inflight) + (0 if tip_is_inflight else 1)
+        if reserved >= after_budget:
+            # in-flight 顶满：硬保 tip + 最近一段 in-flight（可略超，优先 tip 可见）
+            room = max(0, after_budget - 1)
+            rest_inflight = [r for r in inflight if int(r.get("rowId") or 0) != tip_id]
+            keep_ids = {int(r.get("rowId") or 0) for r in rest_inflight[-room:]}
+            keep_ids.add(tip_id)
+            return [*head, *[r for r in after_user if int(r.get("rowId") or 0) in keep_ids]]
+        tip_slot = 0 if tip_is_inflight else 1
+        tail_budget = max(0, after_budget - len(inflight) - tip_slot)
+        settled_no_tip = [r for r in settled if int(r.get("rowId") or 0) != tip_id]
+        tail = settled_no_tip[-tail_budget:] if tail_budget else []
+        keep_ids = {
+            int(r.get("rowId") or 0) for r in (*inflight, *tail)
+        }
+        keep_ids.add(tip_id)
+        return [*head, *[r for r in after_user if int(r.get("rowId") or 0) in keep_ids]]
 
     @staticmethod
     def _snapshot_tail_window(

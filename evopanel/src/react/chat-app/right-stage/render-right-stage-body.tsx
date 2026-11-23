@@ -1,4 +1,12 @@
-// @ts-nocheck — mechanical P83 extract.
+// @ts-nocheck
+// 【self-evolution-bot · 2026-11-21 · 第111轮 · 模型:deepseek-v4.1-flash-1017】
+// 为什么保留 @ts-nocheck：本文件去掉它还剩 10 条存量类型错误（TS2322/TS2740/TS2339，
+//   全是 props 声明为 unknown 造成的收窄问题），属 P83 机械抽取遗留，不在本轮范围。
+// 但保留它有一个致命副作用，本轮已自撞：**tsc 对该文件完全免疫**，我改动时误删了
+//   `const data = surface.data || {}`，第 84 行引用未定义变量，tsc exit=0 一路绿灯，
+//   直到装进包、运行时才报「工作流加载失败 data is not defined」。
+// 因此新增护栏：evopanel/scripts/check-nocheck-shadow.mjs 检出本文件内 TS2304/TS2552
+//   （Cannot find name）这类**运行时必崩**的错误，类型收窄类不拦。
 /**
  * Right-stage surface body renderer. Extracted from ChatApp.tsx (P83).
  */
@@ -23,6 +31,8 @@ import { V4CollabSubtaskTranscriptPane } from './v4-collab-subtask-transcript-pa
 import { V4EmployeeProcessPane } from './v4-employee-process-pane.js'
 import { V4SessionRuntimePane } from './v4-session-runtime-pane.js'
 import { resolveEmployeeProcessTabTitle } from '../../../lib/right-stage/open-employee-process-stage.js'
+// 【self-evolution-bot · 2026-11-21 · 第109轮 · 模型:deepseek-v4.1-flash-1017】工作流签任务绑定判据
+import { resolveCollabWorkflowStageBinding } from '../../../lib/right-stage/collab-workflow-stage-binding.js'
 import type { SessionChildWorkItem } from '../../lib/session-reattach.js'
 import { V4SessionPaneBridge } from '../../v4/V4SessionPaneBridge.js'
 import {
@@ -70,10 +80,21 @@ function CollabWorkflowStageBody({
   onClose: () => void
 }) {
   const data = surface.data || {}
-  const mainTaskId = String(data.mainTaskId || fallbackMainTaskId || '').trim()
-  const leadThreadId = String(data.leadThreadId || fallbackLeadThreadId || '').trim()
-  const useShared =
-    !!mainTaskId && mainTaskId === String(fallbackMainTaskId || '').trim() && sharedMainTask != null
+  // 【self-evolution-bot · 2026-11-21 · 第109轮 · 模型:deepseek-v4.1-flash-1017】
+  // 改了什么：把「工作流签绑到哪个任务」这段判据抽到 collab-workflow-stage-binding.ts，并改判据。
+  // 为什么：原来 leadThreadId = data.leadThreadId || fallbackLeadThreadId，而 fallbackLeadThreadId
+  //   恒为「当前聊天 thread」。fetchCollabTaskRow 的解析顺序是 sessionKey → threadId → preferTaskId，
+  //   前两条先命中，于是按当前会话反查到了**另一个任务**的行：标题串成别的任务名、子任务变 0。
+  //   现网实证：ui.show mainTaskId=2611211657_7112（GET /api/tasks/{id} 有 6 个 subtasks、名字
+  //   「验证W5·串并混合六节点文档流」），面板却显示「构建+重启后复验：fire_and_forget 投递重定向是否生效」
+  //   ＋「暂无子任务节点」。显式指定了任务就必须以它为准，不能被当前会话覆盖。
+  //   判据：显式 id 时 body 里的任务名与任务 ID 必须同源，节点数等于该任务 subtasks 长度。
+  const { mainTaskId, leadThreadId, useShared } = resolveCollabWorkflowStageBinding({
+    surfaceData: data,
+    fallbackMainTaskId,
+    fallbackLeadThreadId,
+    sharedMainTask,
+  })
   const { subtasks: fetchedSubs, mainTask: fetchedMain } = useCollabSubtasksFromApi({
     taskId: mainTaskId || null,
     threadId: leadThreadId || null,
@@ -409,16 +430,23 @@ export function renderRightStageBody(
       wsClient?.getSessionThreadId?.(selectedSessionKey || '') || '',
     )
     return sidePanelHeavyMount ? (
-      <V4SubagentTranscriptPane
-        taskId={taskId}
-        title={String(surface.title || data.title || '子代理')}
-        sessionKey={String(data.sessionKey || selectedSessionKey || '')}
-        fallbackText={typeof data.fallbackText === 'string' ? data.fallbackText : undefined}
-        fallbackStatus={typeof data.fallbackStatus === 'string' ? data.fallbackStatus : undefined}
-        parentThreadId={parentThreadId || undefined}
-        liveTask={liveTask as { phase?: string; liveOutput?: string; progressHint?: string; error?: string } | undefined}
-        onClose={() => rightStageStore.closeTab(tabKeyOf(surface))}
-      />
+      // 【self-evolution-bot · 2026-11-20 · 第87轮 · 模型:deepseek-v4.1-flash-1017】
+      // 改了什么：给 V4SubagentTranscriptPane 包上 RightStageTabErrorBoundary。
+      // 为什么：子代理 transcript 是对话类面板之一，此前与 employeeProcess /
+      // collab-* 一样没被 boundary 包住；它内部要消费实时 liveOutput 与多键回退，
+      // 异常概率不低，崩了会连累整条右栏。
+      <RightStageTabErrorBoundary title={String(surface.title || '子代理输出')}>
+        <V4SubagentTranscriptPane
+          taskId={taskId}
+          title={String(surface.title || data.title || '子代理')}
+          sessionKey={String(data.sessionKey || selectedSessionKey || '')}
+          fallbackText={typeof data.fallbackText === 'string' ? data.fallbackText : undefined}
+          fallbackStatus={typeof data.fallbackStatus === 'string' ? data.fallbackStatus : undefined}
+          parentThreadId={parentThreadId || undefined}
+          liveTask={liveTask as { phase?: string; liveOutput?: string; progressHint?: string; error?: string } | undefined}
+          onClose={() => rightStageStore.closeTab(tabKeyOf(surface))}
+        />
+      </RightStageTabErrorBoundary>
     ) : (
       <SidePanelBootShell title={surface.title || '子代理输出'} />
     )
@@ -427,9 +455,24 @@ export function renderRightStageBody(
     const data = surface.data || {}
     const subtaskId = String(data.subtaskId || '').trim()
     const mainTaskId = String(data.mainTaskId || collabSubtasksTaskId || sidebarActiveTaskId || '').trim()
-    if (!subtaskId || !mainTaskId) return null
+    // 【self-evolution-bot · 2026-11-20 · 第87轮 · 模型:deepseek-v4.1-flash-1017】
+    // 改了什么：① 缺参不再静默 return null，改为说出缺哪几个字段；
+    // ② 给 V4CollabSubtaskTranscriptPane 包上 RightStageTabErrorBoundary。
+    // 为什么：契约里 collabSubtaskTranscript 必需 mainTaskId + subtaskId，
+    // 缺了就空白一片用户无法分辨；而它同样是用户常看的进度面板，
+    // 未包 boundary 时内部异常会连累整条右栏（与 employeeProcess 同一处口径）。
+    if (!subtaskId || !mainTaskId) {
+      const miss = [!mainTaskId && 'mainTaskId', !subtaskId && 'subtaskId'].filter(Boolean)
+      return (
+        <div className="flex h-full min-h-0 flex-col items-center justify-center gap-1 px-4 text-ui-sm text-foreground-subtlest">
+          <p>无法打开「协作节点进度」：缺少 {miss.join(' / ')}</p>
+          <p className="text-[11px]">可由模型调用 platform action=ui.kinds 查看该面板所需参数</p>
+        </div>
+      )
+    }
     return sidePanelHeavyMount ? (
-      <V4CollabSubtaskTranscriptPane
+      <RightStageTabErrorBoundary title={String(surface.title || '节点进度')}>
+        <V4CollabSubtaskTranscriptPane
         mainTaskId={mainTaskId}
         subtaskId={subtaskId}
         leadThreadId={String(data.leadThreadId || chatThreadIdForSidebar || '').trim()}
@@ -445,7 +488,8 @@ export function renderRightStageBody(
             : null
         }
         onClose={() => rightStageStore.closeTab(tabKeyOf(surface))}
-      />
+        />
+      </RightStageTabErrorBoundary>
     ) : (
       <SidePanelBootShell title={surface.title || '节点进度'} />
     )
@@ -454,24 +498,50 @@ export function renderRightStageBody(
     const data = surface.data || {}
     const source = data.source
     if (!source) return null
+    // 缺 review 的 code-review 源会在 PreviewPane 读 startLine 时炸；降级成普通 file。
+    const safeSource =
+      source.type === 'code-review' && !(source as { review?: unknown }).review
+        ? {
+            ...source,
+            type: 'file' as const,
+            title: String(source.title || source.path || '文件'),
+            path: String(source.path || ''),
+          }
+        : source
+    if (safeSource.type === 'file' && !String(safeSource.path || '').trim()) {
+      return (
+        <SidePanelBootShell title={surface.title || '代码对比'} />
+      )
+    }
     // ZCode 正式预览件（PreviewPane）：patch/code-review/text/image/media/
     // pdf/pptx/multi-file-diff；普通 file 已在打开时分流到 file 标签。
     const codeViewerRoot = String(
-      source.workspacePath || data.workspaceRoot || effectiveWorkspaceRoot || '',
+      safeSource.workspacePath || data.workspaceRoot || effectiveWorkspaceRoot || '',
     ).trim()
     return sidePanelHeavyMount ? (
-      <V4PreviewPane
-        source={source}
-        threadId={String(data.threadId || '')}
-        workspacePath={codeViewerRoot || undefined}
-        onClose={() => rightStageStore.closeTab(tabKeyOf(surface))}
-        onOpenCodeViewer={(nextSource) => {
-          openRightStageForCodeViewerSource(nextSource, {
-            sessionKey: surface.sessionKey,
-            threadId: String(data.threadId || ''),
-          })
-        }}
-      />
+      // 【self-evolution-bot · 2026-11-21 · 第113轮 · 模型:deepseek-v4.1-flash-1017】
+      // 改了什么：给 codeViewer 分支补上 RightStageTabErrorBoundary（此前它是唯一没有边界的大面板）。
+      // 为什么（本轮真机实测）：`ui.show kind=codeViewer data={source:{type:'code-review'}}`
+      //   —— 一个缺 review 字段的非法 source —— 之后整块聊天区消失：
+      //   `#chat-persistent-host` innerHTML 只剩 33 字节、body.innerText 62 字（只剩导航栏），
+      //   右栏 aside 整个不存在；window error 钩子 count=0（是 React 渲染期抛出，未冒到 window）。
+      //   terminal / asset / file / 媒体 四类分支都有边界，只有 codeViewer 裸挂 V4PreviewPane，
+      //   于是一个坏 source 打掉的是**整个应用**，而不是一个签。
+      // 判据：坏 source 必须被关在这一个签里，其它签与聊天区照常。
+      <RightStageTabErrorBoundary title={surface.title || '代码对比'}>
+        <V4PreviewPane
+          source={safeSource}
+          threadId={String(data.threadId || '')}
+          workspacePath={codeViewerRoot || undefined}
+          onClose={() => rightStageStore.closeTab(tabKeyOf(surface))}
+          onOpenCodeViewer={(nextSource) => {
+            openRightStageForCodeViewerSource(nextSource, {
+              sessionKey: surface.sessionKey,
+              threadId: String(data.threadId || ''),
+            })
+          }}
+        />
+      </RightStageTabErrorBoundary>
     ) : (
       <SidePanelBootShell title={surface.title || '代码对比'} />
     )
@@ -573,8 +643,14 @@ export function renderRightStageBody(
     )
   }
   if (kind === 'collab-workflow') {
+    // 【self-evolution-bot · 2026-11-20 · 第87轮 · 模型:deepseek-v4.1-flash-1017】
+    // 改了什么：给 CollabWorkflowStageBody 包上 RightStageTabErrorBoundary。
+    // 为什么：工作流图是协作任务的主视图，节点数据来自实时 threadPanelState，
+    // 未包 boundary 时任一节点渲染异常会崩掉整条右栏（其它签一起消失），
+    // 用户只看到空白。补齐后只坏这一签、并显示错误与「重试」。
     return sidePanelHeavyMount ? (
-      <CollabWorkflowStageBody
+      <RightStageTabErrorBoundary title={String(surface.title || '工作流')}>
+        <CollabWorkflowStageBody
         surface={surface}
         agents={agents}
         fallbackMainTaskId={String(collabSubtasksTaskId || sidebarActiveTaskId || '').trim()}
@@ -591,7 +667,8 @@ export function renderRightStageBody(
             ? () => closeCollabWorkflowSurface(surface)
             : closeCollabExecPanel
         }
-      />
+        />
+      </RightStageTabErrorBoundary>
     ) : (
       <SidePanelBootShell title="工作流" className="react-chat-right-stage-panel" />
     )
@@ -600,7 +677,19 @@ export function renderRightStageBody(
   if (kind === 'employeeProcess') {
     const data = surface.data || {}
     const agentCode = String(data.agentCode || '').trim()
-    if (!agentCode) return null
+    // 【self-evolution-bot · 2026-11-20 · 第87轮 · 模型:deepseek-v4.1-flash-1017】
+    // 改了什么：缺 agentCode 时不再 return null 静默空白，改为给出「缺什么」的提示。
+    // 为什么：静默空白 = 用户看到一个空面板、不知道是没数据还是坏了。
+    // 契约（right_panel_kinds.py）里 employeeProcess 必需 data.agentCode；
+    // 这里把违反契约的事实说出来，和 describeMissingFields 的文案口径一致。
+    if (!agentCode) {
+      return (
+        <div className="flex h-full min-h-0 flex-col items-center justify-center gap-1 px-4 text-ui-sm text-foreground-subtlest">
+          <p>无法打开「员工执行过程」：缺少 agentCode</p>
+          <p className="text-[11px]">可由模型调用 platform action=ui.kinds 查看该面板所需参数</p>
+        </div>
+      )
+    }
     const roleName = String(data.roleName || '').trim()
     // 标题只用岗位/员工中文名；禁止把 agent_code 当标题传下去
     const empTitle = resolveEmployeeProcessTabTitle({
@@ -608,13 +697,20 @@ export function renderRightStageBody(
       roleName,
       agentCode,
     })
+    // 【self-evolution-bot · 2026-11-20 · 第87轮 · 模型:deepseek-v4.1-flash-1017】
+    // 改了什么：给 V4EmployeeProcessPane 包上 RightStageTabErrorBoundary。
+    // 为什么：它是用户最常看的进度面板，却和 terminal/asset/file/sessionRuntime 不同，
+    // 没被 boundary 包住——内部一抛异常整条右栏一起白屏（boundary 的 docstring 写明
+    // 存在的意义就是「不许一块 lazy chunk 崩掉整条 rail」）。补齐口径。
     return sidePanelHeavyMount ? (
-      <V4EmployeeProcessPane
+      <RightStageTabErrorBoundary title={empTitle || '执行过程'}>
+        <V4EmployeeProcessPane
         agentCode={agentCode}
         roleName={roleName}
         busy={!!data.busy}
         title={empTitle}
         roundId={String(data.roundId || '').trim()}
+        roundStamp={String(data.roundStamp || '').trim()}
         taskId={String(data.taskId || '').trim()}
         sessionKey={String(surface.sessionKey || selectedSessionKey || '').trim() || undefined}
         employeeSessionKeyHint={String(
@@ -622,7 +718,8 @@ export function renderRightStageBody(
         ).trim() || undefined}
         pendingSendMessage={String(data.pendingSendMessage || '').trim() || undefined}
         onClose={() => rightStageStore.closeTab(tabKeyOf(surface))}
-      />
+        />
+      </RightStageTabErrorBoundary>
     ) : (
       <SidePanelBootShell title={empTitle} />
     )

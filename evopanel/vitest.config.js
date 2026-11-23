@@ -41,9 +41,13 @@ export default defineConfig({
     // 其余 tests/*.test.js 使用 node:test，由 `node --test` 单独运行
     include: [
       'tests/shell-session-list-menu.test.tsx',
+      // 【self-evolution-bot · 2026-11-20 · 第87轮 · 模型:deepseek-v4.1-flash-1017】
+      // 右栏面板契约：前端校验与后端 right_panel_kinds.py 同口径
+      'tests/right-panel-contract.test.js',
       'tests/platform-scope-ui.test.js',
       'tests/codex-auth-panel.test.js',
       'tests/v4-wire-conformance.test.ts',
+      'tests/conversation-row-sharing.test.ts',
       'tests/control-busy.test.ts',
       'tests/v4-running-text-interleave.test.ts',
       'tests/v4-reasoning-visibility.test.ts',
@@ -77,12 +81,14 @@ export default defineConfig({
       'tests/transcript-persist.test.js',
       'tests/transcript-resume-anchor.test.js',
       'tests/workspace-api-scope.test.js',
+      'tests/chat-workspace-root-placeholder.test.js',
       'tests/artifact-absolute-path.test.js',
       'tests/workspace-stream-preview.test.js',
       'tests/workspace-html-preview.test.js',
       'tests/preview-view-mode.test.js',
       'tests/preview-doc-parsers.test.js',
       'tests/preview-pane-text-wrap-default.test.ts',
+      'tests/preview-pane-code-review.test.ts',
       'tests/workspace-recent-sections.test.js',
       'tests/zcode-theme-host-scope.test.ts',
       'tests/workspace-file-preview-view-toggle.test.tsx',
@@ -161,6 +167,9 @@ export default defineConfig({
       'tests/stream-resume-gate.test.js',
       'tests/stream-reattach-cooldown.test.js',
       'tests/session-reattach.test.js',
+      // 【self-evolution-bot · 2026-11-19 · 第69轮 · 模型:deepseek-v4.1-flash-1017】
+      // 死会话 404 风暴的失败退避；白名单不加进来等于没写测试（第33轮同坑）。
+      'tests/session-reattach-failure-backoff.test.js',
       'tests/context-usage.test.js',
       'tests/conversation-compact-tip.test.ts',
       'tests/agent-trace-compaction.test.js',
@@ -176,6 +185,9 @@ export default defineConfig({
       'tests/message-row-timeline.test.js',
       'tests/turn-display-phase.test.js',
       'tests/turn-timing.test.js',
+      // 【self-evolution-bot · 2026-11-20 · 第91轮 · 模型:deepseek-v4.1-flash-1017】
+      // 工具卡运行中耗时不动（结束才出现）的回归锚点。
+      'tests/tool-card-live-elapsed.test.tsx',
       'tests/message-row-reasoning-display.test.js',
       'tests/reasoning-display-text.test.js',
       'tests/activity-fold-visible-content.test.js',
@@ -187,9 +199,13 @@ export default defineConfig({
       'tests/session-debug-turn-groups.test.js',
       'tests/pick-session-row-title.test.js',
       'tests/chat-layout-bottom-dock.test.js',
+      // 【self-evolution-bot · 2026-11-21 · 第114轮 · 模型:deepseek-v4.1-flash-1017】
+      // 右栏宽度随窗口重算：缩窗溢出实测 vw=960 被裁 216px（现网数字，见测试文件头）。
+      'tests/chat-layout-right-panel-reflow.test.js',
       'tests/chat-pane-mode.test.ts',
       'tests/chat-ws-foreground.test.js',
       'tests/conversation-turn-session-busy.test.ts',
+      'tests/v4-render-units-selector.test.ts',
       'tests/platform-media-turn-end.test.ts',
       'tests/home-live-activity.test.ts',
       'tests/task-runtime-health.test.js',
@@ -212,10 +228,18 @@ export default defineConfig({
       'tests/background-voice.test.js',
       'tests/voice-listen-control.test.js',
       'tests/voice-reply-speech.test.js',
+      'tests/xiaomi-voice-provider.test.js',
       'tests/speech-client-queue.test.js',
       'tests/goal-closure-local.test.js',
       'tests/license-nav.test.js',
       'tests/task-summary-outputs.test.js',
+      // 【self-evolution-bot · 2026-11-22 · 第125轮 · 模型:deepseek-v4.1-flash】
+      // 任务详情「对话」面板选源：不许把别处对话挂在任务名下，也不许把真执行记录漏掉。
+      'tests/task-conversation-source.test.js',
+      'tests/employee-pane-send-target.test.js',
+      // 【self-evolution-bot · 2026-11-22 · 第127轮 · 模型:deepseek-v4.1-flash】
+      // 平台排队的首条消息：面板忙时必须 hold（不许 return 丢消息），且只有发送成功才清签。
+      'tests/pending-send-gate.test.js',
       'tests/assets-file-prefetch.test.js',
       'tests/task-tree.test.js',
       'tests/ui-extension-manifest.test.js',
@@ -223,21 +247,81 @@ export default defineConfig({
       'tests/decide-right-stage.test.js',
       'tests/publish-platform-entries.test.js',
       'tests/open-progress-from-panel-set.test.js',
+      'tests/employee-process-round-switch.test.js',
+      'tests/employee-process-dispatch-cta-e2e.test.js',
       'tests/shell-page-mount-table.test.js',
+      // 【self-evolution-bot · 2026-11-21 · 第109轮 · 模型:deepseek-v4.1-flash-1017】
+      // 右栏「任务」签恒空：asList 只认顶层信封，错过 {success,data:{tasks}}。不登记 include 等于没写。
+      'tests/tasks-center-compact-envelope.test.js',
+      // 【self-evolution-bot · 2026-11-21 · 第109轮 · 模型:deepseek-v4.1-flash-1017】
+      // 工作流签绑错任务：显式 mainTaskId 被当前会话 thread 覆盖 → 标题串、节点 0。
+      'tests/collab-workflow-stage-binding.test.ts',
+      // 【self-evolution-bot · 2026-11-21 · 第111轮 · 模型:deepseek-v4.1-flash-1017】
+      // 员工面板发送落到 task 会话 → 消息进任务时间线，对话面板永远看不到（现网 19:40 实证）。
+      'tests/employee-pane-send-session-kind.test.js',
+      // 【self-evolution-bot · 2026-11-21 · 第112轮 · 模型:deepseek-v4.1-flash-1017】
+      // 护栏：子任务会话历史不得用裸 fetch（Tauri 下相对路径拿到 SPA 首页）。
+      'tests/subtask-fetch-must-use-gateway.test.js',
       'tests/subtask-conversation-history.test.js',
+      // 【self-evolution-bot · 2026-11-21 · 第113轮 · 模型:deepseek-v4.1-flash-1017】
+      // codeViewer 是唯一没有错误边界的大面板：一个坏 source 打掉整个聊天区（本轮实测）。
+      'tests/right-stage-codeviewer-error-boundary.test.js',
       'tests/right-stage-tab-layout.test.ts',
       'tests/right-stage-store-tabs.test.ts',
+      // 【self-evolution-bot · 2026-11-23 · 第128轮 · 模型:deepseek-v4.1-flash】
+      // 右栏「谁打开的」溯源：三态取值域 + 创建时定死 + 缺省兜底会话而非 user。
+      // 用户原话「我在 A 打开了一个截图，但在别处看到却不知道是谁打开的，就容易错乱」。
+      'tests/right-stage-opened-by.test.ts',
       'tests/right-stage-force-expand.test.js',
       'tests/right-stage-scope.test.ts',
       'tests/right-stage-artifacts-session-stamp.test.ts',
+      // 【self-evolution-bot · 2026-11-21 · 第106轮 · 模型:deepseek-v4.1-flash-1017】
+      // 为什么：expand=true 的 show 跨会话时必须写进用户眼前，此前被隔离分支吃掉了。
+      'tests/right-stage-expand-cross-session.test.ts',
       'tests/bridge-theme-dark.test.ts',
       'tests/right-stage-force-mount.test.ts',
+      'tests/right-stage-no-permanent-loading.test.ts',
+      // 【self-evolution-bot · 2026-11-20 · 第100轮 · 模型:deepseek-v4.1-flash-1017】
+      // chat_send 单 owner：服务端已受理时前端不许再 pendingSend，否则同一句话两遍。
+      'tests/employee-chat-send-single-owner.test.js',
+      // 【self-evolution-bot · 2026-11-21 · 第109轮 · 模型:deepseek-v4.1-flash-1017】面板发送桥判据
+      'tests/employee-pane-send-bridge.test.js',
+      // 右栏「当前在看哪一页」上报 + 切到已有标签：用户明确要求可查、可切。
+      'tests/right-stage-state-report.test.ts',
+      'tests/right-stage-activate.test.ts',
+      // 【self-evolution-bot · 2026-11-20 · 第101轮 · 模型:deepseek-v4.1-flash-1017】
+      // 新增：ui.close / ui.move 的前端分发（关单签、调顺序）。
+      'tests/right-stage-close-move.test.ts',
+      // 【self-evolution-bot · 2026-11-21 · 第102轮 · 模型:deepseek-v4.1-flash-1017】
+      // 接线层测试：custom 流 → applyRightStageAgUiCustom 的 key/target 透传。
+      // 不登记进 include 等于没写（本仓 vitest 只跑 include 里的白名单）。
+      'tests/right-stage-custom-stream-key-wiring.test.ts',
+      // 【self-evolution-bot · 2026-11-21 · 第102轮 · 模型:deepseek-v4.1-flash-1017】
+      // 标题被兜底名覆盖 + 收起锁语义两处回归。
+      'tests/right-stage-title-collapse-semantics.test.ts',
+      // 【self-evolution-bot · 2026-11-20 · 第89轮 · 模型:deepseek-v4.1-flash-1017】
+      // 不可用终态提示的 DOM 渲染用例：断言实际渲染文本里没有「加载中」。
+      'tests/right-stage-unavailable-shell.test.tsx',
       'tests/right-stage-overlay-commit.test.ts',
       'tests/right-stage-session-persistence.test.ts',
+      // 【self-evolution-bot · 2026-11-21 · 第104轮 · 模型:deepseek-v4.1-flash-1017】
+      // 串台回归：CUA 截图自动开右栏的判据（尾轮 + 正在跑），
+      // 以及截图标签必须只在自己会话可见。不登记进 include 等于没写。
+      'tests/cua-screenshot-auto-open-gate.test.ts',
       'tests/browser-panel-node-repl-intent.test.js',
+      // 主窗口 __evoflowPanel snapshot/click/fill（platform ui.panel /main-cdp）
+      'tests/panel-api-snapshot.test.js',
       'tests/cua-glow-agui.test.js',
+      'tests/cua-glow-ring-wiring.test.js',
+      'tests/cua-glow-elapsed-page.test.js',
+      // 【self-evolution-bot · 2026-11-22】drawStroke 内嵌 PowerShell 的参数名回归
+      // （`$Pid` 是只读自动变量，撞上就整条笔画路径跑不通）。
+      'tests/cua-stroke-ps-param.test.ts',
+      'tests/cua-control-revoke-semantics.test.js',
+      'tests/cua-release-on-chat-stop.test.js',
       'tests/platform-feedback.test.js',
       'tests/platform-workflow-progress.test.ts',
+      'tests/platform-tool-title.test.ts',
       'tests/dept-group-handoff.test.js',
       'tests/dept-group-steward.test.js',
       'tests/dept-group-wake-queue.test.js',
@@ -245,6 +329,14 @@ export default defineConfig({
       'tests/dept-group-dispatch-status.test.js',
       'tests/dept-group-mentions.test.js',
       'tests/dept-group-transcript.test.js',
+      // 【self-evolution-bot · 2026-11-20 · 第88轮 · 模型:deepseek-v4.1-flash-1017】
+      // 群近期上下文按 token 预算裁剪（用户拍板「不按天翻篇」）。不登记 = 这测试不存在。
+      'tests/dept-group-context.test.js',
+      // 【self-evolution-bot · 2026-11-20 · 第88轮 · 模型:deepseek-v4.1-flash-1017】
+      'tests/dept-group-wake-persist.test.js',
+      // 【self-evolution-bot · 2026-11-20 · 第88轮 · 模型:deepseek-v4.1-flash-1017】
+      // 渲染期冒烟：tsc 抓不到渲染异常，必须真挂载组件看 DOM
+      'tests/dept-group-chat-render.test.tsx',
       'tests/dept-chat-list-cache.test.ts',
       'tests/dept-member-work-session.test.js',
       'tests/close-removed-entity-stage.test.js',
@@ -270,6 +362,8 @@ export default defineConfig({
       'tests/chat-turn-timing-stalled.test.js',
       // 首帧响应按回合幂等：后台回合无 sendTrace 时每 delta 双 IPC 落盘的洪水（1.2 万条/日）
       'tests/chat-turn-timing-first-response-latch.test.js',
+      // 发送水位线：正常收紧 / 异常留证 + 前后接口
+      'tests/chat-turn-waterline.test.js',
       'tests/live-execution-busy.test.js',
       // 多会话钉住 V4 投影：peekStore + pin 租约，切回不冷开空白
       'tests/v4-pin-sessions.test.js',
@@ -283,9 +377,14 @@ export default defineConfig({
       'tests/langgraph-thread-stale-epoch.test.ts',
       // 超大会话渲染层尾窗软顶（防 loadAllOlder / 长流式撑爆 window）
       'tests/projection-window-cap.test.ts',
+      'tests/tip-soft-cap-latch.test.ts',
       // overflow/recovery 尾窗快照不得冲掉已 loadOlder 的更早行
       'tests/v4-preserve-older-on-tail-snapshot.test.ts',
       'tests/v4-userinput-visible-in-tail.test.ts',
+      // 同 turn 工具 rowId 落在用户气泡前 → 不得先画「已工作」造成上下割裂
+      'tests/v4-turn-user-first-order.test.ts',
+      // user 行「先落库再发流」是 seq 不倒挂的唯一保证（第118轮现网 13 对倒挂）
+      'tests/chat-send-user-row-order.test.js',
       'tests/v4-fold-health.test.ts',
       'tests/v4-display-order-health.test.ts',
       'tests/v4-running-text-interleave.test.ts',
@@ -293,6 +392,8 @@ export default defineConfig({
       'tests/stream-stop-log.test.ts',
       'tests/run-page-load-resume.test.ts',
       'tests/settings-modal-tauri-drag.test.js',
+      // 设置→已装资源：「已装产物」分组（BOT 合并 employees+agents 去重、extensions 叫「Agent应用」）
+      'tests/installed-packs-artifact-labels.test.js',
       'tests/task-duration.test.js',
       'tests/replay-real-run-133609527d1f.test.js',
       'tests/replay-real-run-81320d61e8cc-diag.test.js',
@@ -321,6 +422,13 @@ export default defineConfig({
       // 视口调试「接口」页：只收录对话页相关 HTTP，并落盘入参/出参
       'tests/v4-viewport-api-tap.test.ts',
       'tests/v4-viewport-stream-tap.test.ts',
+      // 滚轮页：已显示/全量条数文案 + hasOlder=0 时不得写「可自动拉更早」
+      'tests/v4-viewport-scroll-tap.test.ts',
+      // 视口异常表：流式落后窗 / loadOlder 不前进 / 用户气泡错位 / 绘画埋没
+      'tests/v4-viewport-anomaly.test.ts',
+      // V4 投递路径根因对账（HUB_AHEAD_NOTIFIED0 / NO_STORE_SUB…）——面板能定位才算修好。
+      'tests/v4-path-probe.test.ts',
+      'tests/v4-viewport-virtualization-probe.test.ts',
       // search_code_index 卡片：不得被 family=search 抢去渲染成不可展开的一行式块
       // 【self-evolution-bot · 2026-11-17 · 第33轮】新增用例必须登记，否则 vitest 根本不会跑它
       'tests/search-code-index-card.test.ts',

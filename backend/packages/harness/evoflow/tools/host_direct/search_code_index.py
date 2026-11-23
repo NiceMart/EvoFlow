@@ -6,8 +6,9 @@ import atexit
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 
-from langchain.tools import ToolRuntime, tool
+from langchain_core.tools import tool
 
+from evoflow.core.tool_runtime_type import ToolRuntime
 from evoflow.tools.minimal_schema import SEARCH_CODE_INDEX_DESCRIPTION
 
 _MAX_WALL_SECONDS = 45.0
@@ -120,18 +121,49 @@ def _run_search_index_lookup(
         from evoflow.code_index.store import index_status
 
         st = index_status(workspace_root=root or None, thread_id=thread_id)
-        if st.get("building"):
+        # 【self-evolution-bot · 2026-11-22 · 第124轮 · 模型:deepseek-v4.1-flash】
+        # 坏库判定必须**排在** building / ready 两个分支**之前**。
+        # 为什么（本轮自撞）：初版把这段放在 `if not st.get("building")` 之后，
+        # 而隔离后紧接着调 index_status，`ready` 仍是 False 且 `building` 可能还没置位
+        # （重建是异步排队的），于是先撞上「not ready」分支 → 用户只看到
+        # "Workspace index is not ready … open the project in EvoPanel"。
+        # 库明明是我刚改名隔离掉并已排队重建，文案却让人去找 UI 建索引 —— 下一步动作指错。
+        # 【self-evolution-bot · 2026-11-22 · 第126轮 · 模型:deepseek-v4.1-flash】
+        # 改了什么：文案按 `index_quarantined` **真实取值**分两支，不再一律宣称「已改名隔离」。
+        # 为什么（本轮现网复验抓到的说假话）：隔离因 `[WinError 32]` 全员改名失败时
+        #   `quarantined=[]`，但旧文案照样写 "has been quarantined (kept, renamed …)"。
+        #   实测同句回执出现后我立刻 `quick_check` 那个库 → 仍是同一份坏库、盘上没有一个
+        #   `.corrupt-*`，员工按回执「等重建」永远等不到。判据必须是事实，不是意图。
+        if data.get("index_corrupt_recovered"):
+            if data.get("index_quarantined"):
+                return (
+                    f"No index hits for '{label}' yet — this workspace's index DB was CORRUPTED "
+                    f"(sqlite reported a broken file). The bad file has been quarantined (kept, renamed "
+                    f"with a .corrupt-<timestamp> suffix) and a full rebuild was just scheduled. "
+                    f"Retry search_code_index after the rebuild finishes; do NOT expect hits right now.",
+                    None,
+                )
+            # 隔离没成功：库还坏着，重建也没法在坏文件上跑起来。必须说清并给出人工动作，
+            # 否则员工会像本轮一样连调 6 次拿到同一句「稍后重试」。
             return (
-                f"No index hits for '{label}' yet — workspace index is still building. Retry search_code_index in a few seconds.",
+                f"Error: search_code_index failed — this workspace's index DB is CORRUPTED and could "
+                f"NOT be quarantined (file still locked by another process: {data.get('db_path')}). "
+                f"A rebuild cannot start on a broken file. Ask the operator to close anything holding "
+                f"that file (or delete it), then retry.",
                 None,
             )
-        if not st.get("ready"):
+        if not st.get("building"):
+            if not st.get("ready"):
+                return (
+                    f"No index hits for '{label}'. Workspace index is not ready — open the project in EvoPanel (index build) or wait for background indexing.",
+                    None,
+                )
             return (
-                f"No index hits for '{label}'. Workspace index is not ready — open the project in EvoPanel (index build) or wait for background indexing.",
+                f"No index hits for '{label}'. Try pipe synonyms (dall-e|dalle), shorter symbols, or read_file on likely paths after index miss.",
                 None,
             )
         return (
-            f"No index hits for '{label}'. Try pipe synonyms (dall-e|dalle), shorter symbols, or read_file on likely paths after index miss.",
+            f"No index hits for '{label}' yet — workspace index is still building. Retry search_code_index in a few seconds.",
             None,
         )
     data["label"] = label
@@ -390,3 +422,31 @@ try:
     search_code_index_hd.coroutine = _search_code_index_coroutine
 except Exception:  # pragma: no cover - pydantic 冻结时静默跳过
     pass
+
+
+# 【self-evolution-bot · 2026-11-19 · 第64轮 · 模型:deepseek-v4.1-flash-1017】
+# 改了什么：模块加载完就把嵌入暖机拉起来，不再等「第一次检索」才起。
+#
+# 为什么（现网实测，重启后同一查询在网关里 964ms ~ 8387ms 波动 8.7 倍）：
+#   · `_start_embed_warmup()` 全仓只有一个调用点 —— `_embed_query_sync` 内部，
+#     也就是**第一次检索发生的那一刻**才启动后台暖机。
+#   · 于是进程启动后第一次检索必然吃到完整冷启动（模型加载 ~3.8s + 首次 KNN
+#     重建页缓存），而它同一时刻还在被 `_SEARCH_POOL` 线程占着，只能干等。
+#   · 观测库证据：重启后 08:21/08:27/08:58 三次检索 4478/11462/7119ms，
+#     而间隔几分钟后的同类查询只要 964ms / 1308ms。
+#
+# 判据：暖机本来就是「后台、单飞、失败只降级不阻塞」的（见 `_start_embed_warmup`），
+# 提前到 import 时启动**不改变任何检索语义**，只是把这 3.8s 从「用户那次检索」里
+# 挪到「进程还没接活的时候」。工具 import 一定早于任何一次检索，所以覆盖完整。
+# 暖机失败仍走原来的 300s 冷却重试，不会因为提前启动就改变降级行为。
+def _kick_embed_warmup_on_import() -> None:
+    """Best-effort: start the code-index embedding warmup at process load time."""
+    try:
+        from evoflow.code_index.store import _start_embed_warmup
+
+        _start_embed_warmup()
+    except Exception:  # noqa: BLE001 - 暖机是纯加速，任何失败都不该影响工具注册
+        return
+
+
+_kick_embed_warmup_on_import()

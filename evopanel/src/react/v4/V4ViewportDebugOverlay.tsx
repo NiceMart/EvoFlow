@@ -2,14 +2,24 @@
  * V4 视口调试浮层：紧凑状态条 + 分页
  * - 运行：SSE / 轮询 / settled
  * - 消息：投影窗已显示/全序行数、用户气泡、loadOlder 预取带（≤2×视口）
- * - 流式：AG-UI / V4 原始 JSON（一行一条，贴底跟最新）
+ * - 流式：AG-UI / V4 原始 JSON（一行一条，全文可滚，会话目录落盘）
+ * - 画面：约每秒一帧「页面上看得见什么」（用户/正文/思考/工具），排查乱套用
+ * - 计时/水位线：发送 → 出泡上屏 → 上线 → 首字 → 结束；正常收紧、异常留证（复制诊断必带）
+ * - 滚轮：scrollTop 轨迹 / !JUMP / 到顶语义（能否自动拉历史 vs 已拉尽）
  * - 接口：页面相关 HTTP（subscribe / messages / catchup…）入参出参表
  * - 视口：DOM ↔ 投影 row
- * 布局诊断（!EST72 / gap / !HISTORY_TOP）仍在状态条。
+ * - 虚拟化：投影软顶 / 窗首尾 / 流式 tip / 直播轮（转圈+SSE、上滚历史必看）
+ * - 异常：流式无画面 / 最新气泡错位 / loadOlder 不前进 / 绘画埋没…（可监测表）
+ * 布局诊断（!EST72 / gap）仍在状态条；问题标记优先吃异常表。
+ * 抽头落盘：~/.evoflow/logs/stream-compare/{sessionId}/overlay/viewport-*.log
  *
  * 开启条件：调试模式（运维观测）开着，且 localStorage
  * `EVOFLOW_V4_VIEWPORT_OVERLAY` 不为 `'0'`（默认开）。
  * 顶栏问号菜单可切换；也可 `window.__evoflowViewportOverlay(true/false)`。
+ *
+ * Agent 拉取（不必点「复制诊断」）：
+ * - `window.__evoflowV4ViewportDiag()` / `__evoflowPanel.viewportDiag()`
+ * - `GET|POST /main-cdp/viewport-diag`（结构化 JSON + markdown）
  */
 import {
   useCallback,
@@ -33,7 +43,16 @@ import { isSessionExecuting } from "../lib/session-execution/queries.js";
 import { isSessionHistoryWatchActive } from "../lib/session-reattach.js";
 import { getV4TimelineBusy } from "./v4-timeline-busy-store.js";
 import { getEvoflowV4Transport } from "./evoflowV4Transport.js";
-import { getSharedV4SessionDataLayer } from "./V4StreamRowsBridge.js";
+import {
+  getSharedV4SessionDataLayer,
+  peekLastV4Catchup,
+} from "./V4StreamRowsBridge.js";
+import {
+  anomalyFromV4PathProbe,
+  collectV4PathProbe,
+  formatV4PathProbeForDiag,
+  type V4PathProbe,
+} from "./v4-path-probe.js";
 import {
   collectV4ChatLayoutDump,
   type V4ChatLayoutDump,
@@ -52,12 +71,57 @@ import {
   type ViewportApiTapFamily,
 } from "./v4-viewport-api-tap.js";
 import {
+  attachViewportScrollTap,
+  clearViewportScrollTap,
+  countViewportScrollJumps,
+  detachViewportScrollTap,
+  formatConversationRecordCounts,
+  formatScrollTopVerdict,
+  listViewportScrollTapEntries,
+  setViewportScrollHistoryContext,
+  setViewportScrollTapSessionId,
+  subscribeViewportScrollTap,
+  type ViewportScrollTapEntry,
+} from "./v4-viewport-scroll-tap.js";
+import {
   hasOlderRows,
 } from "@zcode/ui/v4/conversationProjectionStore.js";
 import {
   historyPrefetchTriggerPx,
   shouldTriggerLoadOlder,
 } from "@zcode/ui/v4/timelineScrollAnchor.js";
+import { buildConversationTurnRenderUnits } from "@zcode/ui/v4/conversationTurnRenderUnits.js";
+import {
+  classifyEmptyAssistantCompleted,
+  collectViewportAnomalies,
+  formatAnomalyBadge,
+  mergeStickyViewportAnomalies,
+  type StickyViewportAnomaly,
+  type ViewportAnomaly,
+} from "./v4-viewport-anomaly.js";
+import {
+  collectVirtualizationProbe,
+  formatVirtualizationProbeForDiag,
+  type VirtualizationProbe,
+} from "./v4-viewport-virtualization-probe.js";
+import {
+  classifyChatTurnTimingVerdict,
+  formatChatTurnWaterlineForDiag,
+  listChatTurnAnomalies,
+  listChatTurnTimingRows,
+  subscribeChatTurnTiming,
+  type ChatTurnTimingRow,
+} from "../lib/chat-turn-timing-log.js";
+import { getStreamStopRing } from "../lib/stream-stop-log.js";
+import {
+  clearViewportPageSnap,
+  listViewportPageSnapEntries,
+  pageVisibleBitsFromRawRows,
+  pushViewportPageSnap,
+  subscribeViewportPageSnap,
+  turnsFromWindowRows,
+  type ViewportPageSnapEntry,
+} from "./v4-viewport-page-snap.js";
 
 /** 与 session-reattach.reattachRunningSessionIfNeeded 默认一致。 */
 const HISTORY_WATCH_DEFAULT_POLL_SEC = 1.5;
@@ -71,10 +135,19 @@ type VisibleTurnProbe = {
   turnId: string;
   dataIndex: string | null;
   top: number;
+  /** 底边 Y（top+height），用于叠层判定 */
+  bottom: number;
   height: number;
   displayText: string;
   /** 与下一 turn 的 top 差；末条为 null */
   gapToNext: number | null;
+  /**
+   * 下一卡 top − 本卡 bottom：负值=肉眼重叠（估高叠字现场）。
+   * 末条为 null。
+   */
+  spaceToNext: number | null;
+  /** spaceToNext &lt; -8 → 与下一卡在屏幕上叠在一起 */
+  overlapsNext: boolean;
   rawRows: Array<Record<string, unknown>>;
   /** 右栏有 turnHeader(origin=userInput) 却无 userInput → 左栏易被劈成两截 */
   orphanHeaderNoUser: boolean;
@@ -151,7 +224,10 @@ type OverlaySnapshot = {
   layout: V4ChatLayoutDump | null;
   runStatus: RunStatusProbe;
   history: HistoryLoadProbe;
+  /** 视口相交的 turn（布局/空隙诊断） */
   turns: VisibleTurnProbe[];
+  /** 投影窗全序 row（视口页 1:1 摊平用，含最新发送，不跟滚动丢） */
+  windowRows: Array<Record<string, unknown>>;
 };
 
 function collectRunStatusProbe(
@@ -327,6 +403,46 @@ function summarizeRow(row: ConversationRow): Record<string, unknown> {
   }
 }
 
+/** 视口左栏：单行给人看的摘要（与右栏 JSON 1:1） */
+function viewportRowLeftLabel(r: Record<string, unknown>): string {
+  const kind = String(r.kind || "?");
+  if (kind === "userInput") {
+    return `用户 ${clip(r.text, 100) || "（空）"}`;
+  }
+  if (kind === "assistantText") {
+    return `正文 ${clip(r.text, 100) || "（空）"}`;
+  }
+  if (kind === "reasoning") {
+    return `思考 ${clip(r.text, 80) || "（空）"}`;
+  }
+  if (kind === "toolCall") {
+    const name = String(r.toolName || r.name || "tool");
+    const status = r.status ? `[${String(r.status)}]` : "";
+    return `工具 ${name}${status}`;
+  }
+  if (kind === "turnHeader") {
+    const origin = r.origin ? ` origin=${String(r.origin)}` : "";
+    const state = r.state ? ` state=${String(r.state)}` : "";
+    return `轮头${origin}${state}`;
+  }
+  if (kind === "subagent") {
+    return `子代理 ${String(r.subagentType || "")} ${clip(r.summaryText, 60)}`;
+  }
+  if (kind === "artifact") {
+    return `产物 ${String(r.displayName || r.artifactType || "")}`;
+  }
+  return kind;
+}
+
+/** 视口右栏：单行 JSON 摘要（完整对象点开 turn 再看） */
+function viewportRowJsonSummary(r: Record<string, unknown>): string {
+  try {
+    return JSON.stringify(r);
+  } catch {
+    return String(r);
+  }
+}
+
 function findConversationScroll(host: Element): HTMLElement | null {
   const turn0 = host.querySelector("[data-v4-turn-unit]");
   let sc: HTMLElement | null = turn0
@@ -369,6 +485,7 @@ function collectHistoryLoadProbe(
   tid: string,
   scrollTop: number,
   clientHeight: number,
+  scrollHeight: number = 0,
 ): HistoryLoadProbe {
   const triggerPx = historyPrefetchTriggerPx(clientHeight);
   const inPrefetchZone = scrollTop <= triggerPx;
@@ -383,11 +500,26 @@ function collectHistoryLoadProbe(
     const windowRows = snap?.rows?.window ?? [];
     const loadingOlder = !!state?.loadingOlder;
     const hasOlder = hasOlderRows(snap);
+    // 跟底中不预取（与 ConversationTimeline 一致）；否则短尾窗会假阳性 auto=1。
+    const followingAttr =
+      typeof document !== "undefined"
+        ? document
+            .querySelector('[data-v4-chat-host-visible="1"] [data-following]')
+            ?.getAttribute("data-following")
+        : null;
+    const following = followingAttr !== "false";
+    const distanceFromBottom = Math.max(
+      0,
+      (scrollHeight || 0) - scrollTop - clientHeight,
+    );
     const wouldTrigger = shouldTriggerLoadOlder({
       scrollTop,
       canLoadOlder: hasOlder,
       loadingOlder,
       triggerPx,
+      following,
+      distanceFromBottom,
+      viewportHeight: clientHeight,
     });
     let windowUserCount = 0;
     let windowTurnCount = 0;
@@ -458,12 +590,16 @@ function collectOverlaySnapshot(): OverlaySnapshot | null {
     .sort((a, b) => a.r.top - b.r.top);
 
   let rawByTurn = new Map<string, ConversationRow[]>();
+  let windowRowsFlat: Array<Record<string, unknown>> = [];
   if (tid) {
     try {
       const snap = getSharedV4SessionDataLayer()
         .peekStore(tid)
         ?.getState()?.snapshot;
       const windowRows = snap?.rows?.window ?? [];
+      windowRowsFlat = windowRows.map((row) =>
+        summarizeRow(row),
+      ) as Array<Record<string, unknown>>;
       const map = new Map<string, ConversationRow[]>();
       for (const row of windowRows) {
         const turnId = String(row.turnId || "").trim();
@@ -475,13 +611,20 @@ function collectOverlaySnapshot(): OverlaySnapshot | null {
       rawByTurn = map;
     } catch {
       rawByTurn = new Map();
+      windowRowsFlat = [];
     }
   }
 
   const turns: VisibleTurnProbe[] = visibleEls.map(({ el, r }, i) => {
     const turnId = String(el.getAttribute("data-turn-id") || "").trim();
     const next = visibleEls[i + 1];
+    const top = Math.round(r.top);
+    const height = Math.round(r.height);
+    const bottom = top + height;
     const gapToNext = next ? Math.round(next.r.top - r.top) : null;
+    const spaceToNext = next ? Math.round(next.r.top - r.bottom) : null;
+    // 允许 8px 缝；再负就是绝对定位叠在一起（肉眼重叠）。
+    const overlapsNext = spaceToNext != null && spaceToNext < -8;
     const raw = turnId ? rawByTurn.get(turnId) ?? [] : [];
     const hasUserInput = raw.some((row) => row.kind === "userInput");
     const header = raw.find((row) => row.kind === "turnHeader");
@@ -495,27 +638,59 @@ function collectOverlaySnapshot(): OverlaySnapshot | null {
         : null;
     const orphanHeaderNoUser =
       !!header && headerOrigin === "userInput" && !hasUserInput;
-    const hasAssistantLike = raw.some((row) => {
-      const k = String(row.kind || "");
-      return (
-        k === "assistantText" ||
-        k === "reasoning" ||
-        k === "toolCall" ||
-        k === "subagent"
-      );
+    const executionKind =
+      header && typeof (header as { executionKind?: unknown }).executionKind === "string"
+        ? String((header as { executionKind: string }).executionKind)
+        : null;
+    const rawEmpty = classifyEmptyAssistantCompleted({
+      headerOrigin,
+      headerState,
+      executionKind,
+      rows: raw.map((row) => ({
+        kind: String(row.kind || ""),
+        origin:
+          typeof (row as { origin?: unknown }).origin === "string"
+            ? String((row as { origin: string }).origin)
+            : undefined,
+        text:
+          typeof (row as { text?: unknown }).text === "string"
+            ? String((row as { text: string }).text)
+            : undefined,
+      })),
     });
-    const emptyAssistantCompleted =
-      hasUserInput &&
-      !hasAssistantLike &&
-      !!headerState &&
-      (headerState.startsWith("completed") || headerState === "failed");
+    // 后方已有续跑正文时，渲染会撤掉本轮 empty-run；探针跟时间线一致。
+    let emptyAssistantCompleted = rawEmpty;
+    if (raw.length > 0) {
+      try {
+        const units = buildConversationTurnRenderUnits(raw, { sessionBusy: false });
+        emptyAssistantCompleted = units.some(
+          (unit) =>
+            unit.visibleUserInputs.some(
+              (u) =>
+                (!u.origin || u.origin === "realUser") &&
+                Boolean(String(u.text || "").trim()),
+            ) &&
+            unit.assistantTextRows.length === 0 &&
+            unit.assistantWorkRows.length === 0 &&
+            !!unit.header?.state &&
+            (String(unit.header.state).startsWith("completed") ||
+              unit.header.state === "failed"),
+        );
+      } catch {
+        emptyAssistantCompleted = rawEmpty;
+      }
+    }
     return {
       turnId: turnId || `anon-${i}`,
       dataIndex: el.getAttribute("data-index"),
-      top: Math.round(r.top),
-      height: Math.round(r.height),
-      displayText: clip(el.innerText || "", 320),
+      top,
+      bottom,
+      height,
+      // 肉眼所见：截长一点，复制诊断靠这段对齐屏幕
+      displayText: clip(el.innerText || "", 480),
       gapToNext,
+      spaceToNext,
+      overlapsNext,
       rawRows: raw.map(summarizeRow),
       orphanHeaderNoUser,
       hasUserInput,
@@ -535,31 +710,77 @@ function collectOverlaySnapshot(): OverlaySnapshot | null {
     clientHeight,
     layout,
     runStatus: collectRunStatusProbe(sessionKey, tid),
-    history: collectHistoryLoadProbe(tid, scrollTop, clientHeight),
+    history: collectHistoryLoadProbe(tid, scrollTop, clientHeight, scrollHeight),
     turns,
+    windowRows: windowRowsFlat,
   };
 }
 
-const OVERLAY_WIDTH_PX = 920;
-const OVERLAY_DEFAULT_BOTTOM_GAP = 88;
+const OVERLAY_WIDTH_PX = 1100;
+const OVERLAY_HEIGHT_PX = 860;
+const OVERLAY_MIN_WIDTH_PX = 520;
+const OVERLAY_MIN_HEIGHT_PX = 320;
+const OVERLAY_DEFAULT_BOTTOM_GAP = 72;
 const OVERLAY_EDGE_PAD = 8;
 /** 拖拽后标题条至少留在视口内的高度，避免拖飞后抓不到。 */
 const OVERLAY_HEADER_MIN_VISIBLE_PX = 44;
 const OVERLAY_TAB_LS_KEY = "EVOFLOW_V4_VIEWPORT_OVERLAY_TAB";
+const OVERLAY_SIZE_LS_KEY = "EVOFLOW_V4_VIEWPORT_OVERLAY_SIZE";
 
-type OverlayTab = "status" | "stream" | "api" | "viewport";
-type ApiFamilyFilter = "all" | ViewportApiTapFamily;
+type OverlayTab =
+  | "status"
+  | "stream"
+  | "page"
+  | "timing"
+  | "scroll"
+  | "api"
+  | "viewport"
+  | "virt"
+  | "anomaly";
+type ApiFamilyFilter = "all" | ViewportApiTapFamily | "history";
+
+/** 抽头条：完整换行，不用省略号 */
+const tapLineStyle: CSSProperties = {
+  whiteSpace: "pre-wrap",
+  wordBreak: "break-word",
+  overflowWrap: "anywhere",
+};
+
+const tapJsonPreStyle: CSSProperties = {
+  margin: "4px 0 0",
+  padding: 8,
+  borderRadius: 4,
+  border: "1px solid rgba(148,163,184,0.35)",
+  background: "rgba(2,6,23,0.92)",
+  color: "#f8fafc",
+  whiteSpace: "pre-wrap",
+  wordBreak: "break-word",
+  overflowWrap: "anywhere",
+  overflow: "auto",
+  fontSize: 11,
+  lineHeight: 1.35,
+};
 
 function readOverlayTab(): OverlayTab {
   try {
     const v = localStorage.getItem(OVERLAY_TAB_LS_KEY);
-    if (v === "status" || v === "stream" || v === "api" || v === "viewport") {
+    if (
+      v === "status" ||
+      v === "stream" ||
+      v === "page" ||
+      v === "timing" ||
+      v === "scroll" ||
+      v === "api" ||
+      v === "viewport" ||
+      v === "virt" ||
+      v === "anomaly"
+    ) {
       return v;
     }
   } catch {
     /* ignore */
   }
-  return "stream";
+  return "page";
 }
 
 function writeOverlayTab(tab: OverlayTab): void {
@@ -570,10 +791,60 @@ function writeOverlayTab(tab: OverlayTab): void {
   }
 }
 
+type OverlaySize = { width: number; height: number };
+
+function clampOverlaySize(width: number, height: number): OverlaySize {
+  if (typeof window === "undefined") {
+    return {
+      width: Math.max(OVERLAY_MIN_WIDTH_PX, width),
+      height: Math.max(OVERLAY_MIN_HEIGHT_PX, height),
+    };
+  }
+  const maxW = Math.max(OVERLAY_MIN_WIDTH_PX, window.innerWidth - OVERLAY_EDGE_PAD * 2);
+  const maxH = Math.max(OVERLAY_MIN_HEIGHT_PX, window.innerHeight - OVERLAY_EDGE_PAD * 2);
+  return {
+    width: Math.min(maxW, Math.max(OVERLAY_MIN_WIDTH_PX, Math.round(width))),
+    height: Math.min(maxH, Math.max(OVERLAY_MIN_HEIGHT_PX, Math.round(height))),
+  };
+}
+
+function defaultOverlaySize(): OverlaySize {
+  if (typeof window === "undefined") {
+    return { width: OVERLAY_WIDTH_PX, height: OVERLAY_HEIGHT_PX };
+  }
+  return clampOverlaySize(
+    Math.min(OVERLAY_WIDTH_PX, window.innerWidth - 32),
+    Math.min(OVERLAY_HEIGHT_PX, Math.round(window.innerHeight * 0.86)),
+  );
+}
+
+function readOverlaySize(): OverlaySize {
+  try {
+    const raw = localStorage.getItem(OVERLAY_SIZE_LS_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as { width?: unknown; height?: unknown };
+      const w = Number(parsed?.width);
+      const h = Number(parsed?.height);
+      if (Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0) {
+        return clampOverlaySize(w, h);
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return defaultOverlaySize();
+}
+
+function writeOverlaySize(size: OverlaySize): void {
+  try {
+    localStorage.setItem(OVERLAY_SIZE_LS_KEY, JSON.stringify(size));
+  } catch {
+    /* ignore */
+  }
+}
+
 const shellStyle: CSSProperties = {
   position: "fixed",
-  width: `min(${OVERLAY_WIDTH_PX}px, calc(100vw - 32px))`,
-  maxHeight: "min(78vh, 780px)",
   zIndex: 2147483000,
   display: "flex",
   flexDirection: "column",
@@ -590,15 +861,14 @@ const shellStyle: CSSProperties = {
   pointerEvents: "auto",
 };
 
-function defaultOverlayPos(): { left: number; top: number } {
+function defaultOverlayPos(size?: OverlaySize): { left: number; top: number } {
   if (typeof window === "undefined") return { left: 16, top: 120 };
-  const width = Math.min(OVERLAY_WIDTH_PX, window.innerWidth - 32);
-  const height = Math.min(window.innerHeight * 0.78, 780);
+  const s = size || defaultOverlaySize();
   return {
-    left: Math.max(OVERLAY_EDGE_PAD, window.innerWidth - width - 16),
+    left: Math.max(OVERLAY_EDGE_PAD, window.innerWidth - s.width - 16),
     top: Math.max(
       OVERLAY_EDGE_PAD,
-      window.innerHeight - height - OVERLAY_DEFAULT_BOTTOM_GAP,
+      window.innerHeight - s.height - OVERLAY_DEFAULT_BOTTOM_GAP,
     ),
   };
 }
@@ -684,176 +954,524 @@ const paneStyle: CSSProperties = {
   lineHeight: 1.4,
 };
 
-/** 复制给 Agent 排查用的诊断包：布局 + 运行态 + 视口 turn + 最近流式帧 + 接口。 */
+function summarizeTurnRows(
+  rawRows: VisibleTurnProbe["rawRows"],
+): string {
+  if (rawRows.length === 0) return "（投影无此 turn）";
+  const kinds = new Map<string, number>();
+  for (const r of rawRows) {
+    const kind = String(r.kind || "?");
+    const key =
+      typeof r.toolName === "string"
+        ? `${kind}:${r.toolName}`
+        : typeof r.origin === "string"
+          ? `${kind}:${r.origin}`
+          : kind;
+    kinds.set(key, (kinds.get(key) ?? 0) + 1);
+  }
+  const head = [...kinds.entries()]
+    .slice(0, 8)
+    .map(([k, n]) => (n > 1 ? `${k}×${n}` : k))
+    .join(" | ");
+  const user = rawRows.find(
+    (r) => r.kind === "userInput" && typeof r.text === "string" && r.text.trim(),
+  );
+  const asst = rawRows.find(
+    (r) => r.kind === "assistantText" && typeof r.text === "string" && r.text.trim(),
+  );
+  const bits = [head];
+  if (user?.text) bits.push(`user「${clip(user.text, 48)}」`);
+  if (asst?.text) bits.push(`asst「${clip(asst.text, 48)}」`);
+  else if (!rawRows.some((r) => r.kind === "assistantText" || r.kind === "toolCall")) {
+    bits.push("无助手行");
+  }
+  return bits.join(" · ");
+}
+
+function pickDiagnosticTurns(
+  turns: OverlaySnapshot["turns"],
+): OverlaySnapshot["turns"] {
+  if (turns.length === 0) return turns;
+  const flagged = turns.filter(
+    (t) =>
+      t.orphanHeaderNoUser ||
+      t.emptyAssistantCompleted ||
+      t.overlapsNext ||
+      (t.spaceToNext != null && t.spaceToNext < 24 && t.height > 120),
+  );
+  if (flagged.length > 0) {
+    // 异常/叠层轮 + 其前后各一（上下文），去重保序，最多 6（叠字要多看几卡）
+    const want = new Set(flagged);
+    for (const t of flagged) {
+      const i = turns.indexOf(t);
+      if (i > 0) want.add(turns[i - 1]!);
+      if (i >= 0 && i < turns.length - 1) want.add(turns[i + 1]!);
+    }
+    return turns.filter((t) => want.has(t)).slice(0, 6);
+  }
+  // 健康时只留末 2 轮，够对「最新气泡 / 空回复」
+  return turns.slice(-2);
+}
+
+function isNoisyApiPath(path: string): boolean {
+  const p = path.toLowerCase();
+  return (
+    p.includes("file_changes") ||
+    p.includes("/assets/") ||
+    p.includes("/telemetry") ||
+    p.includes("/metrics")
+  );
+}
+
+function isSignalApiPath(path: string): boolean {
+  const p = path.toLowerCase();
+  return (
+    p.includes("rows_range") ||
+    p.includes("subscribe") ||
+    p.includes("catchup") ||
+    p.includes("/frames") ||
+    p.includes("snapshot")
+  );
+}
+
+/**
+ * 一键复制给 Agent：异常优先、短证据。
+ * 刻意不塞：流式整段 JSON、滚轮流水账、file_changes、百科提示——那些干扰排障。
+ */
+/** 现场采集 V4 投递路径根因对账（frames / sub / hub tip / catchup notified）。 */
+function collectLiveV4PathProbe(opts: {
+  tid: string;
+  runStatus: RunStatusProbe;
+  history: HistoryLoadProbe;
+  streamEntries: ViewportStreamTapEntry[];
+  windowRows?: Array<Record<string, unknown>>;
+  turns?: VisibleTurnProbe[];
+  nowMs?: number;
+}): V4PathProbe {
+  const now = opts.nowMs ?? Date.now();
+  const tid = String(opts.tid || "").trim();
+  let storeStatus: string | null = null;
+  let subscriptionId: string | null = null;
+  let subActive: boolean | null = null;
+  let stagedCount: number | null = null;
+  let activeSubCount = 0;
+  let framesUp = !!opts.runStatus.v4FramesSseOpen;
+  try {
+    const transport = getEvoflowV4Transport();
+    framesUp = transport.isFramesSseConnected();
+    const store = tid
+      ? getSharedV4SessionDataLayer().peekStore(tid)
+      : null;
+    const st = store?.getState();
+    storeStatus = st?.status != null ? String(st.status) : null;
+    subscriptionId = st?.subscriptionId ? String(st.subscriptionId) : null;
+    const path = transport.getPathDiag(subscriptionId);
+    activeSubCount = path.activeCount;
+    subActive = path.subActive;
+    stagedCount = path.stagedCount;
+  } catch {
+    /* best effort */
+  }
+  const lastCatchup = tid ? peekLastV4Catchup(tid) : null;
+  let lastV4AtMs: number | null = null;
+  for (let i = opts.streamEntries.length - 1; i >= 0; i -= 1) {
+    const e = opts.streamEntries[i]!;
+    if (e.channel !== "v4") continue;
+    if (tid && e.sessionId && e.sessionId !== tid) continue;
+    lastV4AtMs = e.atMs;
+    break;
+  }
+  const rows = opts.windowRows ?? [];
+  const windowHasLive = rows.some((r) => {
+    const state = String(r.state || "");
+    const status = String(r.status || "");
+    if (
+      r.kind === "turnHeader" &&
+      (state === "running" || String(state).startsWith("running"))
+    ) {
+      return true;
+    }
+    if (
+      (r.kind === "assistantText" || r.kind === "reasoning") &&
+      state === "streaming"
+    ) {
+      return true;
+    }
+    return status === "running" || status === "executing";
+  });
+  const hasOptimistic = (opts.turns ?? []).some((t) =>
+    String(t.turnId || "").startsWith("optimistic"),
+  );
+  return collectV4PathProbe({
+    nowMs: now,
+    tid,
+    executing: !!opts.runStatus.executing,
+    settled: !!opts.runStatus.uiTurnSettled,
+    framesUp,
+    storeStatus,
+    subscriptionId,
+    subActive,
+    stagedCount,
+    activeSubCount,
+    feTip: opts.history.windowLastRowId,
+    hubTip: lastCatchup?.hubTip ?? null,
+    lastV4AtMs,
+    catchupReason: lastCatchup?.reason ?? null,
+    catchupNotified: lastCatchup?.notified ?? null,
+    catchupAtMs: lastCatchup?.at ?? null,
+    subscriberCount: lastCatchup?.subscriberCount ?? null,
+    hasOptimistic,
+    windowHasLive,
+    streamEntries: opts.streamEntries,
+  });
+}
+
 function buildOverlayDiagnosticText(opts: {
   tab: OverlayTab;
   snapshot: OverlaySnapshot | null;
   streamEntries: ViewportStreamTapEntry[];
+  scrollEntries: ViewportScrollTapEntry[];
   apiEntries: ViewportApiTapEntry[];
+  /** 水位线对账用（subscribe/chatSend 等，可比 apiEntries 更宽） */
+  waterlineApiEntries?: ViewportApiTapEntry[];
   problems: string;
+  anomalies: ViewportAnomaly[];
+  virt?: VirtualizationProbe | null;
+  path?: V4PathProbe | null;
 }): string {
-  const { tab, snapshot, streamEntries, apiEntries, problems } = opts;
+  const {
+    tab,
+    snapshot,
+    streamEntries,
+    scrollEntries,
+    apiEntries,
+    waterlineApiEntries,
+    problems,
+    anomalies,
+    virt,
+    path,
+  } = opts;
+  const waterlineApis = waterlineApiEntries?.length
+    ? waterlineApiEntries
+    : apiEntries;
   const lines: string[] = [];
-  lines.push("## EvoFlow V4 视口调试诊断");
-  lines.push(`- 复制时间: ${new Date().toISOString()}`);
-  lines.push(`- 当前页签: ${tab}`);
-  lines.push(`- 问题标记: ${problems || "OK"}`);
+  lines.push("## EvoFlow V4 视口诊断（精简）");
+  lines.push(
+    `- ${new Date().toISOString()} · tab=${tab} · ${problems || "OK"} · 异常=${anomalies.length}${path && path.verdict !== "OK" && path.verdict !== "IDLE" ? ` · 根因=${path.verdict}` : ""}`,
+  );
+  lines.push("");
+  if (path) {
+    lines.push(...formatV4PathProbeForDiag(path));
+    lines.push("");
+  }
+  lines.push("### 怎么用");
+  lines.push(
+    "- Agent 优先拉：`GET /main-cdp/viewport-diag` 或 `__evoflowPanel.viewportDiag()` / `__evoflowV4ViewportDiag()`（结构化 JSON + 同款 markdown）；人可点「复制诊断」贴聊。",
+  );
+  lines.push(
+    "- 先看「根因对账」verdict（HUB_AHEAD_NOTIFIED0 / NO_STORE_SUB / SUB_NOT_ACTIVATED…），再看异常表；WIRE_WITHOUT_V4_TIP 只是症状。",
+  );
+  lines.push(
+    "- 「肉眼所见」是屏幕 DOM 文案+坐标，不是投影幻想；不必复制 HTML/截长图；若肉眼叠了而本节无 !叠下一卡，再说一声。",
+  );
+  lines.push(
+    "- 「发送水位线 / 停止归因」：发了几次、何时出泡上屏、上线/首字/收口；异常带前后接口；点停/Esc/client_attach/断流的 whoZh 在「停止归因」。",
+  );
+  lines.push(
+    "- 「虚拟化」表：软顶/窗首尾/流式 tip/直播轮——转圈但 SSE 在动、上滚没历史，先对这一节。",
+  );
   if (!snapshot) {
     lines.push("- 快照: （无可见对话）");
+    // 无快照仍尽量带水位线（发了没回也能对账）
+    lines.push("");
+    lines.push(
+      ...formatChatTurnWaterlineForDiag({
+        apiHints: waterlineApis.map((e) => ({
+          at: e.atMs,
+          path: e.path || e.label,
+          ok: e.ok,
+          ms: e.durationMs ?? null,
+          status: e.status ?? null,
+          error: e.errorText || null,
+        })),
+        anomalies: listChatTurnAnomalies(),
+        stopHints: getStreamStopRing().map((s) => ({
+          atMs: s.atMs,
+          whoZh: s.whoZh,
+          trigger: s.trigger,
+          kind: s.kind,
+          sessionKey: s.sessionKey,
+          runId: s.runId,
+          fromUiStopButton: s.fromUiStopButton,
+        })),
+      }),
+    );
     return lines.join("\n");
   }
 
-  lines.push("");
-  lines.push("### 会话");
-  lines.push(`- title: ${snapshot.title || "∅"}`);
-  lines.push(`- tid: ${snapshot.tid}`);
-  lines.push(`- sessionKey: ${snapshot.sessionKey || "∅"}`);
-  lines.push(
-    `- scroll: top=${snapshot.scrollTop} height=${snapshot.scrollHeight} client=${snapshot.clientHeight}`,
-  );
-
   const h = snapshot.history;
-  lines.push("");
-  lines.push("### 消息 / 投影窗口");
-  lines.push(
-    `- rows: 已显示 ${h.windowCount} / 全序 ${h.totalCount ?? "∅"}（user气泡=${h.windowUserCount} turns=${h.windowTurnCount}）`,
-  );
-  lines.push(
-    `- rowId: first=${h.firstRowId ?? "∅"} window=${h.windowFirstRowId ?? "∅"}…${h.windowLastRowId ?? "∅"}`,
-  );
-  lines.push(
-    `- loadOlder: hasOlder=${h.hasOlder ? 1 : 0} loading=${h.loadingOlder ? 1 : 0} triggerPx=${h.triggerPx} inZone=${h.inPrefetchZone ? 1 : 0} wouldTrigger=${h.wouldTrigger ? 1 : 0}`,
-  );
-  lines.push(
-    `- 预取规则: scrollTop ≤ max(64, 2×clientHeight) 才自动 loadOlder；不是一上滚就拉`,
-  );
-
   const rs = snapshot.runStatus;
+  const pageSeen = pageVisibleBitsFromRawRows(snapshot.windowRows || []);
+  const pageSeenLine = [pageSeen.user, pageSeen.text, pageSeen.tool]
+    .filter(Boolean)
+    .join(" | ");
+  const host = snapshot.layout?.hosts.find((x) => x.visibleAttr === "1");
+  const eyeTurns = snapshot.turns;
+  const overlapCount = eyeTurns.filter((t) => t.overlapsNext).length;
+  const tight72 =
+    host?.estimateStuck === true ||
+    eyeTurns.filter(
+      (t) => t.gapToNext != null && t.gapToNext >= 60 && t.gapToNext <= 84,
+    ).length >= 2;
+  const eyeVerdict = [
+    overlapCount > 0 ? `!叠层×${overlapCount}` : "",
+    host?.stacked ? "!STACK(多卡同Y)" : "",
+    tight72 ? "!EST72(间距≈72估高)" : "",
+    overlapCount === 0 && !host?.stacked && !tight72 ? "排列正常" : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  // —— 肉眼所见必须最先：Agent 先对屏幕再对投影 ——
   lines.push("");
-  lines.push("### 运行状态");
-  lines.push(`- label: ${rs.label} (mode=${rs.mode})`);
+  lines.push("### 肉眼所见（视口 DOM · 从上到下）");
+  lines.push(`- 总判: ${eyeVerdict || "∅"}`);
   lines.push(
-    `- phase=${rs.turnPhase} wire=${rs.streamWireSource || "∅"} frames=${rs.v4FramesSseOpen ? "connected" : "down"} settled=${rs.uiTurnSettled ? 1 : 0} executing=${rs.executing ? 1 : 0}`,
+    `- 视口 turn=${eyeTurns.length} · scroll ${snapshot.scrollTop}/${snapshot.scrollHeight} · client=${snapshot.clientHeight}`,
   );
-  lines.push(`- why: ${rs.execWhy || "∅"}`);
-  lines.push(
-    `- historyWatch=${rs.historyWatchActive ? 1 : 0} v4Busy=${rs.v4TimelineBusy ? 1 : 0}`,
-  );
-  for (const p of rs.polls) {
-    lines.push(
-      `- poll ${p.active ? "ACTIVE" : "idle"} every ${p.intervalSec}s | ${p.owner} | ${p.target}`,
-    );
+  if (eyeTurns.length === 0) {
+    lines.push("- （视口无可见 turn 节点）");
+  } else {
+    const list =
+      overlapCount > 0 || host?.stacked
+        ? eyeTurns.slice(0, 10)
+        : pickDiagnosticTurns(eyeTurns);
+    for (let i = 0; i < list.length; i++) {
+      const t = list[i]!;
+      const flags = [
+        t.overlapsNext ? "!叠下一卡" : "",
+        t.spaceToNext != null && t.spaceToNext < 24 && t.spaceToNext >= -8
+          ? "!贴太近"
+          : "",
+        t.orphanHeaderNoUser ? "!NO_USER" : "",
+        t.emptyAssistantCompleted ? "!EMPTY_ASSISTANT" : "",
+      ]
+        .filter(Boolean)
+        .join(" ");
+      const space =
+        t.spaceToNext == null
+          ? ""
+          : ` space→下=${t.spaceToNext}${t.overlapsNext ? "(负=重叠)" : ""}`;
+      lines.push(
+        `- [#${t.dataIndex ?? "∅"}] y=${t.top}→${t.bottom} h=${t.height}${space}${flags ? ` ${flags}` : ""} tid=${t.turnId.slice(0, 10)}`,
+      );
+      lines.push(`  屏上字: ${clip(t.displayText, 220) || "（空）"}`);
+    }
+    if (list.length < eyeTurns.length) {
+      lines.push(`- …另有 ${eyeTurns.length - list.length} 卡未展开（无叠层时只留异常/末轮）`);
+    }
   }
 
-  const host = snapshot.layout?.hosts.find((h) => h.visibleAttr === "1");
   lines.push("");
-  lines.push("### 布局（左栏 DOM / virtualizer）");
+  lines.push(
+    ...formatChatTurnWaterlineForDiag({
+      sessionKey: snapshot.sessionKey || null,
+      apiHints: waterlineApis.map((e) => ({
+        at: e.atMs,
+        path: e.path || e.label,
+        ok: e.ok,
+        ms: e.durationMs ?? null,
+        status: e.status ?? null,
+        error: e.errorText || null,
+      })),
+      anomalies: listChatTurnAnomalies().filter(
+        (a) =>
+          !snapshot.sessionKey ||
+          !a.sessionKey ||
+          a.sessionKey === snapshot.sessionKey,
+      ),
+      stopHints: getStreamStopRing()
+        .filter(
+          (s) =>
+            !snapshot.sessionKey ||
+            !s.sessionKey ||
+            s.sessionKey === snapshot.sessionKey,
+        )
+        .map((s) => ({
+          atMs: s.atMs,
+          whoZh: s.whoZh,
+          trigger: s.trigger,
+          kind: s.kind,
+          sessionKey: s.sessionKey,
+          runId: s.runId,
+          fromUiStopButton: s.fromUiStopButton,
+        })),
+    }),
+  );
+
+  lines.push("");
+  lines.push("### 会话 / 投影摘要");
+  lines.push(
+    `- ${snapshot.title || "∅"} · tid=${snapshot.tid} · sk=${snapshot.sessionKey || "∅"}`,
+  );
+  lines.push(`- 页面所见(段末): ${pageSeenLine || "（空）"}`);
+  lines.push(
+    `- ${formatConversationRecordCounts({
+      windowCount: h.windowCount,
+      totalCount: h.totalCount,
+      windowTurnCount: h.windowTurnCount,
+      windowUserCount: h.windowUserCount,
+    })} · win=${h.windowFirstRowId ?? "∅"}…${h.windowLastRowId ?? "∅"} · hasOlder=${h.hasOlder ? 1 : 0} loading=${h.loadingOlder ? 1 : 0} wouldTrigger=${h.wouldTrigger ? 1 : 0}`,
+  );
+  lines.push(
+    `- run ${rs.label} phase=${rs.turnPhase} wire=${rs.streamWireSource || "∅"} frames=${rs.v4FramesSseOpen ? "up" : "down"} settled=${rs.uiTurnSettled ? 1 : 0} exec=${rs.executing ? 1 : 0} why=${rs.execWhy || "∅"}`,
+  );
+  const activePolls = rs.polls.filter((p) => p.active);
+  if (activePolls.length > 0) {
+    lines.push(
+      `- polls: ${activePolls.map((p) => `${p.owner}@${p.intervalSec}s`).join(", ")}`,
+    );
+  }
+  const layoutBad =
+    !!host?.estimateStuck ||
+    !!host?.stacked ||
+    (snapshot.layout?.stackedHostCount ?? 0) > 0 ||
+    !!snapshot.layout?.composer?.drifted;
   if (host) {
     lines.push(
-      `- host visible v=${host.visibleAttr} focused=${host.focusedAttr} display=${host.display} vis=${host.visibility}`,
-    );
-    lines.push(
-      `- turns=${host.turnCount} uniqueTops=${host.uniqueTops} medianGap=${host.medianGap ?? "∅"} stacked=${host.stacked ? 1 : 0} estimateStuck=${host.estimateStuck ? 1 : 0}`,
-    );
-  } else {
-    lines.push("- （无 visible host）");
-  }
-  if (snapshot.layout) {
-    lines.push(
-      `- stackedHostCount=${snapshot.layout.stackedHostCount} composerDrift=${snapshot.layout.composer?.drifted ? 1 : 0}`,
+      `- layout turns=${host.turnCount} uniqueY=${host.uniqueTops} gap=${host.medianGap ?? "∅"} stuck=${host.estimateStuck ? 1 : 0} stacked=${host.stacked ? 1 : 0} hosts=${snapshot.layout?.stackedHostCount ?? 0} composerDrift=${snapshot.layout?.composer?.drifted ? 1 : 0}${layoutBad ? " ←" : ""}`,
     );
   }
 
+  const virtProbe =
+    virt ??
+    collectVirtualizationProbe({
+      tid: snapshot.tid,
+      windowRows: snapshot.windowRows || [],
+      windowCount: h.windowCount,
+      totalCount: h.totalCount,
+      winFirst: h.windowFirstRowId,
+      winLast: h.windowLastRowId,
+      hasOlder: h.hasOlder,
+      loadingOlder: h.loadingOlder,
+      wouldTrigger: h.wouldTrigger,
+      streamEntries,
+    });
   lines.push("");
-  lines.push("### 视口内 turn（左=DOM 字 / 右=投影 row）");
-  if (snapshot.turns.length === 0) {
-    lines.push("- （视口无 turn）");
-  } else {
-    for (const t of snapshot.turns) {
-      lines.push(
-        `- #${t.dataIndex ?? "∅"} turn=${t.turnId.slice(0, 12)} h=${t.height} gap→${t.gapToNext ?? "∅"}${t.orphanHeaderNoUser ? " !NO_USER" : ""}${t.emptyAssistantCompleted ? " !EMPTY_ASSISTANT" : ""}${t.headerState ? ` state=${t.headerState}` : ""}`,
-      );
-      lines.push(`  DOM: ${clip(t.displayText, 280) || "（空）"}`);
-      const rowBrief =
-        t.rawRows.length === 0
-          ? "（投影无此 turn）"
-          : t.rawRows
-              .map((r) => {
-                const kind = String(r.kind || "?");
-                if (typeof r.toolName === "string") {
-                  return `${kind}:${r.toolName}${r.status ? `[${r.status}]` : ""}`;
-                }
-                if (typeof r.text === "string" && r.text) {
-                  return `${kind}:${clip(r.text, 100)}`;
-                }
-                if (typeof r.origin === "string") {
-                  return `${kind}:origin=${r.origin}`;
-                }
-                if (typeof r.state === "string") {
-                  return `${kind}:state=${r.state}`;
-                }
-                return kind;
-              })
-              .join(" | ");
-      lines.push(`  ROW: ${rowBrief}`);
-    }
-  }
+  lines.push(...formatVirtualizationProbeForDiag(virtProbe));
 
-  const recent = streamEntries.slice(-12);
   lines.push("");
-  lines.push(
-    `### 最近流式帧（${recent.length}/${streamEntries.length}，含裁剪后 JSON）`,
-  );
-  if (recent.length === 0) {
+  lines.push(`### 异常（${anomalies.length}）`);
+  if (anomalies.length === 0) {
     lines.push("- （无）");
   } else {
-    for (const e of recent) {
-      lines.push(`- #${e.id} ${new Date(e.atMs).toISOString()} ${e.headline}`);
-      lines.push("```json");
-      lines.push(e.jsonText);
-      lines.push("```");
+    for (const a of anomalies) {
+      const liveTag =
+        "live" in a && typeof (a as { live?: boolean }).live === "boolean"
+          ? (a as { live: boolean }).live
+            ? "现"
+            : "曾"
+          : "";
+      lines.push(
+        `- [${a.severity}${liveTag ? `·${liveTag}` : ""}] ${a.code} · ${a.title} · ${a.detail}`,
+      );
     }
   }
 
-  const recentApi = apiEntries.slice(-10);
+  const turns = pickDiagnosticTurns(snapshot.turns);
   lines.push("");
   lines.push(
-    `### 最近页面接口（${recentApi.length}/${apiEntries.length}，入参/出参已裁剪）`,
+    `### 投影对照（${turns.length}/${snapshot.turns.length}，异常优先）`,
+  );
+  if (turns.length === 0) {
+    lines.push("- （视口无 turn）");
+  } else {
+    for (const t of turns) {
+      const flags = [
+        t.overlapsNext ? "!叠下一卡" : "",
+        t.orphanHeaderNoUser ? "!NO_USER" : "",
+        t.emptyAssistantCompleted ? "!EMPTY_ASSISTANT" : "",
+      ]
+        .filter(Boolean)
+        .join(" ");
+      lines.push(
+        `- #${t.dataIndex ?? "∅"} ${t.turnId.slice(0, 12)} h=${t.height}${flags ? ` ${flags}` : ""}${t.headerState ? ` ${t.headerState}` : ""}`,
+      );
+      lines.push(`  DOM: ${clip(t.displayText, 160) || "（空）"}`);
+      lines.push(`  ROW: ${summarizeTurnRows(t.rawRows)}`);
+    }
+  }
+
+  const needStreamDetail = anomalies.some(
+    (a) =>
+      a.code === "STREAM_AHEAD_OF_WINDOW" ||
+      a.code === "STREAM_LIVE_NO_DOM" ||
+      a.code === "EMPTY_ASSISTANT",
+  );
+  const recentStream = streamEntries.slice(needStreamDetail ? -6 : -4);
+  lines.push("");
+  lines.push(`### 流式 headline（${recentStream.length}/${streamEntries.length}，无整段 JSON）`);
+  if (recentStream.length === 0) {
+    lines.push("- （无）");
+  } else {
+    for (const e of recentStream) {
+      lines.push(
+        `- #${e.id} ${e.kindLabel || "?"} ${e.summary || e.headline}`,
+      );
+    }
+  }
+
+  const jumps = scrollEntries.filter((e) => e.jump).slice(-8);
+  const jumpTotal = scrollEntries.reduce((n, e) => n + (e.jump ? 1 : 0), 0);
+  lines.push("");
+  lines.push(`### 滚轮 !JUMP（${jumps.length} 条 / 总计 ${jumpTotal}）`);
+  if (jumps.length === 0) {
+    const last = scrollEntries.at(-1);
+    if (last) {
+      lines.push(
+        `- 最近非跳: top=${Math.round(last.scrollTop)} h=${Math.round(last.scrollHeight)} src=${last.source} follow=${last.followingAttr ?? "∅"} winFirst=${last.windowFirstRowId ?? "∅"}`,
+      );
+    } else {
+      lines.push("- （无）");
+    }
+  } else {
+    for (const e of jumps) {
+      lines.push(
+        `- #${e.id} ${e.headline} · src=${e.source} follow=${e.followingAttr ?? "∅"} dH=${Math.round(e.dHeight)} winFirst=${e.windowFirstRowId ?? "∅"} shown=${e.windowCount}/${e.totalCount ?? "∅"}`,
+      );
+    }
+  }
+
+  const signalApis = apiEntries.filter(
+    (e) => !e.ok || isSignalApiPath(e.path) || !isNoisyApiPath(e.path),
+  );
+  const recentApi = [
+    ...signalApis.filter((e) => !e.ok),
+    ...signalApis.filter((e) => e.ok && isSignalApiPath(e.path)),
+  ]
+    .filter((e, i, arr) => arr.findIndex((x) => x.id === e.id) === i)
+    .slice(-6);
+  lines.push("");
+  lines.push(
+    `### 接口（${recentApi.length} 条信号；已跳过 file_changes 等噪声）`,
   );
   if (recentApi.length === 0) {
     lines.push("- （无）");
   } else {
     for (const e of recentApi) {
       lines.push(
-        `- #${e.id} ${new Date(e.atMs).toISOString()} ${e.method} ${e.label} ${e.status} ${e.durationMs}ms ${e.ok ? "ok" : "FAIL"}`,
+        `- #${e.id} ${e.method} ${e.label} ${e.status} ${e.durationMs}ms ${e.ok ? "ok" : "FAIL"} · ${e.path}`,
       );
-      lines.push(`  path: ${e.path}${e.query ? `?${e.query}` : ""}`);
-      lines.push("  --- request ---");
-      lines.push(e.requestText || "（空）");
-      lines.push("  --- response ---");
-      lines.push(e.responseText || "（空）");
+      // 失败或 rows_range/subscribe：只留极短 body，够对 epoch/winFirst
+      if (!e.ok || e.path.includes("rows_range") || e.path.includes("subscribe")) {
+        const req = clip(e.requestText.replace(/\s+/g, " ").trim(), 160);
+        const res = clip(e.responseText.replace(/\s+/g, " ").trim(), 200);
+        if (req) lines.push(`  req: ${req}`);
+        if (res) lines.push(`  res: ${res}`);
+      }
     }
   }
 
-  lines.push("");
-  lines.push("### 给 Agent 的提示");
-  lines.push(
-    "- 叠字/空白/滚不到历史 → 看布局 estimateStuck、medianGap、视口 turn DOM↔ROW。",
-  );
-  lines.push("- 粘运行中/停不掉 → 看 phase/wire/settled/why 与 polls。");
-  lines.push("- 投影落后或劈 turn → 对流式 deltas/snapshot 与 ROW 摘要。");
-  lines.push(
-    "- 接口有正文、页面空 → 对「接口」页签 response 与视口 ROW；差在 hydrate/mirror/前端过滤。",
-  );
-  lines.push(
-    "- !EMPTY_ASSISTANT → 用户轮已 completed 却无助手行：多为中途 RUN_FINISHED 后迟到 TEXT 挂空 turnId（需 gateway 含 late-stream 挂回修复）；历史孤儿重载后无法自愈。",
-  );
-  lines.push(
-    "- 上拉到顶看不到更早消息 → 看「消息/投影窗口」hasOlder、wouldTrigger、!HISTORY_TOP；直播 overflow 尾窗曾整窗替换冲掉 loadOlder（需同 epoch 保历史）。",
-  );
-  lines.push(
-    "- 页面已停但浮层仍见 SSE/接口 → 先对 tid 与 stream topic / rows_range.sessionId：常是旁路会话或 prefetch，不是本页还在跑。",
-  );
   return lines.join("\n");
 }
 
@@ -881,38 +1499,499 @@ async function copyTextToClipboard(text: string): Promise<boolean> {
   }
 }
 
-function problemBadge(
-  layout: V4ChatLayoutDump | null,
-  turns?: VisibleTurnProbe[] | null,
-  history?: HistoryLoadProbe | null,
-  scrollTop?: number,
-): string {
-  const parts: string[] = [];
-  if (layout) {
-    if (layout.hosts.some((h) => h.visibleAttr === "1" && h.estimateStuck)) {
-      parts.push("!EST72");
-    }
-    if (layout.stackedHostCount > 0) parts.push("!STACK");
-    if (layout.composer?.drifted) parts.push("!COMPOSER_DRIFT");
-  }
-  if (turns?.some((t) => t.orphanHeaderNoUser)) {
-    parts.push("!NO_USER");
-  }
-  if (turns?.some((t) => t.emptyAssistantCompleted)) {
-    parts.push("!EMPTY_ASSISTANT");
-  }
-  // 视觉已到顶，但投影仍声明有更早行 → 预取该响却可能卡住 / 刚被尾窗冲掉
-  if (
-    history &&
-    typeof scrollTop === "number" &&
-    scrollTop <= 8 &&
-    history.hasOlder &&
-    !history.loadingOlder
-  ) {
-    parts.push("!HISTORY_TOP");
-  }
-  return parts.join(" ");
+function readToolDisplayMeta(row: ConversationRow): {
+  displayKind: string | undefined;
+  hasMedia: boolean;
+} {
+  if (row.kind !== "toolCall") return { displayKind: undefined, hasMedia: false };
+  const display =
+    (row as { display?: { kind?: string; media?: unknown } }).display ??
+    (row as { output?: { display?: { kind?: string; media?: unknown } } }).output
+      ?.display;
+  const displayKind =
+    display && typeof display.kind === "string" ? display.kind : undefined;
+  const hasMedia = Array.isArray(display?.media) && display!.media!.length > 0;
+  return { displayKind, hasMedia };
 }
+
+function collectAnomalyWindowRows(tid: string): NonNullable<
+  Parameters<typeof collectViewportAnomalies>[0]["windowRows"]
+> {
+  if (!tid) return [];
+  try {
+    const snap = getSharedV4SessionDataLayer()
+      .peekStore(tid)
+      ?.getState()?.snapshot;
+    const windowRows = snap?.rows?.window ?? [];
+    return windowRows.map((row) => {
+      const meta = readToolDisplayMeta(row);
+      return {
+        rowId: row.rowId,
+        kind: String(row.kind || ""),
+        origin:
+          typeof (row as { origin?: unknown }).origin === "string"
+            ? String((row as { origin: string }).origin)
+            : undefined,
+        turnId: String(row.turnId || ""),
+        text:
+          typeof (row as { text?: unknown }).text === "string"
+            ? String((row as { text: string }).text)
+            : undefined,
+        state:
+          typeof (row as { state?: unknown }).state === "string"
+            ? String((row as { state: string }).state)
+            : undefined,
+        status:
+          typeof (row as { status?: unknown }).status === "string"
+            ? String((row as { status: string }).status)
+            : undefined,
+        displayKind: meta.displayKind,
+        hasMedia: meta.hasMedia,
+      };
+    });
+  } catch {
+    return [];
+  }
+}
+
+function buildViewportAnomalies(input: {
+  snapshot: OverlaySnapshot | null;
+  streamEntries: ViewportStreamTapEntry[];
+  apiEntries: ViewportApiTapEntry[];
+  scrollEntries: ViewportScrollTapEntry[];
+  path?: V4PathProbe | null;
+}): ViewportAnomaly[] {
+  const snap = input.snapshot;
+  if (!snap) return [];
+  const host = snap.layout?.hosts.find((h) => h.visibleAttr === "1");
+  const out = collectViewportAnomalies({
+    tid: snap.tid,
+    scrollTop: snap.scrollTop,
+    scrollHeight: snap.scrollHeight,
+    clientHeight: snap.clientHeight,
+    executing: snap.runStatus.executing,
+    uiTurnSettled: snap.runStatus.uiTurnSettled,
+    history: {
+      hasOlder: snap.history.hasOlder,
+      loadingOlder: snap.history.loadingOlder,
+      wouldTrigger: snap.history.wouldTrigger,
+      firstRowId: snap.history.firstRowId,
+      windowFirstRowId: snap.history.windowFirstRowId,
+      windowLastRowId: snap.history.windowLastRowId,
+      windowCount: snap.history.windowCount,
+      totalCount: snap.history.totalCount,
+    },
+    turns: snap.turns,
+    layout: host
+      ? {
+          estimateStuck: !!host.estimateStuck,
+          stackedHostCount: snap.layout?.stackedHostCount ?? 0,
+          composerDrifted: !!snap.layout?.composer?.drifted,
+        }
+      : snap.layout
+        ? {
+            estimateStuck: false,
+            stackedHostCount: snap.layout.stackedHostCount,
+            composerDrifted: !!snap.layout.composer?.drifted,
+          }
+        : null,
+    windowRows: collectAnomalyWindowRows(snap.tid),
+    streamEntries: input.streamEntries.map((e) => ({
+      atMs: e.atMs,
+      channel: e.channel,
+      sessionId: e.sessionId,
+      kindLabel: e.kindLabel,
+      summary: e.summary,
+      headline: e.headline,
+      jsonText: e.jsonText,
+    })),
+    apiEntries: input.apiEntries.map((e) => ({
+      atMs: e.atMs,
+      path: e.path,
+      ok: e.ok,
+      sessionId: e.sessionId,
+      requestText: e.requestText,
+      responseText: e.responseText,
+    })),
+    scrollEntries: input.scrollEntries.map((e) => ({
+      atMs: e.atMs,
+      jump: e.jump,
+      source: e.source,
+      followingAttr: e.followingAttr,
+    })),
+  });
+  if (input.path) {
+    const pathAnomaly = anomalyFromV4PathProbe(input.path);
+    if (pathAnomaly) out.unshift(pathAnomaly);
+  }
+  return out;
+}
+
+function problemBadge(anomalies: readonly ViewportAnomaly[]): string {
+  return formatAnomalyBadge(anomalies);
+}
+
+export type V4ViewportDiagnosticDump = {
+  kind: "v4_viewport_diag";
+  at: string;
+  sessionKey: string | null;
+  threadId: string | null;
+  title: string | null;
+  problems: string;
+  anomalies: Array<{
+    code: string;
+    severity: string;
+    title: string;
+    detail?: string;
+    live?: boolean;
+  }>;
+  virt: {
+    softCap: number;
+    windowCount: number;
+    totalCount: number | null;
+    balloon: boolean;
+    streamAhead: boolean;
+    winFirst: number | null;
+    winLast: number | null;
+    streamMaxRowId: number | null;
+    liveTipRowId: number | null;
+    liveInFlight: number;
+    windowInFlight: number;
+    hasOlder: boolean;
+    following: boolean;
+    flags: string[];
+  } | null;
+  eye: {
+    verdict: string;
+    turnCount: number;
+    overlapCount: number;
+    scrollTop: number;
+    scrollHeight: number;
+    clientHeight: number;
+  } | null;
+  run: {
+    label: string;
+    phase: string;
+    wire: string | null;
+    framesUp: boolean;
+    settled: boolean;
+    executing: boolean;
+    why: string | null;
+  } | null;
+  /** V4 投递路径根因对账（优先看 verdict，再看 anomalies） */
+  path: {
+    verdict: string;
+    title: string;
+    detail: string;
+    framesUp: boolean;
+    storeStatus: string | null;
+    subscriptionId: string | null;
+    subActive: boolean | null;
+    stagedCount: number | null;
+    activeSubCount: number;
+    feTip: number | null;
+    hubTip: number | null;
+    tipDelta: number | null;
+    streamMax: number | null;
+    lastV4AgeMs: number | null;
+    catchupReason: string | null;
+    catchupNotified: number | null;
+    catchupAgeMs: number | null;
+    subscriberCount: number | null;
+  } | null;
+  history: {
+    windowCount: number;
+    totalCount: number | null;
+    winFirst: number | null;
+    winLast: number | null;
+    hasOlder: boolean;
+    loadingOlder: boolean;
+    wouldTrigger: boolean;
+  } | null;
+  waterline: {
+    sendCount: number;
+    anomalyCount: number;
+    inFlightCount: number;
+    rows: Array<{
+      preview: string;
+      verdict: string;
+      level: string;
+      bubbleMs: number | null;
+      wireMs: number | null;
+      runMs: number | null;
+      firstMs: number | null;
+      endMs: number | null;
+      outcome: string | null;
+    }>;
+  };
+  /** 与「复制诊断」同款 markdown，Agent 可读 */
+  markdown: string;
+};
+
+export type CollectV4ViewportDiagnosticOpts = {
+  tab?: OverlayTab | string;
+  apiFamily?: ApiFamilyFilter;
+  /** 浮层内复制时传入 sticky；CDP 拉取默认只用 live */
+  stickyAnomalies?: StickyViewportAnomaly[];
+  stickyTid?: string | null;
+};
+
+/**
+ * 与浮层「复制诊断」同源：刷新快照 + 异常 + 虚拟化 + 水位线。
+ * 挂在 `window.__evoflowV4ViewportDiag` / `__evoflowPanel.viewportDiag` /
+ * `GET /main-cdp/viewport-diag`，供 Agent 直接拉，不必用户复制。
+ */
+export function collectV4ViewportDiagnostic(
+  opts: CollectV4ViewportDiagnosticOpts = {},
+): V4ViewportDiagnosticDump {
+  const tab = (opts.tab as OverlayTab | undefined) || "scroll";
+  const apiFamily = opts.apiFamily ?? "all";
+  const fresh = collectOverlaySnapshot();
+  const snap = fresh;
+  const streamEntries = listViewportStreamTapEntries({
+    sessionKey: snap?.sessionKey ?? null,
+    sessionId: snap?.tid ?? null,
+    limit: 16,
+  });
+  const scrollEntries = listViewportScrollTapEntries({ limit: 32 });
+  const apiEntries = listViewportApiTapEntries({
+    family: apiFamily,
+    sessionId: snap?.tid ?? null,
+    limit: 24,
+  });
+  const apiForWaterline = listViewportApiTapEntries({
+    family: "all",
+    sessionId: snap?.tid ?? null,
+    includeForeign: true,
+    limit: 48,
+  });
+  let following = true;
+  try {
+    following =
+      document
+        .querySelector('[data-v4-chat-host-visible="1"] [data-following]')
+        ?.getAttribute("data-following") !== "false";
+  } catch {
+    following = true;
+  }
+
+  const virt = snap
+    ? collectVirtualizationProbe({
+        tid: snap.tid,
+        windowRows: snap.windowRows || [],
+        windowCount: snap.history.windowCount,
+        totalCount: snap.history.totalCount,
+        winFirst: snap.history.windowFirstRowId,
+        winLast: snap.history.windowLastRowId,
+        hasOlder: snap.history.hasOlder,
+        loadingOlder: snap.history.loadingOlder,
+        wouldTrigger: snap.history.wouldTrigger,
+        following,
+        streamEntries,
+      })
+    : null;
+
+  const path = snap
+    ? collectLiveV4PathProbe({
+        tid: snap.tid,
+        runStatus: snap.runStatus,
+        history: snap.history,
+        streamEntries,
+        windowRows: snap.windowRows,
+        turns: snap.turns,
+      })
+    : null;
+
+  const liveAnomalies = buildViewportAnomalies({
+    snapshot: snap,
+    streamEntries,
+    apiEntries,
+    scrollEntries,
+    path,
+  });
+  const anomalies =
+    opts.stickyAnomalies && opts.stickyAnomalies.length > 0
+      ? mergeStickyViewportAnomalies({
+          tid: snap?.tid ?? "",
+          prevTid: opts.stickyTid ?? "",
+          prev: opts.stickyAnomalies,
+          live: liveAnomalies,
+          windowFirstRowId: snap?.history?.windowFirstRowId ?? null,
+        }).items
+      : liveAnomalies;
+
+  const markdown = buildOverlayDiagnosticText({
+    tab,
+    snapshot: snap,
+    streamEntries,
+    scrollEntries,
+    apiEntries,
+    waterlineApiEntries: apiForWaterline,
+    anomalies,
+    problems: problemBadge(anomalies),
+    virt,
+    path,
+  });
+
+  const host = snap?.layout?.hosts.find((h) => h.visibleAttr === "1");
+  const eyeTurns = snap?.turns ?? [];
+  const overlapCount = eyeTurns.filter((t) => t.overlapsNext).length;
+  const tight72 =
+    host?.estimateStuck === true ||
+    eyeTurns.filter(
+      (t) => t.gapToNext != null && t.gapToNext >= 60 && t.gapToNext <= 84,
+    ).length >= 2;
+  const eyeVerdict = [
+    overlapCount > 0 ? `!叠层×${overlapCount}` : "",
+    host?.stacked ? "!STACK(多卡同Y)" : "",
+    tight72 ? "!EST72(间距≈72估高)" : "",
+    overlapCount === 0 && !host?.stacked && !tight72 ? "排列正常" : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  const nowMs = Date.now();
+  const timingRows = listChatTurnTimingRows({
+    sessionKey: snap?.sessionKey ?? null,
+    limit: 12,
+  });
+  const waterlineAnomalies = listChatTurnAnomalies().filter(
+    (a) =>
+      !snap?.sessionKey || !a.sessionKey || a.sessionKey === snap.sessionKey,
+  );
+  const waterlineRows = timingRows.map((r) => {
+    const v = classifyChatTurnTimingVerdict(r, nowMs);
+    const d = (at: number | null) =>
+      at != null && r.sendAt > 0 ? Math.max(0, at - r.sendAt) : null;
+    return {
+      preview: clip(r.textPreview, 80),
+      verdict: v.zh,
+      level: v.level,
+      bubbleMs: d(r.userBubbleAt),
+      wireMs: d(r.wireAt),
+      runMs: d(r.runStartedAt),
+      firstMs: d(r.firstResponseAt),
+      endMs: d(r.streamEndAt),
+      outcome: r.outcome,
+    };
+  });
+
+  const problemsBadge = problemBadge(anomalies);
+  const problems =
+    path && path.verdict !== "OK" && path.verdict !== "IDLE"
+      ? problemsBadge
+        ? `${path.verdict} · ${problemsBadge}`
+        : path.verdict
+      : problemsBadge;
+
+  return {
+    kind: "v4_viewport_diag",
+    at: new Date().toISOString(),
+    sessionKey: snap?.sessionKey ?? null,
+    threadId: snap?.tid ?? null,
+    title: snap?.title ?? null,
+    problems,
+    anomalies: anomalies.map((a) => ({
+      code: a.code,
+      severity: a.severity,
+      title: a.title,
+      detail: a.detail,
+      live:
+        "live" in a && typeof (a as StickyViewportAnomaly).live === "boolean"
+          ? (a as StickyViewportAnomaly).live
+          : true,
+    })),
+    virt: virt
+      ? {
+          softCap: virt.softCap,
+          windowCount: virt.windowCount,
+          totalCount: virt.totalCount,
+          balloon: virt.balloon,
+          streamAhead: virt.streamAhead,
+          winFirst: virt.winFirst,
+          winLast: virt.winLast,
+          streamMaxRowId: virt.streamMaxRowId,
+          liveTipRowId: virt.liveTipRowId,
+          liveInFlight: virt.liveInFlight,
+          windowInFlight: virt.windowInFlight,
+          hasOlder: virt.hasOlder,
+          following: virt.following,
+          flags: virt.flags,
+        }
+      : null,
+    eye: snap
+      ? {
+          verdict: eyeVerdict || "∅",
+          turnCount: eyeTurns.length,
+          overlapCount,
+          scrollTop: snap.scrollTop,
+          scrollHeight: snap.scrollHeight,
+          clientHeight: snap.clientHeight,
+        }
+      : null,
+    run: snap
+      ? {
+          label: snap.runStatus.label,
+          phase: snap.runStatus.turnPhase,
+          wire: snap.runStatus.streamWireSource,
+          framesUp: !!snap.runStatus.v4FramesSseOpen,
+          settled: !!snap.runStatus.uiTurnSettled,
+          executing: !!snap.runStatus.executing,
+          why: snap.runStatus.execWhy,
+        }
+      : null,
+    path: path
+      ? {
+          verdict: path.verdict,
+          title: path.title,
+          detail: path.detail,
+          framesUp: path.framesUp,
+          storeStatus: path.storeStatus,
+          subscriptionId: path.subscriptionId,
+          subActive: path.subActive,
+          stagedCount: path.stagedCount,
+          activeSubCount: path.activeSubCount,
+          feTip: path.feTip,
+          hubTip: path.hubTip,
+          tipDelta: path.tipDelta,
+          streamMax: path.streamMax,
+          lastV4AgeMs: path.lastV4AgeMs,
+          catchupReason: path.catchupReason,
+          catchupNotified: path.catchupNotified,
+          catchupAgeMs: path.catchupAgeMs,
+          subscriberCount: path.subscriberCount,
+        }
+      : null,
+    history: snap
+      ? {
+          windowCount: snap.history.windowCount,
+          totalCount: snap.history.totalCount,
+          winFirst: snap.history.windowFirstRowId,
+          winLast: snap.history.windowLastRowId,
+          hasOlder: snap.history.hasOlder,
+          loadingOlder: snap.history.loadingOlder,
+          wouldTrigger: snap.history.wouldTrigger,
+        }
+      : null,
+    waterline: {
+      sendCount: timingRows.length,
+      anomalyCount: waterlineAnomalies.length,
+      inFlightCount: waterlineRows.filter((r) => r.level === "pending").length,
+      rows: waterlineRows,
+    },
+    markdown,
+  };
+}
+
+function mountV4ViewportDiagHook(): void {
+  if (typeof window === "undefined") return;
+  const w = window as Window & {
+    __evoflowV4ViewportDiag?: typeof collectV4ViewportDiagnostic;
+  };
+  w.__evoflowV4ViewportDiag = collectV4ViewportDiagnostic;
+}
+
+mountV4ViewportDiagHook();
 
 export function V4ViewportDebugOverlay() {
   const { enabled: obsEnabled } = useObsEnabled();
@@ -925,21 +2004,52 @@ export function V4ViewportDebugOverlay() {
   const [expandedApiId, setExpandedApiId] = useState<number | null>(null);
   const [apiFamily, setApiFamily] = useState<ApiFamilyFilter>("all");
   const [streamEntries, setStreamEntries] = useState<ViewportStreamTapEntry[]>(
-    () => listViewportStreamTapEntries({ limit: 48 }),
+    () => listViewportStreamTapEntries({ limit: 200 }),
   );
   const [apiEntries, setApiEntries] = useState<ViewportApiTapEntry[]>(() =>
-    listViewportApiTapEntries({ limit: 64 }),
+    listViewportApiTapEntries({ limit: 200 }),
   );
+  const [scrollEntries, setScrollEntries] = useState<ViewportScrollTapEntry[]>(
+    () => listViewportScrollTapEntries({ limit: 200 }),
+  );
+  const [timingRows, setTimingRows] = useState<ChatTurnTimingRow[]>(() =>
+    listChatTurnTimingRows({ limit: 40 }),
+  );
+  const [pageSnaps, setPageSnaps] = useState<ViewportPageSnapEntry[]>(() =>
+    listViewportPageSnapEntries({ limit: 120 }),
+  );
+  const [expandedPageSnapId, setExpandedPageSnapId] = useState<number | null>(
+    null,
+  );
+  const [scrollJumpsOnly, setScrollJumpsOnly] = useState(false);
+  const pageSnapScrollRef = useRef<HTMLDivElement | null>(null);
+  const pageSnapFollowBottomRef = useRef(true);
   const [copyHint, setCopyHint] = useState<string | null>(null);
-  const [pos, setPos] = useState(defaultOverlayPos);
+  /** error/warn 锁定：避免 700ms 刷新 + 时间窗证据滑出后标题栏闪灭 */
+  const [stickyAnomalies, setStickyAnomalies] = useState<StickyViewportAnomaly[]>(
+    [],
+  );
+  const stickyTidRef = useRef<string | null>(null);
+  const [size, setSize] = useState<OverlaySize>(readOverlaySize);
+  const [pos, setPos] = useState(() => defaultOverlayPos(readOverlaySize()));
   const panelRef = useRef<HTMLDivElement | null>(null);
   const streamScrollRef = useRef<HTMLDivElement | null>(null);
   const streamFollowBottomRef = useRef(true);
   const apiScrollRef = useRef<HTMLDivElement | null>(null);
   const apiFollowBottomRef = useRef(true);
+  const scrollTrailRef = useRef<HTMLDivElement | null>(null);
+  const scrollFollowBottomRef = useRef(true);
   const dragRef = useRef<{
     startX: number;
     startY: number;
+    originLeft: number;
+    originTop: number;
+  } | null>(null);
+  const resizeRef = useRef<{
+    startX: number;
+    startY: number;
+    originW: number;
+    originH: number;
     originLeft: number;
     originTop: number;
   } | null>(null);
@@ -973,6 +2083,7 @@ export function V4ViewportDebugOverlay() {
     const w = window as Window & {
       __evoflowViewportOverlay?: (enabled?: boolean) => boolean;
       __evoflowViewportDebugSnapshot?: () => OverlaySnapshot | null;
+      __evoflowV4ViewportDiag?: typeof collectV4ViewportDiagnostic;
     };
     w.__evoflowViewportOverlay = (enabled?: boolean) => {
       if (typeof enabled === "boolean") {
@@ -982,22 +2093,71 @@ export function V4ViewportDebugOverlay() {
       return readOverlayPref();
     };
     w.__evoflowViewportDebugSnapshot = () => collectOverlaySnapshot();
+    w.__evoflowV4ViewportDiag = collectV4ViewportDiagnostic;
     return () => {
       delete w.__evoflowViewportOverlay;
       delete w.__evoflowViewportDebugSnapshot;
+      // 诊断钩子模块级常驻，卸载浮层不删，CDP 仍可拉
     };
   }, []);
 
-  const refresh = useCallback(() => {
-    setSnapshot(collectOverlaySnapshot());
-  }, []);
+  const refreshPageSnaps = useCallback(() => {
+    setPageSnaps(
+      listViewportPageSnapEntries({
+        sessionId: snapshot?.tid ?? null,
+        limit: 120,
+      }),
+    );
+  }, [snapshot?.tid]);
+
+  const samplePageSnap = useCallback(
+    (
+      snap: OverlaySnapshot,
+      opts?: { force?: boolean },
+    ) => {
+      const windowRows = snap.windowRows?.length
+        ? snap.windowRows
+        : [];
+      // 无投影窗时退回视口可见 turn（仍按内容签名，不变不记）
+      const turns =
+        windowRows.length > 0
+          ? turnsFromWindowRows(windowRows)
+          : snap.turns.map((t) => ({
+              turnId: t.turnId,
+              dataIndex: t.dataIndex,
+              rawRows: t.rawRows,
+              orphanHeaderNoUser: t.orphanHeaderNoUser,
+              emptyAssistantCompleted: t.emptyAssistantCompleted,
+            }));
+      pushViewportPageSnap({
+        sessionId: snap.tid,
+        runLabel: snap.runStatus.label,
+        scrollTop: snap.scrollTop,
+        scrollHeight: snap.scrollHeight,
+        turns,
+        force: opts?.force === true,
+      });
+    },
+    [],
+  );
+
+  const refresh = useCallback(
+    (opts?: { forcePageSnap?: boolean }) => {
+      const snap = collectOverlaySnapshot();
+      setSnapshot(snap);
+      if (snap?.tid) {
+        samplePageSnap(snap, { force: opts?.forcePageSnap === true });
+      }
+    },
+    [samplePageSnap],
+  );
 
   const refreshStream = useCallback(() => {
     setStreamEntries(
       listViewportStreamTapEntries({
         sessionKey: snapshot?.sessionKey ?? null,
         sessionId: snapshot?.tid ?? null,
-        limit: 48,
+        limit: 200,
       }),
     );
   }, [snapshot?.sessionKey, snapshot?.tid]);
@@ -1007,16 +2167,35 @@ export function V4ViewportDebugOverlay() {
       listViewportApiTapEntries({
         family: apiFamily,
         sessionId: snapshot?.tid ?? null,
-        limit: 64,
+        limit: 200,
       }),
     );
   }, [apiFamily, snapshot?.tid]);
+
+  const refreshScroll = useCallback(() => {
+    setScrollEntries(
+      listViewportScrollTapEntries({
+        limit: 200,
+        jumpsOnly: scrollJumpsOnly,
+      }),
+    );
+  }, [scrollJumpsOnly]);
+
+  const refreshTiming = useCallback(() => {
+    setTimingRows(
+      listChatTurnTimingRows({
+        sessionKey: snapshot?.sessionKey ?? null,
+        limit: 40,
+      }),
+    );
+  }, [snapshot?.sessionKey]);
 
   const active = obsEnabled && prefOn;
 
   useEffect(() => {
     if (!active) {
       setSnapshot(null);
+      detachViewportScrollTap();
       return;
     }
     refresh();
@@ -1030,6 +2209,7 @@ export function V4ViewportDebugOverlay() {
     };
     const host = document.querySelector('[data-v4-chat-host-visible="1"]');
     const sc = host ? findConversationScroll(host) : null;
+    attachViewportScrollTap(sc);
     sc?.addEventListener("scroll", schedule, { passive: true });
     window.addEventListener("resize", schedule);
     const timer = window.setInterval(schedule, 700);
@@ -1038,8 +2218,26 @@ export function V4ViewportDebugOverlay() {
       sc?.removeEventListener("scroll", schedule);
       window.removeEventListener("resize", schedule);
       window.clearInterval(timer);
+      detachViewportScrollTap();
     };
   }, [active, refresh, snapshot?.tid]);
+
+  // 投影窗 / loadOlder 状态喂给滚轮轨迹，到顶行才能写清「还能自动拉吗」。
+  useEffect(() => {
+    if (!active || !snapshot) return;
+    const h = snapshot.history;
+    setViewportScrollTapSessionId(snapshot.tid);
+    setViewportScrollHistoryContext({
+      hasOlder: h.hasOlder,
+      loadingOlder: h.loadingOlder,
+      firstRowId: h.firstRowId,
+      windowFirstRowId: h.windowFirstRowId,
+      totalCount: h.totalCount,
+      windowCount: h.windowCount,
+      windowUserCount: h.windowUserCount,
+      windowTurnCount: h.windowTurnCount,
+    });
+  }, [active, snapshot]);
 
   useEffect(() => {
     if (!active) return;
@@ -1075,6 +2273,39 @@ export function V4ViewportDebugOverlay() {
     };
   }, [active, refreshApi]);
 
+  useEffect(() => {
+    if (!active) return;
+    refreshScroll();
+    let raf = 0;
+    const unsub = subscribeViewportScrollTap(() => {
+      if (raf) return;
+      raf = window.requestAnimationFrame(() => {
+        raf = 0;
+        refreshScroll();
+      });
+    });
+    return () => {
+      unsub();
+      if (raf) window.cancelAnimationFrame(raf);
+    };
+  }, [active, refreshScroll]);
+
+  useEffect(() => {
+    if (!active) return;
+    refreshTiming();
+    return subscribeChatTurnTiming(() => {
+      refreshTiming();
+    });
+  }, [active, refreshTiming]);
+
+  useEffect(() => {
+    if (!active) return;
+    refreshPageSnaps();
+    return subscribeViewportPageSnap(() => {
+      refreshPageSnaps();
+    });
+  }, [active, refreshPageSnaps]);
+
   const selectTab = useCallback((next: OverlayTab) => {
     setTab(next);
     writeOverlayTab(next);
@@ -1083,6 +2314,12 @@ export function V4ViewportDebugOverlay() {
     }
     if (next === "api") {
       apiFollowBottomRef.current = true;
+    }
+    if (next === "scroll") {
+      scrollFollowBottomRef.current = true;
+    }
+    if (next === "page") {
+      pageSnapFollowBottomRef.current = true;
     }
   }, []);
 
@@ -1102,21 +2339,43 @@ export function V4ViewportDebugOverlay() {
     el.scrollTop = el.scrollHeight;
   }, [active, tab, apiEntries]);
 
-  const clampToViewport = useCallback((left: number, top: number) => {
-    const el = panelRef.current;
-    const width = el?.offsetWidth || Math.min(OVERLAY_WIDTH_PX, window.innerWidth - 32);
-    const height = el?.offsetHeight || Math.min(window.innerHeight * 0.72, 720);
-    return clampOverlayPos(left, top, width, height);
-  }, []);
+  // 滚轮轨迹：默认贴最新；上滚查阅历史样本。
+  useLayoutEffect(() => {
+    if (!active || tab !== "scroll" || !scrollFollowBottomRef.current) return;
+    const el = scrollTrailRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [active, tab, scrollEntries]);
+
+  // 画面快照：贴底跟新帧。
+  useLayoutEffect(() => {
+    if (!active || tab !== "page" || !pageSnapFollowBottomRef.current) return;
+    const el = pageSnapScrollRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [active, tab, pageSnaps]);
+
+  const clampToViewport = useCallback(
+    (left: number, top: number, w = size.width, h = size.height) =>
+      clampOverlayPos(left, top, w, h),
+    [size.height, size.width],
+  );
 
   useEffect(() => {
     if (!active) return;
-    const onResize = () => {
+    const onWinResize = () => {
+      setSize((prev) => {
+        const next = clampOverlaySize(prev.width, prev.height);
+        if (next.width !== prev.width || next.height !== prev.height) {
+          writeOverlaySize(next);
+        }
+        return next;
+      });
       setPos((prev) => clampToViewport(prev.left, prev.top));
     };
-    window.addEventListener("resize", onResize);
-    onResize();
-    return () => window.removeEventListener("resize", onResize);
+    window.addEventListener("resize", onWinResize);
+    onWinResize();
+    return () => window.removeEventListener("resize", onWinResize);
   }, [active, clampToViewport]);
 
   const onPointerDownHeader = (e: ReactPointerEvent<HTMLDivElement>) => {
@@ -1142,19 +2401,161 @@ export function V4ViewportDebugOverlay() {
   const onPointerUpHeader = () => {
     dragRef.current = null;
   };
-  const resetPos = () => setPos(defaultOverlayPos());
 
-  const problems = useMemo(
+  const onPointerDownResize = (e: ReactPointerEvent<HTMLDivElement>) => {
+    e.stopPropagation();
+    e.preventDefault();
+    resizeRef.current = {
+      startX: e.clientX,
+      startY: e.clientY,
+      originW: size.width,
+      originH: size.height,
+      originLeft: pos.left,
+      originTop: pos.top,
+    };
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+  const onPointerMoveResize = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const r = resizeRef.current;
+    if (!r) return;
+    const next = clampOverlaySize(
+      r.originW + (e.clientX - r.startX),
+      r.originH + (e.clientY - r.startY),
+    );
+    setSize(next);
+    setPos(clampToViewport(r.originLeft, r.originTop, next.width, next.height));
+  };
+  const onPointerUpResize = () => {
+    const r = resizeRef.current;
+    resizeRef.current = null;
+    if (!r) return;
+    // 松手时再落一次当前尺寸（避免闭包读到拖拽前的旧 size）
+    setSize((cur) => {
+      writeOverlaySize(cur);
+      return cur;
+    });
+  };
+
+  const resetPos = () => {
+    const next = defaultOverlaySize();
+    setSize(next);
+    writeOverlaySize(next);
+    setPos(defaultOverlayPos(next));
+  };
+
+  const virtProbe = useMemo((): VirtualizationProbe | null => {
+    if (!snapshot) return null;
+    let following = true;
+    try {
+      following =
+        document
+          .querySelector('[data-v4-chat-host-visible="1"] [data-following]')
+          ?.getAttribute("data-following") !== "false";
+    } catch {
+      following = true;
+    }
+    const h = snapshot.history;
+    return collectVirtualizationProbe({
+      tid: snapshot.tid,
+      windowRows: snapshot.windowRows || [],
+      windowCount: h.windowCount,
+      totalCount: h.totalCount,
+      winFirst: h.windowFirstRowId,
+      winLast: h.windowLastRowId,
+      hasOlder: h.hasOlder,
+      loadingOlder: h.loadingOlder,
+      wouldTrigger: h.wouldTrigger,
+      following,
+      streamEntries,
+    });
+  }, [snapshot, streamEntries]);
+
+  const pathProbe = useMemo((): V4PathProbe | null => {
+    if (!snapshot) return null;
+    return collectLiveV4PathProbe({
+      tid: snapshot.tid,
+      runStatus: snapshot.runStatus,
+      history: snapshot.history,
+      streamEntries,
+      windowRows: snapshot.windowRows,
+      turns: snapshot.turns,
+    });
+  }, [snapshot, streamEntries]);
+
+  const liveAnomalies = useMemo(
     () =>
-      problemBadge(
-        snapshot?.layout ?? null,
-        snapshot?.turns ?? null,
-        snapshot?.history ?? null,
-        snapshot?.scrollTop,
-      ),
-    [snapshot],
+      buildViewportAnomalies({
+        snapshot,
+        streamEntries,
+        apiEntries,
+        scrollEntries,
+        path: pathProbe,
+      }),
+    [snapshot, streamEntries, apiEntries, scrollEntries, pathProbe],
   );
+
+  useEffect(() => {
+    const tid = snapshot?.tid ?? "";
+    if (!tid) {
+      stickyTidRef.current = null;
+      setStickyAnomalies([]);
+      return;
+    }
+    setStickyAnomalies((prev) => {
+      const merged = mergeStickyViewportAnomalies({
+        tid,
+        prevTid: stickyTidRef.current,
+        prev,
+        live: liveAnomalies,
+        windowFirstRowId: snapshot?.history?.windowFirstRowId ?? null,
+      });
+      stickyTidRef.current = merged.tid;
+      const next = merged.items;
+      const same =
+        next.length === prev.length &&
+        next.every((a, i) => {
+          const b = prev[i];
+          return (
+            !!b &&
+            a.code === b.code &&
+            a.live === b.live &&
+            a.detail === b.detail &&
+            a.title === b.title &&
+            a.severity === b.severity
+          );
+        });
+      return same ? prev : next;
+    });
+  }, [liveAnomalies, snapshot?.tid, snapshot?.history?.windowFirstRowId]);
+  // 展示 / 标题栏：优先锁定表（含「曾现」），不再跟 700ms 时间窗闪灭
+  const anomalies = stickyAnomalies;
+  const problems = useMemo(() => {
+    const badge = problemBadge(anomalies);
+    if (
+      pathProbe &&
+      pathProbe.verdict !== "OK" &&
+      pathProbe.verdict !== "IDLE"
+    ) {
+      return badge
+        ? `${pathProbe.verdict} · ${badge}`
+        : pathProbe.verdict;
+    }
+    return badge;
+  }, [anomalies, pathProbe]);
   const visibleHost = snapshot?.layout?.hosts.find((h) => h.visibleAttr === "1");
+  const clearStickyAnomalies = useCallback(() => {
+    stickyTidRef.current = snapshot?.tid ?? null;
+    setStickyAnomalies(
+      liveAnomalies
+        .filter((a) => a.severity === "info")
+        .map((a) => ({
+          ...a,
+          firstSeenAt: Date.now(),
+          lastSeenAt: Date.now(),
+          live: true,
+        })),
+    );
+  }, [liveAnomalies, snapshot?.tid]);
 
   const flashCopyHint = useCallback((ok: boolean, label: string) => {
     setCopyHint(ok ? label : "复制失败");
@@ -1165,29 +2566,15 @@ export function V4ViewportDebugOverlay() {
     // 复制前先刷一帧，避免贴出去的是过期快照。
     const fresh = collectOverlaySnapshot();
     if (fresh) setSnapshot(fresh);
-    const text = buildOverlayDiagnosticText({
+    const dump = collectV4ViewportDiagnostic({
       tab,
-      snapshot: fresh ?? snapshot,
-      streamEntries: listViewportStreamTapEntries({
-        sessionKey: (fresh ?? snapshot)?.sessionKey ?? null,
-        sessionId: (fresh ?? snapshot)?.tid ?? null,
-        limit: 48,
-      }),
-      apiEntries: listViewportApiTapEntries({
-        family: apiFamily,
-        sessionId: (fresh ?? snapshot)?.tid ?? null,
-        limit: 64,
-      }),
-      problems: problemBadge(
-        (fresh ?? snapshot)?.layout ?? null,
-        (fresh ?? snapshot)?.turns ?? null,
-        (fresh ?? snapshot)?.history ?? null,
-        (fresh ?? snapshot)?.scrollTop,
-      ),
+      apiFamily,
+      stickyAnomalies,
+      stickyTid: stickyTidRef.current,
     });
-    const ok = await copyTextToClipboard(text);
+    const ok = await copyTextToClipboard(dump.markdown);
     flashCopyHint(ok, "已复制诊断");
-  }, [snapshot, tab, apiFamily, flashCopyHint]);
+  }, [tab, apiFamily, flashCopyHint, stickyAnomalies]);
 
   const copySessionId = useCallback(
     async (kind: "tid" | "sk") => {
@@ -1220,8 +2607,9 @@ export function V4ViewportDebugOverlay() {
         top: pos.top,
         right: "auto",
         bottom: "auto",
-        maxHeight: minimized ? undefined : shellStyle.maxHeight,
-        height: minimized ? "auto" : undefined,
+        width: size.width,
+        height: minimized ? "auto" : size.height,
+        maxHeight: minimized ? undefined : size.height,
       }}
     >
       <div
@@ -1250,15 +2638,15 @@ export function V4ViewportDebugOverlay() {
             onClick={() => {
               void copyDiagnostic();
             }}
-            title="复制诊断包（会话/运行态/布局/视口 turn DOM↔ROW/最近流式 JSON），直接贴给 Agent 排查"
+            title="复现叠字/错位后点：复制「肉眼所见」DOM 文案+坐标+叠层标记，再贴给 Agent"
           >
             {copyHint || "复制诊断"}
           </button>
           <button
             type="button"
             style={btnStyle}
-            onClick={() => refresh()}
-            title="立即刷新"
+            onClick={() => refresh({ forcePageSnap: true })}
+            title="立即刷新（画面无变化也会补记一帧）"
           >
             刷新
           </button>
@@ -1266,7 +2654,7 @@ export function V4ViewportDebugOverlay() {
             type="button"
             style={btnStyle}
             onClick={resetPos}
-            title="拖飞了点这个：回到右下角"
+            title="位置+尺寸复位：右下角大窗"
           >
             复位
           </button>
@@ -1360,6 +2748,42 @@ export function V4ViewportDebugOverlay() {
                     {snapshot.turns.length}
                   </span>
                 </div>
+                {pathProbe ? (
+                  <div
+                    style={{
+                      fontSize: 11,
+                      lineHeight: 1.35,
+                      color:
+                        pathProbe.verdict === "OK" ||
+                        pathProbe.verdict === "IDLE"
+                          ? "#86efac"
+                          : "#fbbf24",
+                      marginTop: 2,
+                    }}
+                    title={pathProbe.detail}
+                  >
+                    根因 {pathProbe.verdict} · {pathProbe.title}
+                    {" · "}fe={pathProbe.feTip ?? "∅"} hub=
+                    {pathProbe.hubTip ?? "∅"}
+                    {pathProbe.tipDelta != null
+                      ? ` Δ${pathProbe.tipDelta > 0 ? "+" : ""}${pathProbe.tipDelta}`
+                      : ""}
+                    {" · "}sub=
+                    {pathProbe.subscriptionId
+                      ? pathProbe.subscriptionId.slice(0, 10)
+                      : "∅"}
+                    {" active="}
+                    {pathProbe.subActive === true
+                      ? "1"
+                      : pathProbe.subActive === false
+                        ? "0"
+                        : "∅"}
+                    {" · "}notified=
+                    {pathProbe.catchupNotified ?? "∅"}
+                    {" hubSubs="}
+                    {pathProbe.subscriberCount ?? "∅"}
+                  </div>
+                ) : null}
                 <span
                   style={{
                     flexShrink: 0,
@@ -1412,9 +2836,34 @@ export function V4ViewportDebugOverlay() {
                 {(
                   [
                     ["status", "运行"],
+                    [
+                      "anomaly",
+                      anomalies.length
+                        ? `异常(${anomalies.length})`
+                        : "异常",
+                    ],
+                    ["page", `画面(${pageSnaps.length})`],
                     ["stream", `流式(${streamEntries.length})`],
+                    ["timing", `计时(${timingRows.length})`],
+                    [
+                      "scroll",
+                      `滚轮(${scrollEntries.length}${countViewportScrollJumps() ? `!${countViewportScrollJumps()}` : ""})`,
+                    ],
                     ["api", `接口(${apiEntries.length})`],
-                    ["viewport", `视口(${snapshot.turns.length})`],
+                    [
+                      "viewport",
+                      `视口(${
+                        snapshot.windowRows?.filter(
+                          (r) => String(r.kind) !== "turnHeader",
+                        ).length || snapshot.turns.length
+                      })`,
+                    ],
+                    [
+                      "virt",
+                      virtProbe?.flags.length
+                        ? `虚拟化(!${virtProbe.flags.length})`
+                        : "虚拟化",
+                    ],
                   ] as const
                 ).map(([id, label]) => (
                   <button
@@ -1424,7 +2873,14 @@ export function V4ViewportDebugOverlay() {
                       ...tabBtnBase,
                       background:
                         tab === id ? "rgba(51,65,85,0.95)" : "transparent",
-                      color: tab === id ? "#f8fafc" : "#94a3b8",
+                      color:
+                        tab === id
+                          ? "#f8fafc"
+                          : id === "anomaly" && anomalies.length > 0
+                            ? "#fbbf24"
+                            : id === "virt" && (virtProbe?.flags.length ?? 0) > 0
+                              ? "#fbbf24"
+                              : "#94a3b8",
                       borderColor:
                         tab === id
                           ? "rgba(148,163,184,0.35)"
@@ -1485,6 +2941,46 @@ export function V4ViewportDebugOverlay() {
                       {snapshot.runStatus.executing ? "1" : "0"}
                       {" · "}why={snapshot.runStatus.execWhy || "∅"}
                     </div>
+                    <div
+                      style={{
+                        marginBottom: 8,
+                        padding: "6px 8px",
+                        borderRadius: 6,
+                        background:
+                          anomalies.length > 0
+                            ? "rgba(127,29,29,0.28)"
+                            : "rgba(22,101,52,0.22)",
+                        color: anomalies.length > 0 ? "#fecaca" : "#86efac",
+                      }}
+                    >
+                      异常表{" "}
+                      <b>
+                        {anomalies.length > 0
+                          ? `${anomalies.length} 条 · ${anomalies
+                              .slice(0, 3)
+                              .map((a) => a.code)
+                              .join(" / ")}${
+                              anomalies.length > 3
+                                ? ` +${anomalies.length - 3}`
+                                : ""
+                            }`
+                          : "0 · OK"}
+                      </b>
+                      {anomalies.length > 0 ? (
+                        <button
+                          type="button"
+                          style={{
+                            ...btnStyle,
+                            marginLeft: 8,
+                            borderColor: "rgba(251,191,36,0.45)",
+                            color: "#fbbf24",
+                          }}
+                          onClick={() => selectTab("anomaly")}
+                        >
+                          打开异常
+                        </button>
+                      ) : null}
+                    </div>
                     {snapshot.runStatus.mode === "sse" ? (
                       <div style={{ color: "#a5f3fc", marginBottom: 6 }}>
                         AG-UI POST /runs/stream 仍开着（浏览器持有 live SSE）
@@ -1507,14 +3003,13 @@ export function V4ViewportDebugOverlay() {
                                 ? "rgba(180, 83, 9, 0.28)"
                                 : "rgba(30, 41, 59, 0.65)",
                               color: p.active ? "#fde68a" : "#94a3b8",
-                              whiteSpace: "nowrap",
-                              overflow: "hidden",
-                              textOverflow: "ellipsis",
+                              ...tapLineStyle,
                             }}
-                            title={`(a)${p.target}\n(b)${p.owner}`}
                           >
                             轮询 {p.active ? "●" : "○"} 每{p.intervalSec}s ·{" "}
                             {p.owner}
+                            {"\n"}
+                            target={p.target}
                           </div>
                         ))
                       )
@@ -1544,11 +3039,12 @@ export function V4ViewportDebugOverlay() {
                       }}
                     >
                       <div style={{ color: "#e2e8f0", fontWeight: 600 }}>
-                        消息计数 · 投影窗{" "}
-                        {snapshot.history.windowCount}/
-                        {snapshot.history.totalCount ?? "∅"}
-                        {" · "}用户气泡 {snapshot.history.windowUserCount}
-                        {" · "}轮 {snapshot.history.windowTurnCount}
+                        {formatConversationRecordCounts({
+                          windowCount: snapshot.history.windowCount,
+                          totalCount: snapshot.history.totalCount,
+                          windowTurnCount: snapshot.history.windowTurnCount,
+                          windowUserCount: snapshot.history.windowUserCount,
+                        })}
                       </div>
                       <div style={{ marginTop: 2, color: "#94a3b8" }}>
                         rowId first={snapshot.history.firstRowId ?? "∅"} · 窗=
@@ -1582,8 +3078,174 @@ export function V4ViewportDebugOverlay() {
                         {" · "}scrollTop={snapshot.scrollTop}
                       </div>
                       <div style={{ marginTop: 2, color: "#64748b", fontSize: 10 }}>
-                        规则：scrollTop ≤ max(64, 2×视口高) 才自动 loadOlder，不是一上滚就拉
+                        规则：未跟底且 scrollTop ≤ max(64, 2×视口高) 才自动
+                        loadOlder；跟底中绝不预取（防短尾窗死循环）
                       </div>
+                    </div>
+                  </div>
+                ) : null}
+
+                {tab === "page" ? (
+                  <div
+                    style={{
+                      flex: 1,
+                      minHeight: 0,
+                      display: "flex",
+                      flexDirection: "column",
+                      border: "1px solid rgba(52,211,153,0.4)",
+                      borderRadius: 8,
+                      overflow: "hidden",
+                      background: "rgba(6, 78, 59, 0.22)",
+                    }}
+                  >
+                    <div
+                      style={{
+                        ...mono,
+                        flexShrink: 0,
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 6,
+                        padding: "4px 8px",
+                        background: "rgba(6, 95, 70, 0.5)",
+                        color: "#a7f3d0",
+                        fontSize: 11,
+                      }}
+                    >
+                      <span>
+                        仅内容变化记一帧（尾部用户/正文/思考/工具）· 不变不刷 ·
+                        点开看明细
+                      </span>
+                      <span
+                        style={{ marginLeft: "auto", display: "flex", gap: 4 }}
+                      >
+                        <button
+                          type="button"
+                          style={btnStyle}
+                          title="滚到最新"
+                          onClick={() => {
+                            pageSnapFollowBottomRef.current = true;
+                            const el = pageSnapScrollRef.current;
+                            if (el) el.scrollTop = el.scrollHeight;
+                          }}
+                        >
+                          最新
+                        </button>
+                        <button
+                          type="button"
+                          style={btnStyle}
+                          title="清空画面快照"
+                          onClick={() => clearViewportPageSnap()}
+                        >
+                          清空
+                        </button>
+                      </span>
+                    </div>
+                    <div
+                      ref={pageSnapScrollRef}
+                      onScroll={(e) => {
+                        const el = e.currentTarget;
+                        const dist =
+                          el.scrollHeight - el.scrollTop - el.clientHeight;
+                        pageSnapFollowBottomRef.current = dist < 56;
+                      }}
+                      style={{
+                        ...mono,
+                        flex: 1,
+                        minHeight: 120,
+                        overflow: "auto",
+                        padding: "4px 6px 8px",
+                        fontSize: 12,
+                        color: "#d1fae5",
+                        lineHeight: 1.35,
+                      }}
+                    >
+                      {pageSnaps.length === 0 ? (
+                        <div style={{ color: "#6ee7b7", padding: 8 }}>
+                          尚无画面帧。用户发送 / 正文 / 工具变化时才会记；点顶栏「刷新」可强制补一帧。
+                        </div>
+                      ) : (
+                        pageSnaps.map((entry, idx) => {
+                          const newest = idx >= pageSnaps.length - 2;
+                          const open = expandedPageSnapId === entry.id;
+                          const d = new Date(entry.atMs);
+                          const time = `${d.toLocaleTimeString("zh-CN", {
+                            hour12: false,
+                            hour: "2-digit",
+                            minute: "2-digit",
+                            second: "2-digit",
+                          })}.${String(entry.atMs % 1000).padStart(3, "0")}`;
+                          return (
+                            <div
+                              key={entry.id}
+                              style={{
+                                marginBottom: open ? 6 : 1,
+                                padding: open ? "4px 6px 6px" : "1px 4px",
+                                borderRadius: 4,
+                                border: newest
+                                  ? "1px solid rgba(110,231,183,0.5)"
+                                  : "1px solid transparent",
+                                background: newest
+                                  ? "rgba(6, 95, 70, 0.35)"
+                                  : "transparent",
+                              }}
+                            >
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setExpandedPageSnapId((cur) =>
+                                    cur === entry.id ? null : entry.id,
+                                  )
+                                }
+                                style={{
+                                  all: "unset",
+                                  cursor: "pointer",
+                                  display: "flex",
+                                  alignItems: "baseline",
+                                  gap: 8,
+                                  width: "100%",
+                                  boxSizing: "border-box",
+                                  whiteSpace: "nowrap",
+                                  overflow: "hidden",
+                                  color: "#ecfdf5",
+                                }}
+                                title={entry.headline}
+                              >
+                                <span style={{ color: "#6ee7b7", flexShrink: 0 }}>
+                                  {open ? "▼" : "▶"}
+                                </span>
+                                <span
+                                  style={{
+                                    color: "#f8fafc",
+                                    fontWeight: 700,
+                                    flexShrink: 0,
+                                  }}
+                                >
+                                  #{entry.id}
+                                </span>
+                                <span
+                                  style={{ color: "#94a3b8", flexShrink: 0 }}
+                                >
+                                  {time}
+                                </span>
+                                <span
+                                  style={{
+                                    minWidth: 0,
+                                    overflow: "hidden",
+                                    textOverflow: "ellipsis",
+                                  }}
+                                >
+                                  {entry.headline}
+                                </span>
+                              </button>
+                              {open ? (
+                                <pre style={{ ...tapJsonPreStyle, marginTop: 6 }}>
+                                  {entry.detailText}
+                                </pre>
+                              ) : null}
+                            </div>
+                          );
+                        })
+                      )}
                     </div>
                   </div>
                 ) : null}
@@ -1614,7 +3276,9 @@ export function V4ViewportDebugOverlay() {
                         fontSize: 11,
                       }}
                     >
-                      <span>最新在底 · 一行看清 思考/正文/工具+内容 · 点开 JSON</span>
+                      <span>
+                        最新在底 · 序号+时间+类型+摘要 · 点开才看 JSON
+                      </span>
                       <span style={{ marginLeft: "auto", display: "flex", gap: 4 }}>
                         <button
                           type="button"
@@ -1652,38 +3316,52 @@ export function V4ViewportDebugOverlay() {
                         minHeight: 120,
                         overflow: "auto",
                         padding: "4px 6px 8px",
-                        fontSize: 11,
+                        fontSize: 12,
                         color: "#ede9fe",
+                        lineHeight: 1.35,
                       }}
                     >
                       {streamEntries.length === 0 ? (
                         <div style={{ color: "#a78bfa", padding: 8 }}>
-                          尚无流式帧。发消息后这里贴底显示最新 AG-UI / V4 JSON。
+                          尚无流式帧。发消息后这里贴底显示最新 AG-UI / V4 摘要。
                         </div>
                       ) : (
                         streamEntries.map((entry, idx) => {
                           const newest = idx >= streamEntries.length - 2;
+                          // 默认一行摘要；点开才展开 JSON
                           const open = expandedStreamId === entry.id;
-                          const time = new Date(entry.atMs).toLocaleTimeString(
-                            "zh-CN",
-                            {
-                              hour12: false,
-                              hour: "2-digit",
-                              minute: "2-digit",
-                              second: "2-digit",
-                            },
-                          );
+                          const d = new Date(entry.atMs);
+                          const time = `${d.toLocaleTimeString("zh-CN", {
+                            hour12: false,
+                            hour: "2-digit",
+                            minute: "2-digit",
+                            second: "2-digit",
+                          })}.${String(entry.atMs % 1000).padStart(3, "0")}`;
+                          const kind = entry.kindLabel || "其它";
+                          const kindColor =
+                            kind === "用户"
+                              ? "#86efac"
+                              : kind === "正文"
+                                ? "#93c5fd"
+                                : kind === "思考"
+                                  ? "#c4b5fd"
+                                  : kind === "工具"
+                                    ? "#fcd34d"
+                                    : kind === "开跑" || kind === "收尾"
+                                      ? "#67e8f9"
+                                      : "#e2e8f0";
                           return (
                             <div
                               key={entry.id}
                               style={{
-                                marginBottom: 2,
+                                marginBottom: open ? 6 : 1,
+                                padding: open ? "4px 6px 6px" : "1px 4px",
                                 borderRadius: 4,
                                 border: newest
                                   ? "1px solid rgba(196,181,253,0.45)"
                                   : "1px solid transparent",
                                 background: newest
-                                  ? "rgba(91, 33, 182, 0.28)"
+                                  ? "rgba(91, 33, 182, 0.22)"
                                   : "transparent",
                               }}
                             >
@@ -1697,39 +3375,445 @@ export function V4ViewportDebugOverlay() {
                                 style={{
                                   all: "unset",
                                   cursor: "pointer",
-                                  display: "block",
+                                  display: "flex",
+                                  alignItems: "baseline",
+                                  gap: 8,
                                   width: "100%",
                                   boxSizing: "border-box",
-                                  padding: "3px 6px",
-                                  color: newest ? "#f5f3ff" : "#c4b5fd",
-                                  // 一行摘要必须看得见思考/正文/工具内容；过长才省略。
                                   whiteSpace: "nowrap",
                                   overflow: "hidden",
-                                  textOverflow: "ellipsis",
+                                  color: newest ? "#f5f3ff" : "#ddd6fe",
                                 }}
-                                title={entry.headline}
+                                title={`${kind} ${entry.summary || entry.headline}`}
                               >
-                                {open ? "▼" : "▶"} #{entry.id} {time}{" "}
-                                {entry.headline}
-                              </button>
-                              {open ? (
-                                <pre
+                                <span style={{ color: "#a78bfa", flexShrink: 0 }}>
+                                  {open ? "▼" : "▶"}
+                                </span>
+                                <span
                                   style={{
-                                    margin: "0 4px 6px",
-                                    padding: 8,
-                                    borderRadius: 4,
-                                    background: "rgba(2,6,23,0.88)",
                                     color: "#f8fafc",
-                                    whiteSpace: "pre-wrap",
-                                    wordBreak: "break-word",
-                                    maxHeight: 200,
-                                    overflow: "auto",
-                                    fontSize: 11,
+                                    fontWeight: 700,
+                                    flexShrink: 0,
                                   }}
                                 >
-                                  {entry.jsonText}
-                                </pre>
+                                  #{entry.id}
+                                </span>
+                                <span
+                                  style={{
+                                    color: "#94a3b8",
+                                    flexShrink: 0,
+                                  }}
+                                >
+                                  {time}
+                                </span>
+                                <span
+                                  style={{
+                                    color: kindColor,
+                                    fontWeight: 700,
+                                    flexShrink: 0,
+                                  }}
+                                >
+                                  {kind}
+                                </span>
+                                <span
+                                  style={{
+                                    minWidth: 0,
+                                    overflow: "hidden",
+                                    textOverflow: "ellipsis",
+                                    color: newest ? "#faf5ff" : "#e9d5ff",
+                                  }}
+                                >
+                                  {entry.summary || entry.headline}
+                                </span>
+                              </button>
+                              {open ? (
+                                <div style={{ marginTop: 6 }}>
+                                  <div
+                                    style={{
+                                      color: "#a78bfa",
+                                      fontSize: 11,
+                                      marginBottom: 2,
+                                    }}
+                                  >
+                                    JSON · {entry.channel}/{entry.type}
+                                  </div>
+                                  <pre style={tapJsonPreStyle}>
+                                    {entry.jsonText}
+                                  </pre>
+                                </div>
                               ) : null}
+                            </div>
+                          );
+                        })
+                      )}
+                    </div>
+                  </div>
+                ) : null}
+
+                {tab === "timing" ? (
+                  <div
+                    style={{
+                      flex: 1,
+                      minHeight: 0,
+                      display: "flex",
+                      flexDirection: "column",
+                      border: "1px solid rgba(56,189,248,0.4)",
+                      borderRadius: 8,
+                      overflow: "hidden",
+                      background: "rgba(8, 47, 73, 0.28)",
+                    }}
+                  >
+                    <div
+                      style={{
+                        ...mono,
+                        flexShrink: 0,
+                        padding: "6px 10px",
+                        background: "rgba(7, 89, 133, 0.55)",
+                        color: "#bae6fd",
+                        fontSize: 11,
+                      }}
+                    >
+                      发送水位线：出泡(上屏)→上线→首字→结束 · 正常收紧 ·
+                      异常留证 · viewport-timing.log
+                    </div>
+                    <div
+                      style={{
+                        ...mono,
+                        flex: 1,
+                        minHeight: 0,
+                        overflow: "auto",
+                        padding: "4px 6px 8px",
+                        fontSize: 11,
+                        color: "#e0f2fe",
+                      }}
+                    >
+                      {timingRows.length === 0 ? (
+                        <div style={{ color: "#7dd3fc", padding: 8 }}>
+                          尚无回合计时。点发送后这里会出现一行：发送时刻、出泡上屏、上线、首字、判定。
+                        </div>
+                      ) : (
+                        <div
+                          style={{
+                            display: "grid",
+                            gridTemplateColumns:
+                              "56px 72px 1fr 48px 48px 48px 48px 1fr",
+                            gap: "4px 8px",
+                            alignItems: "start",
+                            padding: "4px 4px 0",
+                          }}
+                        >
+                          {(
+                            [
+                              "发送",
+                              "判定",
+                              "内容",
+                              "出泡",
+                              "上线",
+                              "首字",
+                              "结束",
+                              "首包预览",
+                            ] as const
+                          ).map((h) => (
+                            <div
+                              key={h}
+                              style={{
+                                color: "#7dd3fc",
+                                fontSize: 10,
+                                borderBottom:
+                                  "1px solid rgba(125,211,252,0.35)",
+                                paddingBottom: 4,
+                                position: "sticky",
+                                top: 0,
+                                background: "rgba(8,47,73,0.95)",
+                              }}
+                            >
+                              {h}
+                            </div>
+                          ))}
+                          {[...timingRows].reverse().map((row) => {
+                            const send = new Date(
+                              row.sendAt,
+                            ).toLocaleTimeString("zh-CN", {
+                              hour12: false,
+                              hour: "2-digit",
+                              minute: "2-digit",
+                              second: "2-digit",
+                            });
+                            const ms = (at: number | null) =>
+                              at == null
+                                ? "—"
+                                : `${Math.max(0, at - row.sendAt)}ms`;
+                            const verdict = classifyChatTurnTimingVerdict(row);
+                            const verdictColor =
+                              verdict.level === "ok"
+                                ? "#86efac"
+                                : verdict.level === "pending"
+                                  ? "#7dd3fc"
+                                  : verdict.level === "warn"
+                                    ? "#fbbf24"
+                                    : "#fca5a5";
+                            const firstLabel =
+                              row.firstKind === "text"
+                                ? "正文"
+                                : row.firstKind === "reasoning"
+                                  ? "思考"
+                                  : row.firstKind === "tool"
+                                    ? "工具"
+                                    : row.firstKind || "—";
+                            return (
+                              <div key={row.id} style={{ display: "contents" }}>
+                                <div style={tapLineStyle}>{send}</div>
+                                <div
+                                  style={{
+                                    color: verdictColor,
+                                    fontWeight: 600,
+                                  }}
+                                  title={verdict.zh}
+                                >
+                                  {verdict.zh}
+                                </div>
+                                <div style={tapLineStyle}>
+                                  {row.textPreview || "（空）"}
+                                </div>
+                                <div
+                                  style={{
+                                    color:
+                                      row.userBubbleAt != null
+                                        ? "#86efac"
+                                        : "#fbbf24",
+                                  }}
+                                >
+                                  {ms(row.userBubbleAt)}
+                                </div>
+                                <div>{ms(row.wireAt)}</div>
+                                <div
+                                  style={{
+                                    color:
+                                      row.firstResponseAt != null &&
+                                      row.firstResponseAt - row.sendAt >= 3000
+                                        ? "#fbbf24"
+                                        : "#e0f2fe",
+                                  }}
+                                  title={firstLabel}
+                                >
+                                  {ms(row.firstResponseAt)}
+                                </div>
+                                <div>{ms(row.streamEndAt)}</div>
+                                <div style={tapLineStyle}>
+                                  {row.firstResponseAt != null
+                                    ? `${firstLabel} ${row.firstPreview || ""}`
+                                    : "等待首字"}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ) : null}
+
+                {tab === "scroll" ? (
+                  <div
+                    style={{
+                      flex: 1,
+                      minHeight: 0,
+                      display: "flex",
+                      flexDirection: "column",
+                      border: "1px solid rgba(251,191,36,0.4)",
+                      borderRadius: 8,
+                      overflow: "hidden",
+                      background: "rgba(120, 53, 15, 0.22)",
+                    }}
+                  >
+                    <div
+                      style={{
+                        ...mono,
+                        flexShrink: 0,
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: 4,
+                        padding: "4px 8px",
+                        background: "rgba(146, 64, 14, 0.5)",
+                        color: "#fde68a",
+                        fontSize: 11,
+                      }}
+                    >
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 6,
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        <span>
+                          轨迹贴底 · !JUMP=猛跳 · 到顶写清能否自动拉历史
+                        </span>
+                        <span style={{ marginLeft: "auto", display: "flex", gap: 4 }}>
+                          <button
+                            type="button"
+                            style={{
+                              ...btnStyle,
+                              borderColor: scrollJumpsOnly
+                                ? "rgba(251,191,36,0.7)"
+                                : undefined,
+                              color: scrollJumpsOnly ? "#fbbf24" : undefined,
+                            }}
+                            title="只看猛跳样本"
+                            onClick={() => setScrollJumpsOnly((v) => !v)}
+                          >
+                            {scrollJumpsOnly ? "仅JUMP✓" : "仅JUMP"}
+                          </button>
+                          <button
+                            type="button"
+                            style={btnStyle}
+                            title="滚到最新并恢复跟新"
+                            onClick={() => {
+                              scrollFollowBottomRef.current = true;
+                              const el = scrollTrailRef.current;
+                              if (el) el.scrollTop = el.scrollHeight;
+                            }}
+                          >
+                            最新
+                          </button>
+                          <button
+                            type="button"
+                            style={btnStyle}
+                            title="清空滚轮轨迹"
+                            onClick={() => clearViewportScrollTap()}
+                          >
+                            清空
+                          </button>
+                        </span>
+                      </div>
+                      <div
+                        style={{
+                          marginTop: 4,
+                          padding: "6px 8px",
+                          borderRadius: 6,
+                          background: "rgba(154, 52, 18, 0.45)",
+                          border: "1px solid rgba(251, 146, 60, 0.55)",
+                          color: "#fff7ed",
+                          fontSize: 12,
+                          fontWeight: 700,
+                          lineHeight: 1.4,
+                        }}
+                        title="已显示=客户端投影窗行数；全量=服务端会话全序行数。hasOlder=0 且已显示少于全量时，说明尾窗被软顶裁过，不是「历史本来就这么少」。"
+                      >
+                        对话记录 ·{" "}
+                        {formatConversationRecordCounts({
+                          windowCount: snapshot.history.windowCount,
+                          totalCount: snapshot.history.totalCount,
+                          windowTurnCount: snapshot.history.windowTurnCount,
+                          windowUserCount: snapshot.history.windowUserCount,
+                        })}
+                        {typeof snapshot.history.totalCount === "number" &&
+                        snapshot.history.windowCount < snapshot.history.totalCount &&
+                        !snapshot.history.hasOlder ? (
+                          <span style={{ color: "#fecaca", fontWeight: 600 }}>
+                            {" · !缺窗（已显示少于全量却 hasOlder=0）"}
+                          </span>
+                        ) : null}
+                      </div>
+                      <div style={{ color: "#fdba74", fontSize: 10, lineHeight: 1.35, marginTop: 4 }}>
+                        到顶语义：几何顶=scrollTop≈0；「应自动拉」=还有更早；「无更早」=历史已尽；
+                        「loading」=正在展开；「卡住」=到顶仍有更早却没触发。src=scrollToBottom /
+                        browser/native / wheel 可对照谁拽的。
+                      </div>
+                      <div style={{ color: "#fed7aa", fontSize: 10 }}>
+                        当前 scroll={snapshot.scrollTop}/{snapshot.scrollHeight} · hasOlder=
+                        {snapshot.history.hasOlder ? 1 : 0} · loading=
+                        {snapshot.history.loadingOlder ? 1 : 0} · wouldTrigger=
+                        {snapshot.history.wouldTrigger ? 1 : 0} · first=
+                        {snapshot.history.firstRowId ?? "∅"} · winFirst=
+                        {snapshot.history.windowFirstRowId ?? "∅"} · JUMP累计=
+                        {countViewportScrollJumps()}
+                      </div>
+                    </div>
+                    <div
+                      ref={scrollTrailRef}
+                      onScroll={(e) => {
+                        const el = e.currentTarget;
+                        const dist =
+                          el.scrollHeight - el.scrollTop - el.clientHeight;
+                        scrollFollowBottomRef.current = dist < 56;
+                      }}
+                      style={{
+                        ...mono,
+                        flex: 1,
+                        minHeight: 120,
+                        overflow: "auto",
+                        padding: "4px 6px 8px",
+                        fontSize: 11,
+                        color: "#ffedd5",
+                      }}
+                    >
+                      {scrollEntries.length === 0 ? (
+                        <div style={{ color: "#fdba74", padding: 8 }}>
+                          尚无轨迹。在对话区上下滚几下，这里会贴底记下位置变化；猛跳标
+                          !JUMP。
+                        </div>
+                      ) : (
+                        scrollEntries.map((entry, idx) => {
+                          const newest = idx >= scrollEntries.length - 2;
+                          const time = new Date(entry.atMs).toLocaleTimeString(
+                            "zh-CN",
+                            {
+                              hour12: false,
+                              hour: "2-digit",
+                              minute: "2-digit",
+                              second: "2-digit",
+                            },
+                          );
+                          const ms = String(entry.atMs % 1000).padStart(3, "0");
+                          return (
+                            <div
+                              key={entry.id}
+                              style={{
+                                marginBottom: 2,
+                                padding: "3px 6px",
+                                borderRadius: 4,
+                                border: entry.jump
+                                  ? "1px solid rgba(248,113,113,0.65)"
+                                  : newest
+                                    ? "1px solid rgba(251,191,36,0.45)"
+                                    : "1px solid transparent",
+                                background: entry.jump
+                                  ? "rgba(153, 27, 27, 0.45)"
+                                  : newest
+                                    ? "rgba(154, 52, 18, 0.35)"
+                                    : "transparent",
+                                color: entry.jump ? "#fecaca" : "#ffedd5",
+                              }}
+                              title={formatScrollTopVerdict(entry.verdict)}
+                            >
+                              <div style={tapLineStyle}>
+                                #{entry.id} {time}.{ms}{" "}
+                                {entry.jump ? (
+                                  <b style={{ color: "#f87171" }}>!JUMP </b>
+                                ) : null}
+                                {entry.headline}
+                              </div>
+                              <div
+                                style={{
+                                  ...tapLineStyle,
+                                  marginTop: 2,
+                                  fontSize: 10,
+                                  color: entry.jump ? "#fca5a5" : "#fdba74",
+                                }}
+                              >
+                                {formatScrollTopVerdict(entry.verdict)}
+                                {" · "}已显示{entry.windowCount}/全量
+                                {entry.totalCount ?? "∅"}
+                                {" · "}hasOlder={entry.hasOlder ? 1 : 0}
+                                {" · "}loading={entry.loadingOlder ? 1 : 0}
+                                {" · "}auto=
+                                {entry.wouldTrigger ? 1 : 0}
+                                {" · "}first={entry.firstRowId ?? "∅"}→win
+                                {entry.windowFirstRowId ?? "∅"}
+                                {" · "}follow={entry.followingAttr ?? "∅"}
+                              </div>
                             </div>
                           );
                         })
@@ -1771,7 +3855,11 @@ export function V4ViewportDebugOverlay() {
                           gap: 6,
                         }}
                       >
-                        <span>页面相关 HTTP · 最新在底 · 点行看入参/出参</span>
+                        <span>
+                          最新在底 · V4 历史 =
+                          <b style={{ color: "#fde68a" }}> 订投影→SSE首屏</b>
+                          {" / "}上拉 rowsRange
+                        </span>
                         <span
                           style={{
                             marginLeft: "auto",
@@ -1805,6 +3893,7 @@ export function V4ViewportDebugOverlay() {
                         {(
                           [
                             ["all", "全部"],
+                            ["history", "查历史"],
                             ["v4", "V4投影"],
                             ["messages", "轨迹消息"],
                             ["catchup", "catchup"],
@@ -1818,12 +3907,21 @@ export function V4ViewportDebugOverlay() {
                               ...btnStyle,
                               background:
                                 apiFamily === id
-                                  ? "rgba(16,185,129,0.35)"
+                                  ? id === "history"
+                                    ? "rgba(245,158,11,0.4)"
+                                    : "rgba(16,185,129,0.35)"
                                   : "rgba(15,23,42,0.45)",
-                              color: apiFamily === id ? "#ecfdf5" : "#a7f3d0",
+                              color:
+                                apiFamily === id
+                                  ? "#ecfdf5"
+                                  : id === "history"
+                                    ? "#fde68a"
+                                    : "#a7f3d0",
                               borderColor:
                                 apiFamily === id
-                                  ? "rgba(52,211,153,0.55)"
+                                  ? id === "history"
+                                    ? "rgba(251,191,36,0.65)"
+                                    : "rgba(52,211,153,0.55)"
                                   : "rgba(148,163,184,0.25)",
                             }}
                             onClick={() => {
@@ -1877,13 +3975,46 @@ export function V4ViewportDebugOverlay() {
                     >
                       {apiEntries.length === 0 ? (
                         <div style={{ color: "#6ee7b7", padding: 8 }}>
-                          尚无页面相关接口。切会话 / 发消息 / catchup
-                          后，这里会记下 subscribe、messages、catchup 等入参出参。
+                          {apiFamily === "history" ? (
+                            <>
+                              尚无查历史记录。V4 打开会话的历史是{" "}
+                              <b>subscribe → SSE snapshot</b>
+                              （标签「查历史·订阅 / 查历史·首屏」），不是 Obs
+                              「调用记录」里的模型请求，也通常不是 /messages。
+                              <br />
+                              上拉更早才是{" "}
+                              <b>store.loadOlder → rowsRange</b>
+                              （「查历史·上拉」）。
+                              <br />
+                              当前 hasOlder=
+                              {snapshot?.history.hasOlder ? "1" : "0"} ·
+                              loading=
+                              {snapshot?.history.loadingOlder ? "1" : "0"} ·
+                              firstRowId=
+                              {snapshot?.history.firstRowId ?? "∅"} · winFirst=
+                              {snapshot?.history.windowFirstRowId ?? "∅"}
+                              <br />
+                              切到本会话或点「清空」后再切一次会话，应出现「查历史·订阅
+                              + 查历史·首屏」。
+                              {snapshot?.history.hasOlder
+                                ? " 有更早行时滚到顶才会多一条「查历史·上拉」。"
+                                : " hasOlder=0 时上拉不会请求。"}
+                            </>
+                          ) : (
+                            <>
+                              尚无本会话接口记录。切会话 / 发消息 / 上拉到顶
+                              后会出现。若刚点过「清空」需再触发一次。
+                            </>
+                          )}
                         </div>
                       ) : (
                         apiEntries.map((entry, idx) => {
                           const newest = idx >= apiEntries.length - 2;
-                          const open = expandedApiId === entry.id;
+                          const open =
+                            expandedApiId === entry.id || newest;
+                          const isHistory =
+                            entry.badge === "查历史" ||
+                            entry.label.startsWith("查历史");
                           const time = new Date(entry.atMs).toLocaleTimeString(
                             "zh-CN",
                             {
@@ -1897,16 +4028,21 @@ export function V4ViewportDebugOverlay() {
                             <div
                               key={entry.id}
                               style={{
-                                marginBottom: 2,
-                                borderRadius: 4,
-                                border: newest
-                                  ? "1px solid rgba(110,231,183,0.45)"
-                                  : "1px solid transparent",
-                                background: newest
-                                  ? "rgba(6, 95, 70, 0.35)"
-                                  : entry.ok
-                                    ? "transparent"
-                                    : "rgba(127, 29, 29, 0.28)",
+                                marginBottom: 8,
+                                padding: "6px 8px",
+                                borderRadius: 6,
+                                border: isHistory
+                                  ? "1px solid rgba(251,191,36,0.55)"
+                                  : newest
+                                    ? "1px solid rgba(110,231,183,0.45)"
+                                    : "1px solid rgba(148,163,184,0.22)",
+                                background: isHistory
+                                  ? "rgba(120, 53, 15, 0.35)"
+                                  : newest
+                                    ? "rgba(6, 95, 70, 0.35)"
+                                    : entry.ok
+                                      ? "rgba(15,23,42,0.35)"
+                                      : "rgba(127, 29, 29, 0.28)",
                               }}
                             >
                               <button
@@ -1919,109 +4055,144 @@ export function V4ViewportDebugOverlay() {
                                 style={{
                                   all: "unset",
                                   cursor: "pointer",
-                                  display: "grid",
-                                  gridTemplateColumns:
-                                    "44px 56px 72px 40px 48px 1fr",
-                                  gap: 4,
+                                  display: "block",
                                   width: "100%",
                                   boxSizing: "border-box",
-                                  padding: "3px 6px",
-                                  color: entry.ok ? "#d1fae5" : "#fecaca",
-                                  alignItems: "center",
+                                  color: entry.ok
+                                    ? isHistory
+                                      ? "#fef3c7"
+                                      : "#d1fae5"
+                                    : "#fecaca",
+                                  ...tapLineStyle,
                                 }}
-                                title={entry.headline}
                               >
-                                <span>
-                                  {open ? "▼" : "▶"}
-                                  {entry.id}
-                                </span>
-                                <span>{time}</span>
-                                <span
-                                  style={{
-                                    overflow: "hidden",
-                                    textOverflow: "ellipsis",
-                                    whiteSpace: "nowrap",
-                                  }}
-                                >
-                                  {entry.method.slice(0, 4)} {entry.label}
-                                </span>
-                                <span>{entry.status || "—"}</span>
-                                <span>{entry.durationMs}ms</span>
-                                <span
-                                  style={{
-                                    overflow: "hidden",
-                                    textOverflow: "ellipsis",
-                                    whiteSpace: "nowrap",
-                                    color: "#a7f3d0",
-                                  }}
-                                >
-                                  {entry.headline}
-                                </span>
+                                {open ? "▼" : "▶"} #{entry.id} {time}{" "}
+                                {isHistory ? (
+                                  <span
+                                    style={{
+                                      display: "inline-block",
+                                      marginRight: 4,
+                                      padding: "0 5px",
+                                      borderRadius: 3,
+                                      background: "rgba(245,158,11,0.55)",
+                                      color: "#422006",
+                                      fontWeight: 700,
+                                      fontSize: 10,
+                                    }}
+                                  >
+                                    查历史
+                                  </span>
+                                ) : null}
+                                {entry.method} {entry.label} ·{" "}
+                                {entry.status || "—"} · {entry.durationMs}ms
+                                {"\n"}
+                                {entry.headline}
+                                {entry.pageText
+                                  ? `\n📄 ${entry.pageText}`
+                                  : ""}
                               </button>
                               {open ? (
                                 <div
                                   style={{
-                                    margin: "0 4px 6px",
-                                    display: "grid",
-                                    gridTemplateColumns: "1fr 1fr",
-                                    gap: 6,
+                                    marginTop: 6,
+                                    display: "flex",
+                                    flexDirection: "column",
+                                    gap: 8,
                                   }}
                                 >
-                                  <div>
+                                  {isHistory ? (
                                     <div
                                       style={{
-                                        color: "#6ee7b7",
-                                        marginBottom: 2,
-                                        fontSize: 10,
-                                      }}
-                                    >
-                                      入参 · {entry.path}
-                                      {entry.query ? `?${entry.query}` : ""}
-                                    </div>
-                                    <pre
-                                      style={{
-                                        margin: 0,
-                                        padding: 8,
+                                        padding: "6px 8px",
                                         borderRadius: 4,
-                                        background: "rgba(2,6,23,0.88)",
-                                        color: "#f8fafc",
-                                        whiteSpace: "pre-wrap",
-                                        wordBreak: "break-word",
-                                        maxHeight: 220,
-                                        overflow: "auto",
-                                        fontSize: 11,
+                                        border:
+                                          "1px solid rgba(251,191,36,0.4)",
+                                        background: "rgba(69, 26, 3, 0.45)",
+                                        color: "#fef3c7",
                                       }}
                                     >
-                                      {entry.requestText || "（无 body）"}
-                                    </pre>
-                                  </div>
-                                  <div>
-                                    <div
-                                      style={{
-                                        color: entry.ok ? "#6ee7b7" : "#fca5a5",
-                                        marginBottom: 2,
-                                        fontSize: 10,
-                                      }}
-                                    >
-                                      出参 · {entry.ok ? "ok" : "fail"} ·{" "}
-                                      {entry.status}
+                                      <div
+                                        style={{
+                                          color: "#fbbf24",
+                                          marginBottom: 4,
+                                          fontSize: 10,
+                                          fontWeight: 700,
+                                        }}
+                                      >
+                                        {entry.label === "查历史·首屏"
+                                          ? "查历史·首屏 = subscribe/resync 后 SSE snapshot 进 store 的窗口行（V4 打开会话真正「查到的历史」）"
+                                          : entry.label === "查历史·订阅" ||
+                                              entry.label === "查历史·resync"
+                                            ? "查历史·订阅 = POST /api/v4/conversation/subscribe；行内容在随后「查历史·首屏」"
+                                            : entry.label === "查历史·轨迹"
+                                              ? "查历史·轨迹 = 旧 GET …/messages（V4 权威时常跳过）"
+                                              : "查历史·上拉 = store.loadOlder → conversation.rowsRange（/api/v4/conversation/rows_range）"}
+                                      </div>
+                                      <div style={{ fontSize: 11, marginBottom: 6 }}>
+                                        {entry.pageText || "（无分页摘要）"}
+                                      </div>
+                                      <div
+                                        style={{
+                                          color: "#fcd34d",
+                                          marginBottom: 2,
+                                          fontSize: 10,
+                                        }}
+                                      >
+                                        本页返回的历史消息
+                                      </div>
+                                      <pre
+                                        style={{
+                                          ...tapJsonPreStyle,
+                                          maxHeight: 220,
+                                          borderColor:
+                                            "rgba(251,191,36,0.35)",
+                                          color: "#fffbeb",
+                                        }}
+                                      >
+                                        {entry.historyPreviewText ||
+                                          "（无预览）"}
+                                      </pre>
                                     </div>
-                                    <pre
-                                      style={{
-                                        margin: 0,
-                                        padding: 8,
-                                        borderRadius: 4,
-                                        background: "rgba(2,6,23,0.88)",
-                                        color: "#f8fafc",
-                                        whiteSpace: "pre-wrap",
-                                        wordBreak: "break-word",
-                                        maxHeight: 220,
-                                        overflow: "auto",
-                                        fontSize: 11,
-                                      }}
-                                    >
-                                      {entry.responseText || "（空）"}
-                                    </pre>
+                                  ) : null}
+                                  <div
+                                    style={{
+                                      display: "grid",
+                                      gridTemplateColumns: "1fr 1fr",
+                                      gap: 8,
+                                    }}
+                                  >
+                                    <div>
+                                      <div
+                                        style={{
+                                          color: "#6ee7b7",
+                                          marginBottom: 2,
+                                          fontSize: 10,
+                                        }}
+                                      >
+                                        入参 JSON · {entry.path}
+                                        {entry.query ? `?${entry.query}` : ""}
+                                      </div>
+                                      <pre style={tapJsonPreStyle}>
+                                        {entry.requestText || "（无 body）"}
+                                      </pre>
+                                    </div>
+                                    <div>
+                                      <div
+                                        style={{
+                                          color: entry.ok
+                                            ? "#6ee7b7"
+                                            : "#fca5a5",
+                                          marginBottom: 2,
+                                          fontSize: 10,
+                                        }}
+                                      >
+                                        出参 JSON · {entry.ok ? "ok" : "fail"} ·{" "}
+                                        {entry.status}
+                                      </div>
+                                      <pre style={tapJsonPreStyle}>
+                                        {entry.responseText || "（空）"}
+                                      </pre>
+                                    </div>
                                   </div>
                                 </div>
                               ) : null}
@@ -2042,188 +4213,529 @@ export function V4ViewportDebugOverlay() {
                       paddingRight: 2,
                     }}
                   >
-                    <div
-                      style={{
-                        display: "grid",
-                        gridTemplateColumns: "1fr 1fr",
-                        gap: 8,
-                        marginBottom: 6,
-                        position: "sticky",
-                        top: 0,
-                        zIndex: 1,
-                        background: "rgba(15,23,42,0.96)",
-                        paddingBottom: 2,
-                      }}
-                    >
-                      <div style={{ ...colHeadStyle, color: "#86efac" }}>
-                        左 · DOM
-                      </div>
-                      <div style={{ ...colHeadStyle, color: "#c4b5fd" }}>
-                        右 · 投影 row
-                      </div>
-                    </div>
-
-                    {snapshot.turns.length === 0 ? (
-                      <div style={{ color: "#fbbf24" }}>
-                        视口内没有 turn（空白常见：滚动与虚拟窗口错位）
-                      </div>
-                    ) : null}
-
-                    {snapshot.turns.map((t) => {
-                      const open = expandedTurn === t.turnId;
-                      const gapWarn =
-                        t.gapToNext != null &&
-                        t.gapToNext <= 80 &&
-                        t.height > 120;
-                      const rawSummary =
-                        t.rawRows.length === 0
-                          ? "（投影窗口无此 turn）"
-                          : t.rawRows
-                              .map((r) => {
-                                const kind = String(r.kind || "?");
-                                if (typeof r.toolName === "string") {
-                                  return `${kind} ${r.toolName}${
-                                    r.status ? ` [${r.status}]` : ""
-                                  }`;
-                                }
-                                if (typeof r.text === "string" && r.text) {
-                                  return `${kind} ${clip(r.text, 80)}`;
-                                }
-                                if (typeof r.origin === "string") {
-                                  return `${kind} origin=${r.origin}`;
-                                }
-                                if (typeof r.state === "string") {
-                                  return `${kind} state=${r.state}`;
-                                }
-                                return kind;
-                              })
-                              .join(" · ");
+                    {(() => {
+                      // 投影窗全序摊平（含最新发送）；不是「视口碰巧看见的旧 turn」
+                      const sourceRows =
+                        snapshot.windowRows?.length > 0
+                          ? snapshot.windowRows
+                          : snapshot.turns.flatMap((t) => t.rawRows);
+                      type FlatLine = {
+                        key: string;
+                        lineNo: number;
+                        turnId: string;
+                        row: Record<string, unknown>;
+                      };
+                      const flat: FlatLine[] = [];
+                      let lineNo = 0;
+                      for (let ri = 0; ri < sourceRows.length; ri++) {
+                        const r = sourceRows[ri]!;
+                        const kind = String(r.kind || "");
+                        if (kind === "turnHeader") continue;
+                        lineNo += 1;
+                        const rowId =
+                          typeof r.rowId === "number" ||
+                          typeof r.rowId === "string"
+                            ? String(r.rowId)
+                            : `i${ri}`;
+                        flat.push({
+                          key: `${String(r.turnId || "")}:${rowId}:${ri}`,
+                          lineNo,
+                          turnId: String(r.turnId || ""),
+                          row: r,
+                        });
+                      }
+                      const lastUser = [...flat]
+                        .reverse()
+                        .find((x) => String(x.row.kind) === "userInput");
+                      const lastUserText = clip(lastUser?.row.text, 80);
+                      const latestSend = timingRows.length
+                        ? timingRows[timingRows.length - 1]
+                        : null;
+                      const sendText = clip(latestSend?.textPreview, 80);
+                      const sendMatch =
+                        !!sendText &&
+                        !!lastUserText &&
+                        (lastUserText === sendText ||
+                          lastUserText.includes(sendText) ||
+                          sendText.includes(lastUserText));
+                      const pageSeen = pageVisibleBitsFromRawRows(sourceRows);
+                      const pageSeenLine = [
+                        pageSeen.user,
+                        pageSeen.text,
+                        pageSeen.tool,
+                      ]
+                        .filter(Boolean)
+                        .join(" | ");
                       return (
-                        <div
-                          key={`${t.turnId}:${t.dataIndex}`}
-                          style={{
-                            border: gapWarn
-                              ? "1px solid rgba(251,191,36,0.55)"
-                              : "1px solid rgba(148,163,184,0.22)",
-                            borderRadius: 8,
-                            marginBottom: 8,
-                            overflow: "hidden",
-                            background: gapWarn
-                              ? "rgba(180, 83, 9, 0.18)"
-                              : "rgba(15,23,42,0.35)",
-                          }}
-                        >
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setExpandedTurn((cur) =>
-                                cur === t.turnId ? null : t.turnId,
-                              )
-                            }
+                        <>
+                          <div
                             style={{
-                              all: "unset",
-                              cursor: "pointer",
-                              display: "flex",
-                              alignItems: "center",
-                              gap: 8,
-                              width: "100%",
-                              boxSizing: "border-box",
-                              padding: "5px 10px",
-                              background: "rgba(30,41,59,0.85)",
-                              color: "#93c5fd",
                               ...mono,
-                              fontSize: 11,
-                              whiteSpace: "nowrap",
-                              overflow: "hidden",
+                              marginBottom: 8,
+                              padding: "6px 8px",
+                              borderRadius: 6,
+                              border: sendMatch
+                                ? "1px solid rgba(134,239,172,0.45)"
+                                : "1px solid rgba(251,191,36,0.55)",
+                              background: sendMatch
+                                ? "rgba(22,101,52,0.28)"
+                                : "rgba(120,53,15,0.35)",
+                              color: sendMatch ? "#bbf7d0" : "#fde68a",
+                              fontSize: 12,
                             }}
                           >
-                            <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>
-                              #{t.dataIndex ?? "∅"} turn={t.turnId.slice(0, 8)} h=
-                              {t.height}
-                              {t.gapToNext != null
-                                ? ` gap→${t.gapToNext}${gapWarn ? " ⚠" : ""}`
-                                : ""}
-                            </span>
-                            <span style={{ marginLeft: "auto", color: "#94a3b8" }}>
-                              {open ? "▲" : "▼"}
-                            </span>
-                          </button>
-
+                            发送「{sendText || "∅"}」
+                            {" → "}
+                            窗尾用户「{lastUserText || "∅"}」
+                            {sendMatch
+                              ? " · 对齐"
+                              : " · 不一致（查投影是否没吃到 / 视口旧数据）"}
+                            {" · "}共{flat.length}条
+                          </div>
+                          <div
+                            style={{
+                              ...mono,
+                              marginBottom: 8,
+                              padding: "6px 8px",
+                              borderRadius: 6,
+                              border: "1px solid rgba(125,211,252,0.45)",
+                              background: "rgba(12,74,110,0.35)",
+                              color: "#e0f2fe",
+                              fontSize: 12,
+                            }}
+                            title="与时间线同一套 renderUnits：段末正文才是页面折叠外能看见的"
+                          >
+                            页面所见（应对齐聊天区）：
+                            {pageSeenLine || "（空）"}
+                          </div>
                           <div
                             style={{
                               display: "grid",
                               gridTemplateColumns: "1fr 1fr",
-                              gap: 0,
-                              borderTop: "1px solid rgba(148,163,184,0.18)",
+                              gap: 8,
+                              marginBottom: 6,
+                              position: "sticky",
+                              top: 0,
+                              zIndex: 1,
+                              background: "rgba(15,23,42,0.96)",
+                              paddingBottom: 2,
                             }}
                           >
-                            <div
-                              style={{
-                                ...paneStyle,
-                                maxHeight: 120,
-                                minHeight: 56,
-                                borderRight:
-                                  "1px solid rgba(148,163,184,0.22)",
-                                background: "rgba(6, 78, 59, 0.22)",
-                                color: "#d1fae5",
-                              }}
-                            >
-                              {t.displayText || "（界面无文字）"}
+                            <div style={{ ...colHeadStyle, color: "#86efac" }}>
+                              左 · 投影原行（含已折进「已工作」的中间正文；≠页面所见）
                             </div>
-                            <div
-                              style={{
-                                ...paneStyle,
-                                maxHeight: 120,
-                                minHeight: 56,
-                                background: "rgba(76, 29, 149, 0.22)",
-                                color: "#ede9fe",
-                              }}
-                            >
-                              {rawSummary}
+                            <div style={{ ...colHeadStyle, color: "#c4b5fd" }}>
+                              右 · 这一条的 JSON
                             </div>
                           </div>
+                          {flat.length === 0 ? (
+                            <div style={{ color: "#fbbf24" }}>
+                              投影窗没有用户/正文/工具行
+                            </div>
+                          ) : null}
+                          {flat.map((item) => {
+                            const open = expandedTurn === item.key;
+                            const left = viewportRowLeftLabel(item.row);
+                            const right = viewportRowJsonSummary(item.row);
+                            return (
+                              <div
+                                key={item.key}
+                                style={{
+                                  marginBottom: open ? 6 : 1,
+                                  borderRadius: 4,
+                                  border: open
+                                    ? "1px solid rgba(196,181,253,0.45)"
+                                    : "1px solid transparent",
+                                  background: open
+                                    ? "rgba(30,41,59,0.55)"
+                                    : "transparent",
+                                }}
+                              >
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setExpandedTurn((cur) =>
+                                      cur === item.key ? null : item.key,
+                                    )
+                                  }
+                                  style={{
+                                    all: "unset",
+                                    cursor: "pointer",
+                                    display: "grid",
+                                    gridTemplateColumns: "1fr 1fr",
+                                    width: "100%",
+                                    boxSizing: "border-box",
+                                    ...mono,
+                                    fontSize: 12,
+                                  }}
+                                >
+                                  <div
+                                    style={{
+                                      padding: "4px 8px",
+                                      borderRight:
+                                        "1px solid rgba(148,163,184,0.25)",
+                                      background: "rgba(6, 78, 59, 0.2)",
+                                      color: "#d1fae5",
+                                      whiteSpace: "nowrap",
+                                      overflow: "hidden",
+                                      textOverflow: "ellipsis",
+                                      textAlign: "left",
+                                    }}
+                                    title={left}
+                                  >
+                                    <span
+                                      style={{
+                                        color: "#f8fafc",
+                                        fontWeight: 700,
+                                        marginRight: 6,
+                                      }}
+                                    >
+                                      L{item.lineNo}
+                                    </span>
+                                    <span style={{ color: "#64748b" }}>
+                                      row#
+                                      {String(item.row.rowId ?? "∅")}{" "}
+                                    </span>
+                                    {left}
+                                  </div>
+                                  <div
+                                    style={{
+                                      padding: "4px 8px",
+                                      background: "rgba(76, 29, 149, 0.2)",
+                                      color: "#ede9fe",
+                                      whiteSpace: "nowrap",
+                                      overflow: "hidden",
+                                      textOverflow: "ellipsis",
+                                      textAlign: "left",
+                                    }}
+                                    title={right}
+                                  >
+                                    {open ? "▼ " : "▶ "}
+                                    {right}
+                                  </div>
+                                </button>
+                                {open ? (
+                                  <pre
+                                    style={{
+                                      ...tapJsonPreStyle,
+                                      margin: "0 0 4px",
+                                    }}
+                                  >
+                                    {JSON.stringify(
+                                      {
+                                        line: item.lineNo,
+                                        turnId: item.turnId,
+                                        row: item.row,
+                                      },
+                                      null,
+                                      2,
+                                    )}
+                                  </pre>
+                                ) : null}
+                              </div>
+                            );
+                          })}
+                        </>
+                      );
+                    })()}
+                  </div>
+                ) : null}
 
-                          {open ? (
-                            <pre
+                {tab === "virt" ? (
+                  <div
+                    style={{
+                      ...mono,
+                      flex: 1,
+                      minHeight: 0,
+                      overflow: "auto",
+                      fontSize: 11,
+                      color: "#cbd5e1",
+                      padding: "4px 2px",
+                    }}
+                  >
+                    <div
+                      style={{
+                        marginBottom: 8,
+                        padding: "6px 8px",
+                        borderRadius: 6,
+                        background:
+                          (virtProbe?.flags.length ?? 0) > 0
+                            ? "rgba(127,29,29,0.28)"
+                            : "rgba(22,101,52,0.22)",
+                        color:
+                          (virtProbe?.flags.length ?? 0) > 0
+                            ? "#fecaca"
+                            : "#86efac",
+                        lineHeight: 1.4,
+                      }}
+                    >
+                      <b>虚拟化 / 投影窗</b>
+                      {" · "}
+                      {virtProbe?.flags.length
+                        ? virtProbe.flags.join(" · ")
+                        : "窗跟流正常"}
+                      <div style={{ marginTop: 4, color: "#94a3b8", fontSize: 10 }}>
+                        对齐 ZCode：follow=1 查 tip/STREAM_AHEAD；follow=0 查上拉；
+                        soft-cap 只在 snapshot/loadOlder（delta 不裁）。窗首&gt;窗尾 → UNSORTED。
+                      </div>
+                    </div>
+                    {virtProbe ? (
+                      <table
+                        style={{
+                          width: "100%",
+                          borderCollapse: "collapse",
+                          fontSize: 11,
+                        }}
+                      >
+                        <tbody>
+                          {(
+                            [
+                              ["软顶 softCap", String(virtProbe.softCap)],
+                              [
+                                "已显示 / 全量",
+                                `${virtProbe.windowCount} / ${virtProbe.totalCount ?? "∅"}`,
+                              ],
+                              [
+                                "占比 softCap",
+                                `${virtProbe.softCapRatio}${virtProbe.balloon ? " !BALLOON" : ""}`,
+                              ],
+                              [
+                                "窗两端(数组)",
+                                `${virtProbe.winFirst ?? "∅"} … ${virtProbe.winLast ?? "∅"}`,
+                              ],
+                              [
+                                "真实 min/max",
+                                `${virtProbe.winMin ?? "∅"} … ${virtProbe.winMax ?? "∅"}${virtProbe.unsortedEnds ? " !UNSORTED" : ""}`,
+                              ],
+                              [
+                                "流式 tip streamMax",
+                                String(virtProbe.streamMaxRowId ?? "∅"),
+                              ],
+                              [
+                                "窗尾 winLast",
+                                String(virtProbe.winLast ?? "∅"),
+                              ],
+                              [
+                                "STREAM_AHEAD",
+                                virtProbe.streamAhead
+                                  ? `是 · Δ+${virtProbe.streamAheadDelta}`
+                                  : "否",
+                              ],
+                              [
+                                "直播轮 tid",
+                                virtProbe.liveTurnId
+                                  ? virtProbe.liveTurnId.slice(0, 16)
+                                  : "∅",
+                              ],
+                              [
+                                "直播 tip liveTip",
+                                String(virtProbe.liveTipRowId ?? "∅"),
+                              ],
+                              [
+                                "inFlight 轮/窗",
+                                `${virtProbe.liveInFlight} / ${virtProbe.windowInFlight}`,
+                              ],
+                              [
+                                "上滚 hasOlder",
+                                virtProbe.hasOlder ? "1" : "0",
+                              ],
+                              [
+                                "loadingOlder",
+                                virtProbe.loadingOlder ? "1" : "0",
+                              ],
+                              [
+                                "wouldTrigger",
+                                virtProbe.wouldTrigger ? "1" : "0",
+                              ],
+                              [
+                                "跟底 follow",
+                                virtProbe.following ? "1" : "0",
+                              ],
+                            ] as const
+                          ).map(([k, v]) => (
+                            <tr key={k}>
+                              <td
+                                style={{
+                                  padding: "3px 6px",
+                                  color: "#94a3b8",
+                                  whiteSpace: "nowrap",
+                                  verticalAlign: "top",
+                                  width: "42%",
+                                }}
+                              >
+                                {k}
+                              </td>
+                              <td
+                                style={{
+                                  padding: "3px 6px",
+                                  color:
+                                    String(v).includes("!") ||
+                                    (k === "STREAM_AHEAD" && v.startsWith("是"))
+                                      ? "#fbbf24"
+                                      : "#e2e8f0",
+                                  wordBreak: "break-all",
+                                }}
+                              >
+                                {v}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    ) : (
+                      <div style={{ color: "#64748b", padding: 8 }}>
+                        无投影快照（打开对话后再看）
+                      </div>
+                    )}
+                  </div>
+                ) : null}
+
+                {tab === "anomaly" ? (
+                  <div
+                    style={{
+                      ...mono,
+                      flex: 1,
+                      minHeight: 0,
+                      overflow: "auto",
+                      fontSize: 11,
+                      color: "#cbd5e1",
+                      padding: "4px 2px",
+                    }}
+                  >
+                    <div
+                      style={{
+                        marginBottom: 8,
+                        color: "#94a3b8",
+                        display: "flex",
+                        alignItems: "flex-start",
+                        gap: 8,
+                        justifyContent: "space-between",
+                      }}
+                    >
+                      <span>
+                        error/warn{" "}
+                        <b style={{ color: "#e2e8f0" }}>锁定显示</b>
+                        （证据滑出时间窗也不灭）；「现」=本帧仍命中，「曾」=曾现已安静。换会话自动清；也可手动清。
+                      </span>
+                      <button
+                        type="button"
+                        style={{
+                          ...btnStyle,
+                          flexShrink: 0,
+                          opacity: anomalies.length ? 1 : 0.45,
+                        }}
+                        disabled={anomalies.length === 0}
+                        onClick={clearStickyAnomalies}
+                        title="清除锁定的异常（本帧仍命中的 info 会留下）"
+                      >
+                        清除锁定
+                      </button>
+                    </div>
+                    {anomalies.length === 0 ? (
+                      <div style={{ color: "#86efac" }}>暂无异常 · OK</div>
+                    ) : (
+                      <table
+                        style={{
+                          width: "100%",
+                          borderCollapse: "collapse",
+                          tableLayout: "fixed",
+                        }}
+                      >
+                        <thead>
+                          <tr style={{ color: "#94a3b8", textAlign: "left" }}>
+                            <th style={{ width: 52, padding: "4px 6px" }}>级</th>
+                            <th style={{ width: 168, padding: "4px 6px" }}>
+                              代码
+                            </th>
+                            <th style={{ padding: "4px 6px" }}>说明 / 证据</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {anomalies.map((a) => (
+                            <tr
+                              key={a.code}
                               style={{
-                                margin: 0,
-                                padding: 10,
                                 borderTop: "1px solid rgba(148,163,184,0.18)",
-                                background: "rgba(2,6,23,0.88)",
-                                color: "#f1f5f9",
-                                whiteSpace: "pre-wrap",
-                                wordBreak: "break-word",
-                                maxHeight: 220,
-                                overflow: "auto",
-                                ...mono,
-                                fontSize: 11,
+                                verticalAlign: "top",
+                                opacity: a.live ? 1 : 0.72,
                               }}
                             >
-                              {JSON.stringify(
-                                {
-                                  turnId: t.turnId,
-                                  layout: {
-                                    top: t.top,
-                                    height: t.height,
-                                    gapToNext: t.gapToNext,
-                                  },
-                                  displayText: t.displayText,
-                                  rows: t.rawRows,
-                                },
-                                null,
-                                2,
-                              )}
-                            </pre>
-                          ) : null}
-                        </div>
-                      );
-                    })}
+                              <td
+                                style={{
+                                  padding: "6px",
+                                  color:
+                                    a.severity === "error"
+                                      ? "#f87171"
+                                      : a.severity === "warn"
+                                        ? "#fbbf24"
+                                        : "#67e8f9",
+                                  fontWeight: 700,
+                                }}
+                              >
+                                {a.severity}
+                              </td>
+                              <td
+                                style={{
+                                  padding: "6px",
+                                  color: "#f8fafc",
+                                  wordBreak: "break-all",
+                                }}
+                              >
+                                {a.code}
+                                <div
+                                  style={{
+                                    marginTop: 2,
+                                    fontSize: 10,
+                                    color: a.live ? "#86efac" : "#94a3b8",
+                                  }}
+                                >
+                                  {a.live ? "现·仍命中" : "曾·已安静"}
+                                </div>
+                              </td>
+                              <td style={{ padding: "6px" }}>
+                                <div style={{ color: "#e2e8f0" }}>{a.title}</div>
+                                <div
+                                  style={{
+                                    color: "#94a3b8",
+                                    marginTop: 2,
+                                    wordBreak: "break-word",
+                                  }}
+                                >
+                                  {a.detail}
+                                </div>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    )}
                   </div>
                 ) : null}
               </div>
             </>
           )}
         </div>
+      ) : null}
+      {!minimized ? (
+        <div
+          onPointerDown={onPointerDownResize}
+          onPointerMove={onPointerMoveResize}
+          onPointerUp={onPointerUpResize}
+          onPointerCancel={onPointerUpResize}
+          title="拖右下角缩放"
+          style={{
+            position: "absolute",
+            right: 2,
+            bottom: 2,
+            width: 18,
+            height: 18,
+            cursor: "nwse-resize",
+            borderRadius: 3,
+            background:
+              "linear-gradient(135deg, transparent 0 45%, rgba(148,163,184,0.55) 46% 54%, transparent 55% 70%, rgba(148,163,184,0.75) 71% 79%, transparent 80%)",
+            zIndex: 2,
+          }}
+        />
       ) : null}
     </div>
   );
