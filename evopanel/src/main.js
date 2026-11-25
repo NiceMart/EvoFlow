@@ -240,6 +240,19 @@ try {
   console.warn('[boot] panel CDP import failed', e)
 }
 
+// 用户界面操作留痕（点击 / 路由）→ platform ui.panel op=focus|state
+try {
+  void import('./lib/ui-focus.js')
+    .then((m) => {
+      m.ensureUiFocusClickCapture()
+      // 预热页面快照钩子
+      return import('./components/global-assistant/assistant-context.js')
+    })
+    .catch((e) => console.warn('[boot] ui-focus mount failed', e))
+} catch (e) {
+  console.warn('[boot] ui-focus import failed', e)
+}
+
 // 初始化主题与面板设置（SQLite evoflow_app_settings / panel.ui）
 initTheme()
 initFontSizePreference()
@@ -753,6 +766,15 @@ async function boot() {
 
   initRouter(content, { chatHostEl: document.getElementById('chat-persistent-host') })
   bootMark('initRouter done')
+
+  // 功能页全局 right-stage 宿主（#content | RightStagePanel 左右分割）
+  try {
+    void import('./components/global-assistant/mount-global-right-stage.js').then((m) => {
+      m.mountGlobalRightStage()
+    })
+  } catch (e) {
+    console.warn('[boot] mountGlobalRightStage failed', e)
+  }
 
   if (isTauri) {
     void import('./lib/background-voice.js').then(({ initBackgroundVoice }) => initBackgroundVoice())

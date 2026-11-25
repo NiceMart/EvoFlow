@@ -6,9 +6,104 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.3.53] - 2026-11-24
+
+相对 **1.3.52**：阿里云/火山 Coding Plan；员工页布局；右栏路径愈合；预览面包屑；待发送队列按会话隔离。
+GitHub Release 说明见 scripts/maintainer/windows/release-notes/PRODUCT-NOTES-1.3.53.md；升级横幅见 scripts/maintainer/update/latest.json。
+
+### Added
+
+- **Coding Plan**：阿里云、火山 Coding Plan 套餐与对话模型档
+
+### Fixed
+
+- **右栏打开路径**：工作区文件路径愈合更稳
+- **预览面包屑**：路径展示与跳转更清楚
+- **待发送队列**：按会话隔离，减少串会话误发
+
+### Changed
+
+- **智能员工页**：身份与能力速览前置，交工/审核/巡检分区更清楚
+- **Plan 目录**：套餐目录同步 Coding Plan
+
+
+## [1.3.52] - 2026-11-24
+
+相对 **1.3.51**：全局右栏宿主；小 V 进主对话改走对话右栏；窄栏排版与员工过程页签。
+GitHub Release 说明见 scripts/maintainer/windows/release-notes/PRODUCT-NOTES-1.3.52.md；升级横幅见 scripts/maintainer/update/latest.json。
+
+### Added
+
+- **全局右栏宿主**：功能页可开与主对话同一套右栏舞台
+
+### Fixed
+
+- **小 V 进主对话**：关掉嵌套窄栏，改用 ChatApp 右栏
+- **窄栏排版**：正文吃满宽度，减少贴中间 / 过大问候 / 过疏轮次
+
+### Changed
+
+- **右栏打开小 V**：与全局 / 对话宿主可见性衔接更清楚
+
+
+## [1.3.51] - 2026-11-24
+
+相对 **1.3.50**：小 V 右栏对话时间线；从功能页打开时保留页面与点击上下文。
+GitHub Release 说明见 scripts/maintainer/windows/release-notes/PRODUCT-NOTES-1.3.51.md；升级横幅见 scripts/maintainer/update/latest.json。
+
+### Added
+
+- **小 V 右栏对话**：右栏挂载对话时间线
+
+### Fixed
+
+- **打开前页面上下文**：点开小 V 前的模块/路由与近期点击不因跳转对话页丢失
+- **主对话会话提示**：侧栏当前会话写入页面上下文
+
+### Changed
+
+- **小 V 提示词**：页面上下文格式更完整
+- **右栏打开小 V**：打开路径与焦点更稳
+
+
+## [1.3.50] - 2026-11-23
+
+相对 **1.3.49**：部门群等当前轮完成再取正文/派工；去掉旧 sticky 误派；门店设计简要对齐；轻量寒暄。
+GitHub Release 说明见 scripts/maintainer/windows/release-notes/PRODUCT-NOTES-1.3.50.md；升级横幅见 scripts/maintainer/update/latest.json。
+
+### Fixed
+
+- **部门群 detached 轮次**：waitingV4 后按本轮 runId 等到最终事件/落库
+- **旧回复误派工**：去掉 unrestricted latest-reply 回退
+- **执行态清空 runId**：须有本轮非空最终助手行才算完成
+- **失败/取消/超时**：显式报错并释放监听，十分钟上限
+
+### Changed
+
+- **门店设计简要对齐**：门店设计 / 施工绘图岗交接前提示范围
+- **轻量寒暄**：单独打招呼走 ask；干活仍 agent
+
+
 ## [1.3.49] - 2026-11-23
 
-相对 **1.3.48** 的后续开发版本（未打正式包标签）。
+相对 **1.3.48**：应用文件夹；组织包安装；对话贴底与收口空白；临时错误可重试；观测库回收更稳。
+GitHub Release 说明见 scripts/maintainer/windows/release-notes/PRODUCT-NOTES-1.3.49.md；升级横幅见 scripts/maintainer/update/latest.json。
+
+### Added
+
+- **应用文件夹**：工作流列表嵌套文件夹与面包屑，应用可移入文件夹
+
+### Fixed
+
+- **对话贴底**：切会话 / 收口后减少整屏空白、贴不到底
+- **临时内部错误**：模型短暂错误、断连时提示可直接再发
+- **本机库忙**：水合 / 读会话在库锁超时 soft-fail，不误报成模型失败
+- **观测库回收**：超限 VACUUM INTO，忙时让路重试
+
+### Changed
+
+- **组织包安装**：安装与注册更完整
+- **能力页签**：技能 / MCP / 知识库勾选先乐观更新
 
 
 ## [1.3.48] - 2026-11-23

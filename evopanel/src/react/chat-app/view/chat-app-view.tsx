@@ -5,9 +5,14 @@
 import {
   useState,
   useEffect,
+  useSyncExternalStore,
   type ReactNode,
   type MouseEvent as ReactMouseEvent,
 } from 'react'
+import {
+  getChatHostVisible,
+  subscribeChatHostVisible,
+} from '../../../lib/chat-host-visibility.js'
 import type { DisplayRow } from '../../chat-types.js'
 import { ModelCatalogMenu } from '../../components/ModelCatalogMenu.js'
 import { ShellSessionListHost } from '../../components/ShellSessionListHost.js'
@@ -68,9 +73,31 @@ import { MemoryRecallChip } from '../../components/MemoryRecallChip.js'
 import { ImagePreviewModal, type ImagePreviewItem } from '../../components/ImagePreviewModal.js'
 import { TauriWindowControls } from '../../components/TauriWindowControls.js'
 import { HoverBubble, HoverBubbleProvider } from '../../components/HoverBubble.js'
-import { ChatHeaderHelpMenu, renderSessionHistoryRefreshButton } from './header-chrome.js'
+import { ChatHeaderHelpMenu } from './header-chrome.js'
 
 export type ChatAppViewCtx = Record<string, any>
+
+/**
+ * Chat 工作台可见时才挂 RightStagePanel；功能页由 GlobalRightStageHost 接手，避免双挂载。
+ */
+function ChatOwnedRightStage(props: {
+  open: boolean
+  panel: ReactNode
+  resizeHandle?: ReactNode
+}) {
+  const chatVisible = useSyncExternalStore(
+    subscribeChatHostVisible,
+    getChatHostVisible,
+    () => true,
+  )
+  if (!props.open || !chatVisible) return null
+  return (
+    <>
+      {props.resizeHandle || null}
+      {props.panel}
+    </>
+  )
+}
 
 /** V4 权威窗口已出现同文案 userInput 时清掉 pending，避免乐观气泡叠第二次。 */
 function ClearPendingOptimisticOnV4Echo(props: {
@@ -113,7 +140,6 @@ let _v4PrevTurnLive = false
 export function renderChatAppView(ctx: ChatAppViewCtx): ReactNode {
   /* 语音全屏模式：html[data-xw-voice='1'] 时由 CSS 接管整窗（左语音域/右标签区） */
   const [xwVoiceOn, setXwVoiceOn] = useState(() => isXwVoiceMode())
-  const [historyRefreshBusy, setHistoryRefreshBusy] = useState(false)
   useEffect(() => subscribeXwVoiceMode(setXwVoiceOn), [])
   const {
     activateRightStageTab,
@@ -443,22 +469,6 @@ export function renderChatAppView(ctx: ChatAppViewCtx): ReactNode {
     wsClient,
   ])
 
-  const sessionHistoryRefreshButton =
-    !isHomeSurface && !isDeptChatSurface && String(selectedSessionKey || '').trim()
-      ? renderSessionHistoryRefreshButton({
-          busy: historyRefreshBusy,
-          disabled: !String(selectedSessionKey || '').trim(),
-          onRefresh: () => {
-            const sk = String(selectedSessionKey || '').trim()
-            if (!sk || historyRefreshBusy) return
-            setHistoryRefreshBusy(true)
-            void Promise.resolve(onShellRefreshSession(sk))
-              .catch(() => {})
-              .finally(() => setHistoryRefreshBusy(false))
-          },
-        })
-      : null
-
   return (
     <HoverBubbleProvider>
     <div
@@ -527,7 +537,6 @@ export function renderChatAppView(ctx: ChatAppViewCtx): ReactNode {
                   </span>
                 </div>
                 <div className="react-chat-header-right react-chat-header-right--mobile">
-                  {sessionHistoryRefreshButton}
                   {isDesktopTauriRuntime() ? (
                     <>
                       <span className="react-chat-header-win-sep" aria-hidden="true" />
@@ -577,7 +586,6 @@ export function renderChatAppView(ctx: ChatAppViewCtx): ReactNode {
                     {workspaceFolderGroup}
                     <span className="react-chat-header-action-sep" aria-hidden />
                     <div className="react-chat-header-action-group react-chat-header-action-group--global">
-                      {sessionHistoryRefreshButton}
                       {browserToggleButton}
                       {infoRailHeaderToggle}
                       <ChatHeaderHelpMenu />
@@ -642,7 +650,6 @@ export function renderChatAppView(ctx: ChatAppViewCtx): ReactNode {
                   </div>
                   <span className="react-chat-header-action-sep" aria-hidden />
                   <div className="react-chat-header-action-group react-chat-header-action-group--global">
-                  {sessionHistoryRefreshButton}
                   {browserToggleButton}
                   {workspaceFolderToggleButton}
                   <ChatHeaderHelpMenu />
@@ -1872,90 +1879,92 @@ export function renderChatAppView(ctx: ChatAppViewCtx): ReactNode {
             {showChatSummaryFloat
               ? renderChatSummaryPanel(chatPanelMode === 'capsule' ? 'capsule' : 'panel')
               : null}
-            {anyRightPanelOpen && layoutResizeEnabled ? (
-              <PanelResizeHandle
-                direction="vertical"
-                label="拖动调整右侧面板宽度"
-                dragging={rightPanelResizeDragging}
-                onPointerDown={onRightPanelResizePointerDown}
-              />
-            ) : null}
-            {rightStageOpen ? (
-              <RightStagePanel
-                tabs={visibleRightStageTabs}
-                activeKey={rightStageActiveKey}
-                recentClosed={rightStageRecentClosed.filter((entry) =>
-                  filterRightStageTabsForSession(
-                    [entry.tab],
-                    rightStageFilterSessionKey || selectedSessionKey,
-                  ).length > 0,
-                )}
-                onActivateTab={activateRightStageTab}
-                onCloseTab={handleCloseRightStageTab}
-                onCloseOtherTabs={handleCloseOtherRightStageTabs}
-                onCloseAllTabs={handleCloseAllRightStageTabs}
-                onReorderTab={reorderRightStageTab}
-                onReopenClosedTab={reopenRightStageTab}
-                onCollapse={handleCollapseRightStage}
-                launcherItems={rightStageLauncherItems}
-                employeeChatRoles={proactiveRolesDisplay}
-                onPickEmployeeChat={(role) => {
-                  const code = String(role.agent_code || '').trim()
-                  if (!code) return
-                  const roleName =
-                    String(role.agent_name || '').trim() ||
-                    String(role.role_name || '').trim() ||
-                    code
-                  void import('../../../lib/right-stage/open-employee-process-stage.js').then((m) => {
-                    m.openEmployeeProcessInRightStage(
-                      {
-                        taskId: `live:${code}`,
-                        agentCode: code,
-                        roleName,
-                        title: roleName,
-                        busy: false,
-                      },
-                      {
-                        sessionKey: String(selectedSessionKey || '').trim() || undefined,
-                        layout: 'wide',
-                        // 用户从启动器点名：清收起锁，避免折叠态只写签不撑开
-                        forceExpand: true,
-                      },
-                    )
-                  })
-                }}
-                sessionWorkflowTaskId={String(sidebarActiveTaskId || '').trim()}
-                onPickWorkflow={(opt) => {
-                  const tid = String(opt?.taskId || '').trim()
-                  if (!tid) return
-                  void import('../../../lib/right-stage/open-collab-workflow-stage.js').then((m) => {
-                    m.openCollabWorkflowInRightStage(
-                      {
-                        mainTaskId: tid,
-                        leadThreadId: String(opt.leadThreadId || chatThreadIdForSidebar || '').trim(),
-                        title: String(opt.title || '工作流').trim() || '工作流',
-                      },
-                      {
-                        sessionKey: String(selectedSessionKey || '').trim() || undefined,
-                        forceExpand: true,
-                      },
-                    )
-                  })
-                }}
-                onPickAgentApp={(appId) => {
-                  const id = String(appId || '').trim()
-                  if (!id) return
-                  // ctx 是 Record<string, any>，缺 handler 时 TS 不会报错；
-                  // 这里显式兜底，避免点「Agent 应用」时抛 ReferenceError 静默失败。
-                  if (typeof openUiExtensionInStage !== 'function') {
-                    console.error('[chat-app-view] openUiExtensionInStage 未注入')
-                    return
-                  }
-                  openUiExtensionInStage(id)
-                }}
-                renderContent={renderRightStageBody}
-              />
-            ) : null}
+            <ChatOwnedRightStage
+              open={!!rightStageOpen}
+              resizeHandle={
+                anyRightPanelOpen && layoutResizeEnabled ? (
+                  <PanelResizeHandle
+                    direction="vertical"
+                    label="拖动调整右侧面板宽度"
+                    dragging={rightPanelResizeDragging}
+                    onPointerDown={onRightPanelResizePointerDown}
+                  />
+                ) : null
+              }
+              panel={
+                <RightStagePanel
+                  tabs={visibleRightStageTabs}
+                  activeKey={rightStageActiveKey}
+                  recentClosed={rightStageRecentClosed.filter((entry) =>
+                    filterRightStageTabsForSession(
+                      [entry.tab],
+                      rightStageFilterSessionKey || selectedSessionKey,
+                    ).length > 0,
+                  )}
+                  onActivateTab={activateRightStageTab}
+                  onCloseTab={handleCloseRightStageTab}
+                  onCloseOtherTabs={handleCloseOtherRightStageTabs}
+                  onCloseAllTabs={handleCloseAllRightStageTabs}
+                  onReorderTab={reorderRightStageTab}
+                  onReopenClosedTab={reopenRightStageTab}
+                  onCollapse={handleCollapseRightStage}
+                  launcherItems={rightStageLauncherItems}
+                  employeeChatRoles={proactiveRolesDisplay}
+                  onPickEmployeeChat={(role) => {
+                    const code = String(role.agent_code || '').trim()
+                    if (!code) return
+                    const roleName =
+                      String(role.agent_name || '').trim() ||
+                      String(role.role_name || '').trim() ||
+                      code
+                    void import('../../../lib/right-stage/open-employee-process-stage.js').then((m) => {
+                      m.openEmployeeProcessInRightStage(
+                        {
+                          taskId: `live:${code}`,
+                          agentCode: code,
+                          roleName,
+                          title: roleName,
+                          busy: false,
+                        },
+                        {
+                          sessionKey: String(selectedSessionKey || '').trim() || undefined,
+                          layout: 'wide',
+                          forceExpand: true,
+                        },
+                      )
+                    })
+                  }}
+                  sessionWorkflowTaskId={String(sidebarActiveTaskId || '').trim()}
+                  onPickWorkflow={(opt) => {
+                    const tid = String(opt?.taskId || '').trim()
+                    if (!tid) return
+                    void import('../../../lib/right-stage/open-collab-workflow-stage.js').then((m) => {
+                      m.openCollabWorkflowInRightStage(
+                        {
+                          mainTaskId: tid,
+                          leadThreadId: String(opt.leadThreadId || chatThreadIdForSidebar || '').trim(),
+                          title: String(opt.title || '工作流').trim() || '工作流',
+                        },
+                        {
+                          sessionKey: String(selectedSessionKey || '').trim() || undefined,
+                          forceExpand: true,
+                        },
+                      )
+                    })
+                  }}
+                  onPickAgentApp={(appId) => {
+                    const id = String(appId || '').trim()
+                    if (!id) return
+                    if (typeof openUiExtensionInStage !== 'function') {
+                      console.error('[chat-app-view] openUiExtensionInStage 未注入')
+                      return
+                    }
+                    openUiExtensionInStage(id)
+                  }}
+                  renderContent={renderRightStageBody}
+                />
+              }
+            />
           </div>
         </div>
         </section>
