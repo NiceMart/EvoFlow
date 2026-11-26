@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import sys
+import threading
 from collections.abc import Callable
 from datetime import UTC
 from pathlib import Path
@@ -348,14 +349,27 @@ async def run_background_startup(app: FastAPI, st_log: StLogFn, _st: Any) -> Non
     # import chain). 5s lines up with EVOFLOW_LG_MOUNT_DELAY_SEC so first paint
     # + first KB query are both clean.
     async def _warmup_embedding_model() -> None:
-        if os.environ.get("EVOFLOW_SKIP_EMBEDDING_WARMUP", "").strip().lower() in {
+        # Windows：sentence_transformers→sklearn→scipy 冷导入会长时间占 GIL，
+        # 即便丢到专用线程也会把 Gateway 事件循环拖死（重启后对话没反应 /
+        # health 超时 / V4 subscribe_ack 卡死）。默认跳过暖机；需要时设
+        # EVOFLOW_EMBEDDING_WARMUP=1（仍走专用线程，且延迟后再跑）。
+        skip_env = os.environ.get("EVOFLOW_SKIP_EMBEDDING_WARMUP", "").strip().lower()
+        force_on = os.environ.get("EVOFLOW_EMBEDDING_WARMUP", "").strip().lower() in {
             "1",
             "true",
             "yes",
             "on",
-        }:
-            st_log("embedding warmup skipped (EVOFLOW_SKIP_EMBEDDING_WARMUP)")
-            logger.info("Local embedding model warmup skipped (EVOFLOW_SKIP_EMBEDDING_WARMUP)")
+        }
+        if skip_env in {"1", "true", "yes", "on"} or (
+            sys.platform == "win32" and not force_on
+        ):
+            reason = (
+                "EVOFLOW_SKIP_EMBEDDING_WARMUP"
+                if skip_env in {"1", "true", "yes", "on"}
+                else "win32 default (set EVOFLOW_EMBEDDING_WARMUP=1 to enable)"
+            )
+            st_log(f"embedding warmup skipped ({reason})")
+            logger.info("Local embedding model warmup skipped (%s)", reason)
             return
         try:
             skip_reason, model_id = await asyncio.to_thread(resolve_local_embedding_warmup_target)
@@ -363,11 +377,12 @@ async def run_background_startup(app: FastAPI, st_log: StLogFn, _st: Any) -> Non
                 st_log(f"embedding warmup skipped ({skip_reason})")
                 logger.info("Local embedding model warmup skipped: %s", skip_reason)
                 return
-            delay_raw = os.environ.get("EVOFLOW_EMBEDDING_WARMUP_DELAY_SEC", "5").strip()
+            # Default 20s：先让 /health + V4 subscribe 通了再暖机，避免重启后对话「没反应」。
+            delay_raw = os.environ.get("EVOFLOW_EMBEDDING_WARMUP_DELAY_SEC", "20").strip()
             try:
                 delay_sec = max(0.0, float(delay_raw))
             except ValueError:
-                delay_sec = 5.0
+                delay_sec = 20.0
             if delay_sec > 0:
                 st_log(f"embedding warmup scheduled in {delay_sec:.0f}s")
                 await asyncio.sleep(delay_sec)
@@ -378,16 +393,51 @@ async def run_background_startup(app: FastAPI, st_log: StLogFn, _st: Any) -> Non
             st_log(f"embedding warmup start ({model_id})")
             logger.info("Local embedding model warmup starting (hub=%s, model=%s)", hub, model_id)
             _t_embed = _st.perf_counter()
-            # Run directly on the event loop — NOT via asyncio.to_thread —
-            # which would dispatch to the ThreadPoolExecutor and trigger a
-            # scipy.linalg._fblas native .pyd cold-load that hangs on Windows
-            # (Windows DLL loader + ThreadPoolExecutor worker threads deadlock).
-            # warmup_local_model uses _load_model_sync (pure sync, no to_thread),
-            # so this blocks the event loop but loads sklearn/scipy in the main
-            # thread where the DLL loader is ready. After warmup, _model_cache
-            # is populated so subsequent _load_model calls skip to_thread.
+            # 绝不能在事件循环上同步 import/load sentence_transformers→sklearn→scipy：
+            # 冷启动可达数十秒，表现为 health 超时、V4 subscribe_ack 卡死、对话没反应
+            # （hang: background_startup._warmup_embedding_model → warmup_local_model）。
+            # 也不走 asyncio.to_thread（默认 ThreadPoolExecutor 在 Windows 上曾与
+            # scipy._fblas .pyd 冷加载死锁）。专用 daemon 线程仍可能因 GIL/import 锁
+            # 拖慢 event loop（2026-11-17 hang 186s）；代码索引重建已改子进程隔离。
+            # 暖机仍用专用线程：堵的是暖机路径，至少不占默认线程池。
+            loop = asyncio.get_running_loop()
+            done: asyncio.Future[None] = loop.create_future()
+
+            def _warmup_in_dedicated_thread() -> None:
+                try:
+                    warmup_local_model(model_id)
+                except Exception as exc:
+                    # 【self-evolution-bot · 2026-11-20 · 第87轮 · 模型:deepseek-v4.1-flash-1017】
+                    # 改了什么：先把异常绑到闭包外的局部变量，再让 `_fail` 使用它。
+                    # 为什么：`except ... as exc` 的 `exc` 在 except 块结束时被 Python **自动解绑**
+                    #   （PEP 3110，为打断 traceback 引用环），而 `_fail` 是经
+                    #   `loop.call_soon_threadsafe` **稍后**在事件循环线程里才执行的闭包 ——
+                    #   届时 `exc` 已不存在，`done.set_exception(exc)` 抛 NameError，
+                    #   被 call_soon 的默认异常处理器吞掉 → `done` 永不完结 → 第 428 行
+                    #   `await done`（无超时）**永久挂起**，表现为启动暖机卡死 / health 迟迟不就绪。
+                    #   这正是本函数上方注释反复警告的那类 hang，只是发生在失败分支上。
+                    # 判据：ruff F821 Undefined name `exc` 即命中；纯同步调用看不出（同步调用时 exc 还在）。
+                    _exc = exc
+
+                    def _fail() -> None:
+                        if not done.done():
+                            done.set_exception(_exc)
+
+                    loop.call_soon_threadsafe(_fail)
+                else:
+                    def _ok() -> None:
+                        if not done.done():
+                            done.set_result(None)
+
+                    loop.call_soon_threadsafe(_ok)
+
+            threading.Thread(
+                target=_warmup_in_dedicated_thread,
+                name="evoflow-embedding-warmup",
+                daemon=True,
+            ).start()
             try:
-                warmup_local_model(model_id)
+                await done
             except Exception:
                 st_log("embedding warmup failed (non-fatal)")
                 logger.debug("Local embedding model warmup failed (non-fatal)", exc_info=True)
@@ -1034,7 +1084,9 @@ async def run_post_ready_warmups(app: FastAPI, st_log: StLogFn, _st: Any) -> Non
                 logger.info("[Gateway] post-ready: waiting on langgraph_ready_event before starting channels")
                 try:
                     await asyncio.wait_for(langgraph_ready_event.wait(), timeout=_LANGGRAPH_READY_WAIT_TIMEOUT_S)
-                except asyncio.TimeoutError:
+                # 【self-evolution-bot · 2026-11-20 · 第70轮】
+                # 3.11+ 起 asyncio.TimeoutError 就是内置 TimeoutError 的别名（UP041）。
+                except TimeoutError:
                     logger.error(
                         "[Gateway] post-ready: langgraph_ready_event not set within %ss — starting channels anyway (degraded)",
                         _LANGGRAPH_READY_WAIT_TIMEOUT_S,
@@ -1192,7 +1244,23 @@ async def run_post_ready_warmups(app: FastAPI, st_log: StLogFn, _st: Any) -> Non
         from evoflow.persistence.db import run_deferred_full_preflight
 
         _t_full = _st.perf_counter()
-        results = await asyncio.to_thread(run_deferred_full_preflight, base_dir=get_paths().base_dir)
+        # 【self-evolution-bot · 2026-11-20 · 第70轮 · 模型:deepseek-v4.1-flash-1017】
+        # 原来这里是 asyncio.to_thread(...) —— 走**默认** ThreadPoolExecutor，
+        # 而 run_deferred_full_preflight 对 3 个库做全量 PRAGMA integrity_check
+        # + WAL truncate（现网 evoflow.db 3.14GB、observability.db 2.46GB），
+        # 实测占住默认池 **5 分 14 秒**（2026-11-20 07:32:17→07:37:31）。
+        # 同时段的端点全部走同一个默认池（routers/mcp.py:167、
+        # routers/tasks.py:868 …），于是被饿死：
+        #   /api/tasks        排队 10s → tasks_catalog_timeout → 503（07:35:05）
+        #   /api/mcp/config   正常 47ms，实际等到 26s 才回（07:35:24）
+        #   /api/knowledge/owned/bases  7.7s
+        # 判据是 lag_s=0.000 —— 事件循环没被阻塞，是线程池空转，
+        # 所以这不是「事件循环卡住」，改 asyncio 调度没用，必须换池。
+        # 修法：挪到 db_async 的专用池（thread_name_prefix=evoflow-db，8 worker），
+        # 让维护性重活与请求路径隔离——与第36轮 transcript/assets 落库同一个模式。
+        from app.gateway.db_async import run_db
+
+        results = await run_db(run_deferred_full_preflight, base_dir=get_paths().base_dir)
         st_log(f"post-ready full db preflight ({(_st.perf_counter() - _t_full) * 1000:.0f}ms) {results}")
         logger.info("Deferred full DB preflight done: %s", results)
     except Exception:

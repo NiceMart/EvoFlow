@@ -74,8 +74,20 @@ def _acquire_process_db_lock() -> bool:
         return False
     if _on_asyncio_loop_thread():
         if not _lock.acquire(timeout=_ASYNCIO_LOCK_TIMEOUT_S):
+            # 【self-evolution-bot · 2026-11-19 · 第58轮 · 模型:deepseek-v4.1-flash-1017】
+            # 改了什么：文案不再以 ``database is locked`` 开头，改成自曝「这是进程内线程锁」
+            # 并给出唯一正确的下一步（重试），同时保留原文案作检索词。
+            # 为什么：这句话的成因**不是** sqlite 库锁，而是本进程内 Python ``RLock`` 没抢到；
+            # 同一个库里 sqlite 自己的 busy 会等 60s（busy_timeout），这里 0.5s 就抛。
+            # 现网实证：2026-11-17 四次，模型（我自己）看到 ``database is locked`` 的第一反应
+            # 是去查「库文件是不是被别的进程占了」——查了一圈全错，白绕一步。
+            # 判据：错误文案是模型唯一能据以行动的东西，写错成因 = 直接误导动作。
             raise sqlite3.OperationalError(
-                f"database is locked (asyncio thread waited {_ASYNCIO_LOCK_TIMEOUT_S:.2f}s for process lock)"
+                "db_process_lock_timeout: 另一个线程正持有进程内数据库锁（不是 sqlite 的库文件锁，"
+                "不要去找别的进程/删 .db-wal）；等 "
+                f"{_ASYNCIO_LOCK_TIMEOUT_S:.2f}s 未拿到，"
+                "直接重试这条操作即可 —— 原错误：database is locked "
+                f"(asyncio thread waited {_ASYNCIO_LOCK_TIMEOUT_S:.2f}s for process lock)"
             )
         return True
     _lock.acquire()
@@ -560,8 +572,18 @@ def _open_shared_connection(path: Path) -> sqlite3.Connection:
 
 
 def run_db_with_retry[T](fn: Callable[[], T], *, max_attempts: int | None = None) -> T:
-    """Run a DB closure with process lock + sqlite busy / stale-cursor retry."""
+    """Run a DB closure with process lock + sqlite busy / stale-cursor retry.
+
+    On the asyncio event-loop thread, busy/locked errors are NOT retried with
+    ``time.sleep``: the 0.5s lock fail-fast in ``_acquire_process_db_lock``
+    exists precisely so the loop never waits on a long writer, and sleeping
+    here (up to ~12s across 8 attempts) would defeat it and freeze the whole
+    Gateway (2026-11-15 298s hang variant). Callers on the loop must offload
+    to a worker thread (``asyncio.to_thread`` / ``db_async.run_db``) to get
+    retry semantics.
+    """
     attempts = _DEFAULT_MAX_ATTEMPTS if max_attempts is None else max_attempts
+    on_loop = _on_asyncio_loop_thread()
     last: BaseException | None = None
     for attempt in range(max(1, int(attempts))):
         try:
@@ -570,6 +592,8 @@ def run_db_with_retry[T](fn: Callable[[], T], *, max_attempts: int | None = None
         except sqlite3.OperationalError as e:
             last = e
             if not _is_sqlite_busy_error(e) or attempt >= attempts - 1:
+                raise
+            if on_loop:
                 raise
             delay = min(0.05 * (2**attempt), 2.5)
             logger.debug(
@@ -871,8 +895,11 @@ def _skip_observability_startup_preflight() -> bool:
 def preflight_database_startup(path: Path, *, label: str = "") -> bool:
     """Fast boot path: ``quick_check`` + passive WAL checkpoint (never blocks on multi-GB integrity_check).
 
-    Full ``integrity_check`` + TRUNCATE repair runs in background via
-    :func:`schedule_deferred_full_preflight` after ``ready to serve``.
+    A cheap ``quick_check`` + PASSIVE checkpoint runs in background via
+    :func:`run_deferred_full_preflight` after ``ready to serve``.
+    Full ``integrity_check`` is opt-in only (``EVOFLOW_STARTUP_DB_PREFLIGHT=full``):
+    on 2026-11-20 it cost 5m14s of default-pool time on 5.6GB of databases.
+    【self-evolution-bot · 2026-11-20 · 第70轮】
     """
     tag = label or path.name
     mode = _startup_preflight_mode()
@@ -1011,8 +1038,80 @@ def preflight_database(path: Path, *, label: str = "") -> bool:
                 pass
 
 
+def preflight_database_deferred(path: Path, *, label: str = "") -> bool:
+    """Post-``ready to serve`` background check — intentionally the CHEAP variant.
+
+    【self-evolution-bot · 2026-11-20 · 第70轮 · 模型:deepseek-v4.1-flash-1017】
+    改了什么：延后全量 preflight 从 ``preflight_database``（full integrity_check +
+    WAL TRUNCATE）换成 ``quick_check`` + ``PASSIVE`` checkpoint。
+    为什么：2026-11-20 07:32:17→07:37:31 现网日志空窗 5 分 14 秒，期间默认线程池被
+    这条 preflight 独占，``/api/tasks`` 排队 10s 直接 503、``/api/mcp/config`` 等到 26s。
+    换池只能解排队，不能让这 5 分钟消失——第36轮已记「差值消失不等于路径变轻」，
+    所以必须同时把它本身变轻。实测（2026-11-20，只读打开）：
+      evoflow.db 3217MB  quick_check  9441ms
+      observability.db 2460MB quick_check 13366ms
+    对照 full integrity_check + TRUNCATE 的 314s，降两个数量级。
+    为什么敢降级：``PRAGMA integrity_check`` 是**诊断**不是**修复**，它发现损坏也只会
+    打日志然后 degraded 运行；启动期已由 ``preflight_database_startup`` 做过 quick_check。
+    真要全量仍可用 ``EVOFLOW_STARTUP_DB_PREFLIGHT=full`` 显式开启（保留逃生舱）。
+    遥测库默认直接跳过：它是可丢弃的（retention 每日裁剪），不值得为它每次启动扫 2.4GB。
+    """
+    tag = label or path.name
+    mode = _startup_preflight_mode()
+    if mode == "skip":
+        return True
+    if mode == "full":
+        # 显式要求全量时才跑 integrity_check + TRUNCATE（启动期 5 分钟级的老行为）。
+        return preflight_database(path, label=label)
+    if _skip_observability_startup_preflight() and (
+        "observability" in tag.lower() or "observability" in str(path).lower()
+    ):
+        logger.info(
+            "deferred preflight: %s skipped (telemetry DB; disposable)", tag
+        )
+        return True
+
+    if not path.is_file():
+        return True
+
+    conn: sqlite3.Connection | None = None
+    t0 = time.perf_counter()
+    try:
+        conn = sqlite3.connect(str(path), timeout=10.0)
+        conn.execute("PRAGMA busy_timeout=3000")
+        result = _quick_check(conn)
+        if result != "ok":
+            logger.error("deferred preflight: %s quick_check FAILED: %s", tag, result[:500])
+            return False
+        try:
+            _wal_checkpoint_passive(conn)
+        except sqlite3.OperationalError as exc:
+            logger.debug("deferred preflight: %s passive checkpoint failed: %s", tag, exc)
+        logger.info(
+            "deferred preflight: %s quick_check=ok size=%.1fMB elapsed=%.0fms",
+            tag,
+            _db_size_mb(path),
+            (time.perf_counter() - t0) * 1000.0,
+        )
+        return True
+    except Exception as exc:
+        logger.error("deferred preflight: %s unexpected error: %s", tag, exc, exc_info=True)
+        return False
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def run_deferred_full_preflight(*, base_dir: Path | None = None) -> dict[str, bool]:
-    """Background full ``integrity_check`` + TRUNCATE WAL (post ``ready to serve``)."""
+    """Background DB health pass (post ``ready to serve``) — cheap by design.
+
+    Runs :func:`preflight_database_deferred` per database: ``quick_check`` plus a
+    PASSIVE WAL checkpoint. The old full ``integrity_check`` + ``wal_checkpoint
+(TRUNCATE)`` version is still reachable via ``EVOFLOW_STARTUP_DB_PREFLIGHT=full``.
+    """
     from evoflow.config.data_paths import (
         checkpoints_db_path,
         observability_db_path,
@@ -1040,7 +1139,7 @@ def run_deferred_full_preflight(*, base_dir: Path | None = None) -> dict[str, bo
     results: dict[str, bool] = {}
     for label, db_path in paths:
         try:
-            ok = preflight_database(db_path, label=label)
+            ok = preflight_database_deferred(db_path, label=label)
             results[label] = ok
         except Exception:
             logger.exception("deferred full preflight failed: %s", label)
@@ -1048,11 +1147,13 @@ def run_deferred_full_preflight(*, base_dir: Path | None = None) -> dict[str, bo
     return results
 
 
-def checkpoint_all_databases() -> dict[str, dict[str, int]]:
-    """Run ``PRAGMA wal_checkpoint(TRUNCATE)`` on all 3 SQLite databases.
+def checkpoint_all_databases(mode: str = "truncate") -> dict[str, dict[str, int]]:
+    """Run ``PRAGMA wal_checkpoint`` on all 3 SQLite databases.
 
-    Called periodically (~hourly) by the data retention scheduler to prevent
-    WAL files from growing unbounded. Returns a summary dict per database.
+    ``mode="truncate"``（默认，保持旧行为）回收 WAL 磁盘空间但需短暂独占——
+    与写繁忙互锁（成功=写排队窗口，失败=WAL 继续膨胀）。``mode="passive"``
+    不阻塞写入方，适合常规整点例行 checkpoint；磁盘回收交给尺寸保险触发的
+    TRUNCATE。Called periodically (~hourly) by the data retention scheduler.
     """
     from evoflow.config.data_paths import (
         checkpoints_db_path,
@@ -1083,7 +1184,10 @@ def checkpoint_all_databases() -> dict[str, dict[str, int]]:
         try:
             conn = sqlite3.connect(str(path), timeout=30.0)
             conn.execute("PRAGMA busy_timeout=5000")
-            busy, log_frames, ckpt_frames = _wal_checkpoint_truncate(conn)
+            if mode == "passive":
+                busy, log_frames, ckpt_frames = _wal_checkpoint_passive(conn)
+            else:
+                busy, log_frames, ckpt_frames = _wal_checkpoint_truncate(conn)
             summary[label] = {"busy": busy, "log": log_frames, "checkpointed": ckpt_frames}
             logger.debug(
                 "wal_checkpoint %s: busy=%s log=%s checkpointed=%s",

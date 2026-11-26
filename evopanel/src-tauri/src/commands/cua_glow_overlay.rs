@@ -9,7 +9,7 @@
 use std::sync::Mutex;
 use std::time::Duration;
 
-use tauri::{LogicalPosition, LogicalSize, Manager, WebviewUrl, WebviewWindow};
+use tauri::{Emitter, LogicalPosition, LogicalSize, Manager, WebviewUrl, WebviewWindow};
 
 #[cfg(target_os = "windows")]
 use crate::commands::browser_cdp_server;
@@ -22,23 +22,101 @@ mod browser_cdp_server {
     }
 }
 
+/// 提示条窗口 label **前缀**。
+///
+/// 【self-evolution-bot · 2026-11-19 · 第73轮 · 模型:deepseek-v4.1-flash-1017】
+/// 改了什么：固定 label `cua-glow-0` → 每次重建递增的 `cua-glow-<n>`，
+/// 并新增 `OVERLAY_ACTIVE_LABEL` 记住「当前这一个」。
+///
+/// 为什么（现网取证，17 次 show 全失败）：
+///   ```
+///   destroy zombie overlay (dead/missing hwnd)
+///   → overlay label still present after close → force destroy
+///   → WARN overlay label STILL present after destroy   ← 永久残留
+///   → create CUA operation indicator failed: a webview with label `cua-glow-0` already exists
+///   ```
+/// `close()` / `destroy()` 都只是**投递**请求，Tauri 的 webview 注册表要等 tao
+/// 事件循环回收才移除 label。一旦某次回收失败（面板刚启动、CPU 被 CDP 桥等占满时
+/// 很容易），`already exists` 就变成**永久死锁**：之后每次 build 都撞同一个名字，
+/// 而失败又不清理 ⇒ 用户从此再也看不到提示条（本次实测就是这样）。
+///
+/// 唯一化后：撞名字最多浪费一个序号，下一次换新名字必然建成 ——
+/// 把「不可恢复的永久死锁」降级为「最多多试一次」。
+const OVERLAY_LABEL_PREFIX: &str = "cua-glow-";
+/// 兼容老名字（首次仍从 0 开始，便于跟历史日志对照）。
 const OVERLAY_LABEL: &str = "cua-glow-0";
-/// 对齐 ZCode indicatorWindowSize（中文 234 卡宽 + shadow inset）。
-const OVERLAY_WIDTH: f64 = 250.0;
+/// 窗口尺寸。
+///
+/// 【self-evolution-bot · 2026-11-19 · 第68轮 · 模型:deepseek-v4.1-flash-1017】
+/// 原来是 ZCode 的 250x56（只有一句固定文案，够用）。本轮卡片里多了
+/// 「当前步骤」+「第 N 步」+「解除控制」按钮，按 13px 实测排版需要约 420px：
+///   主文案 134 + 步骤 104 + 步数 40 + 按钮 62 + 呼吸点 18 + 间隙 36 + 内边距 26
+/// 250px 会把主文案压成「EvoFlow 正在…」，等于没解决用户的问题。
+/// 高度同理：56 - 上下 padding 18 = 38px，装不下 44px 卡片，会被 overflow 裁掉。
+// 圆形胶囊 HUD：dots + 步骤标题 + 「第 N 步」+ 秒数 + 「解除控制」。
+// 标题要看得见，窗口不能再缩到 280；560 给步骤段约 180px 富余。
+const OVERLAY_WIDTH: f64 = 560.0;
 const OVERLAY_HEIGHT: f64 = 56.0;
 const CARD_TOP_OFFSET: f64 = 12.0;
 const SHADOW_INSET_TOP: f64 = 6.0;
 
 struct OverlayState {
     window_created: bool,
+    /// 当前真正在用的 label（唯一化后的）。空 = 还没有活窗口。
+    /// 【self-evolution-bot · 2026-11-19 · 第73轮】所有「查当前窗口」的地方都走它，
+    /// 不再拿固定名字去扫注册表 —— 注册表里可能同时躺着几个已死 label。
+    active_label: String,
+    /// 已用过的最大序号，保证 label 单调递增、绝不复用。
+    seq: u32,
 }
 
 static OVERLAY_STATE: Mutex<OverlayState> = Mutex::new(OverlayState {
     window_created: false,
+    active_label: String::new(),
+    seq: 0,
 });
 
+/// 取当前活跃窗口。**先信 `active_label`，不扫注册表**。
+fn active_overlay(app: &tauri::AppHandle) -> Option<WebviewWindow> {
+    let label = {
+        let st = OVERLAY_STATE.lock().ok()?;
+        st.active_label.clone()
+    };
+    if label.is_empty() {
+        return None;
+    }
+    app.get_webview_window(&label)
+}
+
+/// 分配下一个唯一 label。
+fn next_overlay_label() -> String {
+    let mut st = match OVERLAY_STATE.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let label = if st.seq == 0 {
+        OVERLAY_LABEL.to_string()
+    } else {
+        format!("{OVERLAY_LABEL_PREFIX}{}", st.seq)
+    };
+    st.seq = st.seq.saturating_add(1);
+    st.active_label = label.clone();
+    label
+}
+
 fn glow_log(msg: impl AsRef<str>) {
-    browser_cdp_server::log_line(&format!("[cua-glow] {}", msg.as_ref()));
+    let m = msg.as_ref();
+    // 常规成功线（hide ok / after-show visible=true …）默认不记——曾实测 2646 行/天
+    // 全是同样两行；异常线（visible=false / fail / missing / error，历史排障的关键信号）
+    // 保持可见。全量回开：EVOFLOW_CUA_GLOW_LOGS=1。
+    let anomalous = m.contains("visible=false")
+        || m.contains("fail")
+        || m.contains("missing")
+        || m.contains("error");
+    if !anomalous && !super::log_files::env_flag_enabled("EVOFLOW_CUA_GLOW_LOGS") {
+        return;
+    }
+    browser_cdp_server::log_line(&format!("[cua-glow] {m}"));
 }
 
 fn overlay_logical_position(app: &tauri::AppHandle) -> Result<LogicalPosition<f64>, String> {
@@ -86,44 +164,409 @@ fn overlay_logical_position(app: &tauri::AppHandle) -> Result<LogicalPosition<f6
     Ok(LogicalPosition::new(x, y))
 }
 
-fn apply_overlay_chrome(window: &WebviewWindow) {
-    let _ = window.set_ignore_cursor_events(true);
-    let _ = window.set_always_on_top(true);
-}
-
-/// ``build()`` 常在 HWND 就绪前返回（同 browser_embed）；轮询到真实窗口再继续。
+/// 让提示条窗口**永不成为前台窗口**。
+///
+/// 【self-evolution-bot · 2026-11-22 · 第N轮 · 模型:deepseek-v4.1-flash-1017】
+/// 病灶：CUA 的鼠标手势（`left_click_drag` 等「原始前台事件」）必须发给**当前前台
+/// 应用**，否则 node-repl-host 直接拒绝并回那句
+/// `raw foreground event for app_ref pid X was refused because the live frontmost
+/// application is pid Y. action_sent=false`。
+///
+/// 实测拿到的那句里的 pid Y 就是**面板自己**：`evoflow` 进程，窗口标题
+/// "EvoFlow Computer Use" —— 也就是本文件这个提示条。每次 `cua_glow_overlay_show`
+/// 里的 `window.show()` 都会把它推成前台（`ShowWindow(SW_SHOW)` 带激活语义），
+/// 于是紧随其后的拖拽/点击全部被判定「目标不在前台」，动作根本没发出去。
+/// 表现就是用户看到的「工具坏了、画图没反应、一直重试」。
+///
+/// 修法：抄同仓 `cua_glow_ring.rs`（原生分层环）已验证的做法 ——
+/// `WS_EX_NOACTIVATE`（点了也不激活、show 也不抢前台）+ `WS_EX_TOOLWINDOW`
+/// （不进任务栏、不参与 Alt-Tab）。设置后 `ShowWindow(SW_SHOW)` 不再激活窗口，
+/// 提示条照常可见、置顶、能收鼠标（「解除控制」按钮靠 WM_LBUTTONDOWN 即可，
+/// 不需要焦点；ESC 解除是物理键轮询，也不依赖焦点）。
 #[cfg(target_os = "windows")]
-fn wait_overlay_hwnd(window: &WebviewWindow, timeout: Duration) -> Result<(), String> {
-    use windows::Win32::UI::WindowsAndMessaging::IsWindow;
-    let deadline = std::time::Instant::now() + timeout;
-    let mut last_err = String::from("not ready");
-    while std::time::Instant::now() < deadline {
-        match window.hwnd() {
-            Ok(h) if unsafe { IsWindow(Some(h)).as_bool() } => return Ok(()),
-            Ok(_) => last_err = "IsWindow=false".into(),
-            Err(e) => last_err = e.to_string(),
+fn apply_noactivate(window: &WebviewWindow) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    };
+    let Ok(hwnd) = window.hwnd() else {
+        // 建窗初期 HWND 还没推出来是正常现象；show() 之后 chrome 会再调一次。
+        return;
+    };
+    let h = HWND(hwnd.0 as *mut _);
+    unsafe {
+        let cur = GetWindowLongPtrW(h, GWL_EXSTYLE);
+        let want = cur | (WS_EX_NOACTIVATE.0 as isize) | (WS_EX_TOOLWINDOW.0 as isize);
+        if want != cur {
+            SetWindowLongPtrW(h, GWL_EXSTYLE, want);
         }
-        std::thread::sleep(Duration::from_millis(40));
     }
-    Err(format!("CUA indicator hwnd timeout: {last_err}"))
 }
 
 #[cfg(not(target_os = "windows"))]
-fn wait_overlay_hwnd(_window: &WebviewWindow, _timeout: Duration) -> Result<(), String> {
-    Ok(())
+fn apply_noactivate(_window: &WebviewWindow) {}
+
+fn apply_overlay_chrome(window: &WebviewWindow) {
+    // 第一件事就是摘掉「会抢前台」的属性：它必须在任何 show/set_always_on_top 之前生效。
+    apply_noactivate(window);
+    // 【self-evolution-bot · 2026-11-19 · 第68轮 · 模型:deepseek-v4.1-flash-1017】
+    // 原来无条件 `set_ignore_cursor_events(true)`（整窗穿透）——「解除控制」按钮
+    // 永远点不到，这是用户「不知道怎么解除控制」的直接原因之一。
+    //
+    // 但**不能简单改成 false**：这块条悬在屏幕顶部居中，正好压在窗口标题栏/标签栏上，
+    // 而 CUA 恰恰要往那里点。整窗收事件 = 指示条吃掉它正在指示的那次点击，
+    // 等于自己把自动化弄坏。
+    // CSS `pointer-events:none` 也救不了：WebView2 是不透明子窗口，OS 层照样
+    // 把这个矩形的点击交给我们，只是不再派发到 DOM。
+    //
+    // 所以这里改成**默认穿透**，只由 `spawn_stop_button_hit_test_thread` 在光标真的
+    // 落在按钮矩形上时临时关掉穿透。按钮以外区域一律不抢事件。
+    let _ = window.set_ignore_cursor_events(true);
+    let _ = window.set_always_on_top(true);
+
+    // 【self-evolution-bot · 2026-11-19 · 第70轮 · 模型:deepseek-v4.1-flash-1017】
+    // 对齐 ZCode `created.setContentProtection(true)`。
+    // 为什么对 CUA 尤其重要：AI 是靠**截图**判断该点哪里的。提示条与蓝光环如果
+    // 出现在它自己的截图里，就会污染它自己的判断——亮线被当成 UI 边缘、按钮被
+    // 当成可点目标，直接诱发误点。
+    // `WDA_EXCLUDEFROMCAPTURE` 让本窗口对截屏/录屏不可见（人眼照常可见），
+    // 正是 Electron `setContentProtection(true)` 在 Windows 上的等价实现。
+    //
+    // 【self-evolution-bot · 2026-11-20 · 第91轮 · 模型:deepseek-v4.1-flash-1017】
+    // 反转默认值（第70轮原实现设错前提）："人眼照常可见"在**远程控制**下不成立。
+    // `WDA_EXCLUDEFROMCAPTURE` 会把窗口挡在**一切**抓屏之外，而远程串流本身就是抓屏
+    // （桌面复制/DXGI 捕获），于是远端**完全看不到**提示条与「解除控制」按钮 →
+    // 用户以为系统坏了。本轮实测坐实：提示条 affinity=0x11、A/B 像素差 0/35840、
+    // 自建双窗口对照（一个设 WDA 一个不设）红白分明；本机跑着网易UU远程
+    // （GameViewerServer / MiniHomePagePro），且 SM_REMOTESESSION=0 —— RDP 检测
+    // 对第三方远程无效，没法自动判"正在被远程"，只能靠默认值取"看得见"。
+    // 取舍：截图污染是**可控的次要问题**（提示条固定在顶部居中 560x64、蓝环是描边，
+    // AI 一眼可辨）；"用户看不见"是**不可控的主要问题**（功能等于不存在）。
+    // 默认不排除；需要纯净截图的自动化场景设 EVOFLOW_CUA_GLOW_CAPTURABLE=0。
+    let capturable = std::env::var("EVOFLOW_CUA_GLOW_CAPTURABLE")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    #[cfg(target_os = "windows")]
+    if !capturable {
+        if let Ok(hwnd) = window.hwnd() {
+            use windows::Win32::Foundation::HWND;
+            use windows::Win32::UI::WindowsAndMessaging::{
+                SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE,
+            };
+            let _ = unsafe {
+                SetWindowDisplayAffinity(
+                    HWND(hwnd.0 as *mut core::ffi::c_void),
+                    WDA_EXCLUDEFROMCAPTURE,
+                )
+            };
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = capturable;
 }
 
-fn destroy_zombie_overlay(app: &tauri::AppHandle) {
-    if let Some(window) = app.get_webview_window(OVERLAY_LABEL) {
-        glow_log("destroy zombie overlay (dead/missing hwnd)");
+/// 把当前步骤 / 已执行步数推给提示条页面。
+fn push_overlay_step(
+    window: &WebviewWindow,
+    step: &str,
+    steps_done: i64,
+    elapsed_ms: i64,
+    running: bool,
+) -> bool {
+    // running=true 且 elapsed=0 也要放行：刚起表时必须把秒表锚点推到页面，
+    // 否则「步骤还没文案」时秒数永远起不来。
+    if step.is_empty() && steps_done <= 0 && elapsed_ms <= 0 && !running {
+        return false;
+    }
+    let step_js = serde_json::to_string(step).unwrap_or_else(|_| String::from("\"\""));
+    // 【self-evolution-bot · 2026-11-19 · 第72轮 · 模型:deepseek-v4.1-flash-1017】
+    // 多带 elapsed_ms + running：秒数由**页面自己**每秒走，不能靠轮询推 ——
+    // 步骤文案不变时 updateCuaGlowStep 会早退（省 eval），靠它推时长会冻住。
+    // running=false 时页面停表（grace 期间不再涨），避免「已停止但秒数还在跳」。
+    let js = format!(
+        "window.__cuaGlowOverlay&&window.__cuaGlowOverlay.setStep&&window.__cuaGlowOverlay.setStep({step_js},{steps_done},{elapsed_ms},{running})"
+    );
+    window.eval(&js).is_ok()
+}
+
+/// 【self-evolution-bot · 2026-11-19 · 第68轮 · 模型:deepseek-v4.1-flash-1017】
+/// 「解除控制」按钮的点击热区（逻辑像素，相对窗口右上角）。
+///
+/// 为什么要热区而不是整窗收事件：这块条悬在屏幕顶部居中，正压在窗口标题栏上，
+/// 而 CUA 就要往那里点；整窗收事件会把自动化自己的点击吃掉。
+///
+/// 数值对齐圆形胶囊「解除控制」按钮，并刻意放大热区：
+/// AI 光标热点与可视箭头有偏移，过紧的热区会表现为「看着点上了却没反应」。
+///   body 右 padding 8 + 胶囊右 padding 6 = 14
+///   热区宽/高比可视按钮多一圈余量。
+const STOP_BTN_RIGHT_INSET: f64 = 8.0;
+const STOP_BTN_WIDTH: f64 = 96.0;
+const STOP_BTN_HEIGHT: f64 = 40.0;
+const HIT_TEST_INTERVAL_MS: u64 = 80;
+/// 窗口不可见时的空转间隔（只读一次 is_visible，几乎无成本）。
+const HIT_TEST_IDLE_MS: u64 = 400;
+
+/// 光标是否落在这条提示条的「解除控制」按钮上。
+///
+/// 提示条贴在**光标所在显示器**顶部居中，所以热区在屏幕坐标里的位置是不固定的，
+/// 每次都要用窗口当前的位置现算，不能缓存。
+#[cfg(target_os = "windows")]
+fn cursor_on_stop_button(window: &WebviewWindow) -> bool {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+    let (outer_pos, outer_size) = match (window.outer_position(), window.outer_size()) {
+        (Ok(p), Ok(s)) => (p, s),
+        _ => return false,
+    };
+    let mut pt = POINT::default();
+    if unsafe { GetCursorPos(&mut pt) }.is_err() {
+        return false;
+    }
+    // outer_* 是物理像素，OVERLAY_* 是逻辑像素 —— 用窗口自身比例换算，避免多显示器缩放误判。
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let btn_w = STOP_BTN_WIDTH * scale;
+    let btn_h = STOP_BTN_HEIGHT * scale;
+    let inset = STOP_BTN_RIGHT_INSET * scale;
+    let win_w = outer_size.width as f64;
+    let win_h = outer_size.height as f64;
+    // 竖直居中，水平贴右
+    let bx0 = outer_pos.x as f64 + win_w - inset - btn_w;
+    let bx1 = outer_pos.x as f64 + win_w - inset;
+    let by0 = outer_pos.y as f64 + (win_h - btn_h) / 2.0;
+    let by1 = by0 + btn_h;
+    let cx = pt.x as f64;
+    let cy = pt.y as f64;
+    cx >= bx0 && cx <= bx1 && cy >= by0 && cy <= by1
+}
+
+#[cfg(not(target_os = "windows"))]
+fn cursor_on_stop_button(_window: &WebviewWindow) -> bool {
+    // 非 Windows 保持原行为：整窗穿透，不提供按钮点击。
+    true
+}
+
+/// 按光标位置动态开关鼠标穿透：只有真压在按钮上时才收事件。
+///
+/// 【self-evolution-bot · 2026-11-19 · 第68轮】用轮询而不是低级鼠标钩子：
+/// 这只在提示条可见期间跑（隐藏即退出），80ms 一次 GetCursorPos 开销可忽略；
+/// 挂钩子要处理全局线程与卸载，风险远大于收益。
+/// 是否已有热区轮询线程在跑（进程生命周期内常驻一条，避免 show/hide 之间抢跑）。
+static HIT_TEST_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 常驻轮询：窗口可见时才判断光标位置，不可见时保持整窗穿透。
+///
+/// 【self-evolution-bot · 2026-11-19 · 第68轮】为什么不做「隐藏即退出、下次 show 再拉起」：
+/// 退出与下一次 show 之间存在窗口期 —— show 看到标志还是 true 就不拉新线程，
+/// 旧线程紧接着把标志清掉，结果没人再轮询，按钮永久点不动。
+/// 常驻一条线程最简单也最稳：隐藏时只是每 80ms 读一次 is_visible，开销可忽略。
+fn spawn_stop_button_hit_test_thread(app: tauri::AppHandle) {
+    let mut last: Option<bool> = None;
+    let mut esc_was_down = false;
+    loop {
+        // 【self-evolution-bot · 2026-11-19 · 第68轮】每次现查窗口：
+        // destroy_zombie_overlay 会 close()+重建，抓着旧 handle 会一直对着死窗口，
+        // 结果重建后的新窗永远点不动。
+        let window = active_overlay(&app);
+        let Some(window) = window else {
+            last = None;
+            esc_was_down = false;
+            std::thread::sleep(Duration::from_millis(HIT_TEST_IDLE_MS));
+            continue;
+        };
+        let visible = window.is_visible().unwrap_or(false);
+        let want_events = if visible {
+            cursor_on_stop_button(&window)
+        } else {
+            false
+        };
+        if last != Some(want_events) {
+            // 光标在按钮上 → 收事件（!false = true 表示不穿透）
+            let _ = window.set_ignore_cursor_events(!want_events);
+            last = Some(want_events);
+        }
+        // ESC 解除：提示条未聚焦，DOM keydown 收不到；在热区线程里读物理键。
+        // 边沿触发（按下瞬间一次），避免按住连发多次 revoke。
+        if visible {
+            let esc_down = esc_key_down();
+            if esc_down && !esc_was_down {
+                glow_log("user pressed Escape → stop CUA control");
+                let _ = app.emit(
+                    "cua-glow-user-stop",
+                    serde_json::json!({ "reason": "escape" }),
+                );
+                let _ = window.eval(
+                    "document.documentElement.dataset.state='leaving';window.__cuaGlowOverlay&&window.__cuaGlowOverlay.setLeaving&&window.__cuaGlowOverlay.setLeaving()",
+                );
+            }
+            esc_was_down = esc_down;
+        } else {
+            esc_was_down = false;
+        }
+        std::thread::sleep(Duration::from_millis(if visible {
+            HIT_TEST_INTERVAL_MS
+        } else {
+            HIT_TEST_IDLE_MS
+        }));
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn esc_key_down() -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE};
+    // 高位为 1 = 当前按下。
+    unsafe { GetAsyncKeyState(VK_ESCAPE.0 as i32) as u16 & 0x8000 != 0 }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn esc_key_down() -> bool {
+    false
+}
+
+// 【self-evolution-bot · 2026-11-19 · 第73轮 · 模型:deepseek-v4.1-flash-1017】
+// 删除了 `wait_overlay_hwnd` 与它的非 Windows 空实现。
+//
+// 为什么删（19:10 真机实测，两次建窗都恰好超时 10s）：
+//   `window.hwnd()` 在 Windows 上要**回主线程**取句柄。而所有调用点都在
+//   `tauri::async_runtime::spawn_blocking` 里，主线程正在 `await` 那个 blocking 任务
+//   ⇒ 主线程等 blocking、blocking 等主线程，**死锁满超时才返回**。
+//   这就是「每次都恰好等到超时才失败」而不是「再等久一点就好了」的真相。
+//
+// 保留它只会引诱后来人再写一次同样的等待，所以整体移除：
+//   - 建窗后的判据改为「`build()` 成功即成功」，创建由主线程上的 `show()` 驱动；
+//   - 复用判据改为 `window_created` 状态位（不碰主线程句柄）。
+
+/// 彻底释放 `cua-glow-0` 这个 label，等到注册表里真的没有了才返回。
+///
+/// 【self-evolution-bot · 2026-11-19 · 第71轮 · 模型:deepseek-v4.1-flash-1017】
+/// 真实缺陷（现网日志取证）：
+///   15:39:17 `show failed: CUA indicator hwnd timeout`（HWND 5s 未就绪）
+///   15:39:42 `destroy zombie overlay` → 立刻 `show failed: label cua-glow-0 already exists`
+///   15:40:12 再试 → 仍然 `already exists`  ← **永久卡死，只能重启面板**
+///
+/// 根因：`window.close()` 只是**投递**关闭请求，Tauri 的 webview 注册表要等 tao 事件循环
+/// 丢掉当前指示器窗口（**不等待、不查主线程句柄**）。
+///
+/// 【self-evolution-bot · 2026-11-19 · 第73轮 · 模型:deepseek-v4.1-flash-1017】
+/// 改了什么：原来的 `destroy_zombie_overlay` + `wait_label_released`（轮询等 label
+/// 从注册表消失，最长 1.2s）整体删除，换成这个「发完销毁请求就走」的版本。
+///
+/// 为什么：`get_webview_window`/`close`/`destroy` 都要主线程，而调用点在此前的
+/// `spawn_blocking` 里 ⇒ 与 await 的主线程互等，**死锁到超时**。现网 23 次
+/// `WARN overlay label STILL present after destroy` 就是这么来的：
+/// 不是标签真的泄漏，是我们自己把主线程堵死了、销毁请求根本没被处理。
+///
+/// 现在 label 是唯一化的（`cua-glow-<n>`），撞名最多浪费一个序号，
+/// 所以**完全不需要等注册表回收** —— 发个销毁请求、把状态位清掉即可。
+fn drop_overlay_window(app: &tauri::AppHandle) {
+    if let Some(window) = active_overlay(app) {
+        glow_log("dropping stale overlay window (no wait)");
         let _ = window.close();
-        // Brief yield so Tao drops the label before recreate.
-        std::thread::sleep(Duration::from_millis(80));
+        let _ = window.destroy();
     }
     if let Ok(mut state) = OVERLAY_STATE.lock() {
         state.window_created = false;
+        state.active_label.clear();
     }
 }
+
+/// 用 `SW_SHOWNOACTIVATE` 显窗：可见、置顶，但**不**取得前台/焦点。
+///
+/// Tauri 的 `window.show()` 最终走 `ShowWindow(SW_SHOW)`，该标志会激活窗口；
+/// 对 CUA 提示条来说这是致命的 —— 它一被激活就成了 frontmost app，随后脚本发出的
+/// 「原始前台事件」（拖拽/点击）会被 node-repl-host 判定为「目标不在前台」而丢弃。
+/// 这里改用非激活版本，配合 `WS_EX_NOACTIVATE` 形成双保险。
+#[cfg(target_os = "windows")]
+fn show_noactivate(window: &WebviewWindow) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNOACTIVATE};
+    if let Ok(hwnd) = window.hwnd() {
+        unsafe {
+            let _ = ShowWindow(HWND(hwnd.0 as *mut _), SW_SHOWNOACTIVATE);
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn show_noactivate(window: &WebviewWindow) {
+    let _ = window.show();
+}
+
+/// 记下「谁本来是前台」，用于提示条万一还是抢了前台时把它还回去。
+#[cfg(target_os = "windows")]
+fn foreground_window() -> windows::Win32::Foundation::HWND {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    unsafe { GetForegroundWindow() }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn foreground_window() -> isize {
+    0
+}
+
+/// 记一行「当前前台是谁」——给「动作被拒」这类问题留证据。
+///
+/// 【self-evolution-bot · 2026-11-22】
+/// node-repl-host 拒绝坐标动作时只回一句 `frontmost application is pid N`，
+/// 光凭 pid 分不清到底是**面板主窗**还是**本提示条**抢的前台，于是前面几轮
+/// 一直在猜。这里把 前台 hwnd / pid / 窗口标题 打进日志，下一次看日志就能定位：
+/// 如果 pid 是本进程且标题是 "EvoFlow Computer Use"，就是本文件这条提示条。
+#[cfg(target_os = "windows")]
+fn log_foreground(phase: &str) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowThreadProcessId, GetWindowTextW,
+    };
+    unsafe {
+        let fg: HWND = GetForegroundWindow();
+        if fg.0.is_null() {
+            glow_log(&format!("{phase} foreground=<none>"));
+            return;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(fg, Some(&mut pid as *mut u32));
+        let mut buf = [0u16; 256];
+        let n = GetWindowTextW(fg, &mut buf);
+        let title = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
+        glow_log(&format!(
+            "{phase} foreground hwnd={:?} pid={pid} title={title:?}",
+            fg
+        ));
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn log_foreground(_phase: &str) {}
+
+/// 若提示条把前台抢走了，**当场还给原应用**。
+///
+/// 【self-evolution-bot · 2026-11-22】
+/// `WS_EX_NOACTIVATE` 已经从根上防止了「show 即抢前台」，但 WebView2 首帧附着、
+/// tao 恢复窗口等边角路径仍可能激活一次。CUA 的坐标手势对前台极其敏感
+/// （只要 frontmost 不是目标应用，node-repl-host 就整条拒收），所以这里做最后一道兜底：
+/// 抢了就还，绝不把「用户/自动化正在操作的窗口」留在身后。
+/// 我们此刻正是前台进程，`SetForegroundWindow` 的前台锁不会挡住这次调用。
+#[cfg(target_os = "windows")]
+fn restore_foreground(prev: windows::Win32::Foundation::HWND, window: &WebviewWindow) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SetForegroundWindow};
+    let Ok(hwnd) = window.hwnd() else {
+        return;
+    };
+    let ours = HWND(hwnd.0 as *mut _);
+    unsafe {
+        if GetForegroundWindow() != ours {
+            return; // 没抢，什么都不用做
+        }
+        if prev.0.is_null() || prev == ours {
+            return; // 原本就没人持有前台，还给它反而会把桌面弄成无焦点
+        }
+        let _ = SetForegroundWindow(prev);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn restore_foreground(_prev: isize, _window: &WebviewWindow) {}
 
 /// ZCode showWindowOnTop: Windows 隐藏透明窗后可能丢掉 TOPMOST；每次 show 后强制拉回。
 #[cfg(target_os = "windows")]
@@ -172,58 +615,288 @@ fn log_overlay_state(window: &WebviewWindow, phase: &str) {
     ));
 }
 
+/// 建窗后**有界轮询** HWND —— 照抄同仓已证真的 `browser_embed::wait_embed_hwnd_label`。
+///
+/// 【self-evolution-bot · 2026-11-19 · 第80轮 · 模型:deepseek-v4.1-flash-1017】
+/// 为什么把它加回来：第73轮我删掉了这段等待，理由是「`hwnd()` 要回主线程取句柄，
+/// 与主线程 await 互等 ⇒ 死锁」。**这条归因已被证伪**：
+///   - 源码：`hwnd()` → `dispatcher.window_handle()` → `get_raw_window_handle` →
+///     `window_getter!` → `getter!` = `send_user_message()` + `rx.recv()`。
+///     它**确实发消息**（我第78轮注释写「读缓存槽位、不发消息、不等事件循环」是错的，
+///     本轮更正），但收消息的是 tao 事件循环线程，不是 tokio 工作线程 ——
+///     `spawn_blocking` 里等它不会与任何人互等。
+///   - 同仓实证：`browser_embed` 在**同一个 spawn_blocking 路径**建窗并轮询 `hwnd()`，
+///     今日建窗 25 次、`wait_hwnd_label TIMEOUT` **0 次**、`ON-SCREEN visible=true` 79 次。
+///     而本窗口当日 3 次等待**全超时** ⇒ 差别不在「要不要等」，在等之前窗口是否还有救。
+/// 所以正确做法是照抄它：有界轮询 + `IsWindow` 校验（防止句柄早于窗口销毁）。
+/// 超时**不销毁窗口**：show() 仍可能成功，销毁等于把还能救的窗口先杀掉（第73轮的教训）。
+fn wait_overlay_hwnd(window: &WebviewWindow, timeout: Duration) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+        let deadline = std::time::Instant::now() + timeout;
+        let mut last = String::from("not ready");
+        while std::time::Instant::now() < deadline {
+            match window.hwnd() {
+                Ok(h) if unsafe { IsWindow(Some(h)).as_bool() } => {
+                    // 【self-evolution-bot · 2026-11-22】句柄一出现就**立刻**摘掉激活属性，
+                    // 不等函数返回：builder 的 `.visible(true)` 会在建窗时就 show 一次，
+                    // 这一瞬间足以把提示条推成前台，而前台一旦被抢，紧随其后的
+                    // 拖拽/点击就会被 node-repl-host 判成「目标不在前台」整批丢弃。
+                    apply_noactivate(window);
+                    glow_log(&format!("hwnd ready {h:?}"));
+                    return true;
+                }
+                Ok(_) => last = "IsWindow=false".into(),
+                Err(e) => last = e.to_string(),
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        glow_log(&format!(
+            "hwnd wait TIMEOUT after {}ms last={last} (window kept, show() still attempted)",
+            timeout.as_millis()
+        ));
+        false
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (window, timeout);
+        true
+    }
+}
+
 fn build_glow_window(
     app: &tauri::AppHandle,
+    label: &str,
     pos: LogicalPosition<f64>,
 ) -> Result<WebviewWindow, String> {
     // App HTML (self-contained). data: URLs need `webview-data-url` feature — we don't.
-    // Opaque: transparent WebView2 often paints blank. Builder mirrors voice_overlay
-    // (proven secondary window) plus explicit size/skip_taskbar.
+    // Transparent：对齐同仓已证真的 voice_overlay。圆形胶囊 HUD 需要透出桌面，
+    // 否则不透明灰/白底会再画出用户不要的长方形背景框。
+
+    // 【self-evolution-bot · 2026-11-19 · 第84轮 · 模型:deepseek-v4.1-flash-1017】
+    // 改了什么：给提示条窗口加**独立的 WebView2 数据目录**（照抄同仓唯一建窗成功者
+    // `browser_embed::create_embed_window` 的 `.data_directory(...)`）。
+    //
+    // 为什么 —— 本轮第一次拿到了此前四轮都没有的**同进程硬对照**：
+    //   - 同一个重启后的进程（pid 51952）里，`browser_embed` 22:53:24.676 开始 build，
+    //     22:53:25.150 就打出 `window ready`（**474ms**）；
+    //     而本窗口 22:55 / 23:01 / 23:02 三次 build 全部
+    //     `hwnd wait TIMEOUT after 5000ms last=the underlying handle is not available`。
+    //   - 用 `EnumWindows` 按 pid 实时监视 8 秒：**0 个新窗口出现** ⇒ `build()` 返回的
+    //     `WebviewWindow` 只是个空壳对象，Win32 窗口从未被创建。
+    //     （不是「建了但没显示」，是「根本没建」——所以 show()/topmost 怎么调都没用。）
+    //   - 全部日志里 `after-show visible=true` 出现 **0 次** ⇒ 该提示条从未成功显示过。
+    //   - 两者唯一未被排除的结构性差异就是它。`browser_embed` 源码注释原文：
+    //     "Distinct data_directory so this child does not share the main WebView2
+    //      environment." 本窗口与 voice_overlay / resource_manager 都共享主环境。
+    //
+    // 机制：Tauri/wry 在 Windows 上，同一 WebView2 environment 内的
+    // `additional_browser_args` 必须一致；主窗口若自带自定义 args，后建的共享环境窗口
+    // 就会起不来 —— 与实测「build 返回 Ok 但 HWND 永不出现」完全吻合。
+    // 给独立目录 = 独立 environment，彻底绕开这条约束。
+    //
+    // 与前几轮的边界：第78轮改的 `.visible(true)` **保留**（它不是这里的病根，
+    // 且是本仓 browser_embed 已证真的做法，留着无害）；第80轮加的 `wait_overlay_hwnd`
+    // 也保留 —— 它是本轮的**判据**，改完必须看到它打 `hwnd_ready=true` 才算修好。
+    // 固定目录名（**不用 label**）：本窗口每失败一次就换一个 `cua-glow-N` label，
+    // 按 label 建目录会无限堆积 WebView2 用户数据（每个几十 MB）。同环境的多个窗口
+    // 共享一个 data_directory 是允许的（browser_embed 固定用 browser-embed-primary）。
+    let data_dir = {
+        let base = crate::commands::evoflow_dir().join("webview2-embed");
+        let _ = std::fs::create_dir_all(&base);
+        base.join("cua-glow")
+    };
+    glow_log(&format!("building overlay label={label} data_dir={}", data_dir.display()));
     let window = WebviewWindow::builder(
         app,
-        OVERLAY_LABEL,
+        label,
         WebviewUrl::App("cua-glow-overlay.html".into()),
     )
+    .data_directory(data_dir)
     .title("EvoFlow Computer Use")
     .inner_size(OVERLAY_WIDTH, OVERLAY_HEIGHT)
     .position(pos.x, pos.y)
     .decorations(false)
-    .transparent(false)
+    .transparent(true)
     .shadow(false)
     .always_on_top(true)
     .focused(false)
     .skip_taskbar(true)
     .resizable(false)
-    .visible(false)
+    // 【self-evolution-bot · 2026-11-19 · 第78轮 · 模型:deepseek-v4.1-flash-1017】
+    // 改了什么：`.visible(false)` → `.visible(true)`。针对「提示条建了却从不出现」的第 3 个候选根因。
+    // **注意：这条尚未真机证真**（构建产物 21:02:58 待安装）。同仓有反例，见下方注释。
+    //
+    // 为什么（20:54 / 20:57 两次真机取证，新构建上复现）：
+    //   日志 `overlay window built (label=cua-glow-0), show() will drive creation`（build 成功）
+    //   但紧接着 `after-show visible=false size=<failed to receive message from webview>
+    //   pos=<same> hwnd=<the underlying handle is not available>`
+    //   并且 `EnumWindows` 按 pid 94692 原始枚举只有 6 个窗：Tauri Window / tray_icon_app /
+    //   global_hotkey_app / Tao Thread Event Target / MSCTFIME UI / IME —— **没有任何 cua-glow**。
+    //   ⇒ build 返回的只是一个**空壳对象**，Win32 窗口从未真正创建。
+    //
+    // 判据来源不是我的推测，是本仓已证真的同型窗口（browser_embed.rs:2229-2233 原文）：
+    //   "Always start visible. A `.visible(false)` WebView2 on Windows often never surfaces
+    //    an HWND ("underlying handle is not available"), so nest/place/park/CDP all fail
+    //    and leave a zombie label."
+    // 我之前把它读成「等一会儿就好」「spawn_blocking 死锁」，两轮都改错方向 ——
+    // 真正的开关是**建窗时就必须 visible**，HWND 才会被 tao 推出来。
+    //
+    // 代价可接受：本窗口建出来就是要立刻显示的（同一命令里紧跟着 show），
+    // 位置已在 builder 里设好，不会先闪到屏幕左上角。
+    .visible(true)
     .build()
     .map_err(|e| format!("create CUA operation indicator failed: {e}"))?;
 
-    wait_overlay_hwnd(&window, Duration::from_secs(5)).map_err(|e| {
-        let _ = window.close();
-        e
-    })?;
-    apply_overlay_chrome(&window);
+    // 【self-evolution-bot · 2026-11-19 · 第71轮 · 模型:deepseek-v4.1-flash-1017】
+    // 5s → 10s：现网日志 15:39:17 就是 5s 判超时。WebView2 在面板刚启动、CPU 忙
+    // （同时有 CDP 桥/多 shell 在跑）时首帧可能更慢；5s 误判会让「提示条永久起不来」。
+    // 超时后必须**彻底释放 label**，否则下一次 build 撞 "already exists"（现网已发生两次）。
+    // 【self-evolution-bot · 2026-11-19 · 第73轮 · 模型:deepseek-v4.1-flash-1017】
+    // 改了什么：hwnd 等待从**致命**降级为**尽力**（超时只告警，不 destroy、不 return Err）。
+    //
+    // 为什么（19:10 真机实测）：
+    //   ```
+    //   overlay hwnd wait failed: CUA indicator hwnd timeout:
+    //     the underlying handle is not available → releasing label cua-glow-0
+    //   build with label cua-glow-0 failed: ... → retry with fresh label
+    //   （重试后一条日志都没有 = 也失败了，静默返回）
+    //   ```
+    //   结果：全屏蓝光环亮了（`ring show ok`），顶部提示条**始终不出现**。
+    //
+    // 根因（第78轮**候选假设，尚未真机证真**）：
+    //   第73轮我写「HWND 要等 tao 主事件循环推一轮才就绪，主线程被 await 住」，
+    //   第76轮我写「spawn_blocking 里调 hwnd() 打断了 webview 附着」。
+    //   这两条都已被 20:54/20:57 的新构建实测否定：死锁修掉后日志变成
+    //   `overlay window built ... show() will drive creation` 却仍 `after-show visible=false`。
+    //   第78轮改为「建窗时必须 visible」，依据是同仓 browser_embed.rs:2229-2233 的
+    //   既有结论（`.visible(false)` 的 WebView2 常常根本不产出 HWND）。
+    //   **但必须诚实记下反例**：同仓 resource_manager.rs:620 与 voice_overlay.rs:99
+    //   也用 `.visible(false)`，用户日常都能打开 —— 说明这条不是普适定律。
+    //   所以本条仍需一次真机复验才算证实；未证实就当它和下面的复用判据互为兜底。
+    // 保留原本的现象记录，供后人对照：
+    // 这里在 spawn_blocking 线程里死等 10s，主循环没被推动 ⇒ 永远拿不到句柄
+    // （错误原文 "the underlying handle is not available" 就是 Tauri 侧 hwnd 仍为空）。
+    // 而 `builder.build()` **成功返回了窗口对象**才走到这里，说明 WebView2 controller
+    // 已经建好 —— 真正的生杀权在后面的 `window.show()`，不在这一句等待。
+    // 之前把它当硬判据，等于在窗口还能救的时候先把它 destroy 了。
+    // 【self-evolution-bot · 2026-11-19 · 第73轮 · 模型:deepseek-v4.1-flash-1017】
+    // 改了什么：**删掉 build 后的 hwnd 等待**（原来 10s，改成非致命后仍要空耗 600ms）。
+    //
+    // 为什么（19:10 真机实测，两次建窗都恰好超时）：
+    //   ```
+    //   19:10:55 overlay hwnd wait failed ... → releasing label cua-glow-0
+    //   19:11:06 overlay hwnd wait failed ... → releasing label cua-glow-1
+    //   ```
+    //   `window.hwnd()` 在 Windows 上要**回主线程**取句柄；而这里整段跑在
+    //   `spawn_blocking` 线程，主线程正在 `await` 它的结果 ⇒ **互相等，死锁**。
+    //   这就是「每次都恰好等到超时才失败」而不是「再等久一点就好」的原因。
+    //
+    // 【self-evolution-bot · 2026-11-19 · 第73轮 · 模型:deepseek-v4.1-flash-1017】
+    // 改了什么：**删掉这里的 `apply_overlay_chrome(&window)`**。
+    //
+    // 为什么（19:36 真机实测）：
+    //   `overlay window built (label=cua-glow-0)` 已经打出来了（死锁修复生效），
+    //   但紧接着 `after-show visible=false ... hwnd=<the underlying handle is not available>`
+    //   `size/pos=<runtime error: failed to receive message from webview>`。
+    //   而枚举 Win32 顶层窗口：`cua-glow-0` **根本不在列表里**（蓝光环 EvoFlowCuaGlowRing
+    //   是 VISIBLE 全屏的，说明进程与窗口站没问题）。
+    //
+    // 根因（第78轮更正）：不是这里调了 hwnd()。20:54/20:57 两次实测都证明
+    // `overlay window built` 之后紧接着 `after-show visible=false`，而本顺序
+    // （先 show 再 chrome）仍导致「窗口对象在、Win32 窗口不在」——
+    // 说明「在 blocking 线程取句柄会打断 webview 附着」这条归因不成立。
+    // 本顺序仍保留的理由只剩一条客观事实：`hwnd()` 在 show 之前确实拿不到句柄。
+    //
+    // 【self-evolution-bot · 2026-11-19 · 第80轮 · 模型:deepseek-v4.1-flash-1017】
+    // 上面的「死锁」归因**本轮正式撤回**，并在这里接回有界轮询：
+    //   - 撤回依据：`hwnd()` 虽然发消息（getter! = send_user_message + rx.recv），
+    //     但收消息的是 tao 事件循环线程；同仓 `browser_embed` 在同一条 spawn_blocking
+    //     路径上轮询 hwnd()，今日 25 次建窗 / 0 次 TIMEOUT，证明这条路径不会互等。
+    //   - 为什么必须轮询而不是直接 show：本窗口当日 3 次「等待后仍取不到句柄」，
+    //     而同进程另一类窗口 0 次 —— 说明句柄确实需要时间来，只是「等到」和
+    //     「等不到」要分开处理：等到了就正常 show，等不到照样试 show（不销毁）。
+    let ready = wait_overlay_hwnd(&window, Duration::from_secs(5));
+    // 【self-evolution-bot · 2026-11-22】句柄一就绪就立刻摘掉激活属性：
+    // builder 里的 `.visible(true)` 自己就会走一次 ShowWindow，抢在第一次 show 之前
+    // 把 `WS_EX_NOACTIVATE` 钉上，才能保证提示条从出生起就不是前台窗口。
+    apply_noactivate(&window);
+    glow_log(&format!(
+        "build done label={} hwnd_ready={}",
+        window.label(),
+        ready
+    ));
     Ok(window)
 }
 
 fn ensure_overlay_window(app: &tauri::AppHandle) -> Result<(WebviewWindow, bool), String> {
     let pos = overlay_logical_position(app)?;
-    if let Some(existing) = app.get_webview_window(OVERLAY_LABEL) {
-        // Reuse only if HWND is alive; otherwise Tao keeps a dead label and every
-        // later show() returns Ok with nothing on screen.
-        if wait_overlay_hwnd(&existing, Duration::from_millis(200)).is_ok() {
-            let _ = existing.set_size(LogicalSize::new(OVERLAY_WIDTH, OVERLAY_HEIGHT));
-            let _ = existing.set_position(pos);
-            apply_overlay_chrome(&existing);
-            return Ok((existing, false));
+    // 【self-evolution-bot · 2026-11-19 · 第78轮 · 模型:deepseek-v4.1-flash-1017】
+    // 改了什么：复用判据从「状态位 window_created」改成「**真拿得到 HWND**」。
+    //
+    // 为什么（20:57 真机实测抓到现行）：
+    //   20:54 那次 build 打出了 `overlay window built (label=cua-glow-0)`，窗口从未真出现；
+    //   20:57 我再触发一次，日志里**一条 build 日志都没有** —— 走的是本复用分支，
+    //   状态位还认为窗口活着，于是一直把那个空壳对象返给 show()，show() 也救不回来。
+    //   ⇒ 状态位会撒谎，判据必须落到「句柄在不在」这个客观事实上。
+    //   注意 `hwnd()` 在本线程可用：async 命令跑在 tokio 线程，tao 事件循环仍在主线程正常
+    //   泵消息（20:57 实测 `is_visible()` 能正常返回 false 就是证据），所以这里不会互等。
+    //   真拿不到句柄就销毁重建，把「永久卡死」降级为「多建一次」。
+    let reusable = {
+        let st = match OVERLAY_STATE.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        st.window_created && !st.active_label.is_empty()
+    };
+    if reusable {
+        if let Some(existing) = active_overlay(app) {
+            // 【self-evolution-bot · 2026-11-19 · 第80轮 · 模型:deepseek-v4.1-flash-1017】
+            // 更正第78轮我在这里写错的一句：`hwnd()` **会发消息**。
+            //   真实调用链：`Window::hwnd()` → `dispatcher.window_handle()` →
+            //   `get_raw_window_handle` → `window_getter!` → `getter!` =
+            //   `send_user_message()` + `rx.recv()`（阻塞等事件循环回包）。
+            //   我上轮写「读内部缓存槽位、不发消息、不等事件循环」是错的 ——
+            //   它既发消息也等回包。它能用的真实理由是：收消息的是 tao 事件循环线程，
+            //   不是 tokio 工作线程，所以在 async/blocking 上下文里等它不会自锁。
+            // 判据仍用 hwnd()：空壳窗口在这里会立刻返回 `HandleError::Unavailable`
+            // （即日志里的 `the underlying handle is not available`），不会像
+            // `outer_size()` 那样抛 `failed to receive message from webview`。
+            // `WebviewWindow::hwnd()` 仅 Windows 存在；macOS/Linux 编译会 E0599（1.3.39 CI）。
+            #[cfg(target_os = "windows")]
+            let reuse_ok = existing.hwnd().is_ok();
+            #[cfg(not(target_os = "windows"))]
+            let reuse_ok = true;
+            if reuse_ok {
+                // 尺寸/位置由 show 命令在主线程里补（见 §三之四）。
+                let _ = existing.set_size(LogicalSize::new(OVERLAY_WIDTH, OVERLAY_HEIGHT));
+                let _ = existing.set_position(pos);
+                return Ok((existing, false));
+            }
+            glow_log("reuse candidate has no hwnd (zombie shell) → destroy + rebuild");
         }
-        destroy_zombie_overlay(app);
+        // 状态说有、注册表里没有，或窗口是空壳（无 HWND）→ 清理后重建。
+        drop_overlay_window(app);
     }
-    let window = build_glow_window(app, pos)?;
+    // 【self-evolution-bot · 2026-11-19 · 第73轮】每次新建都拿一个**没用过**的 label。
+    // 万一旧 label 卡在 tao 注册表里没回收，也只是浪费一个序号，不会永久建不起来。
+    let label = next_overlay_label();
+    let window = match build_glow_window(app, &label, pos) {
+        Ok(w) => w,
+        Err(e) => {
+            // 极端情况：连新 label 都撞名（理论上不该发生），再退一格重试一次。
+            glow_log(&format!("build with label {label} failed: {e} → retry with fresh label"));
+            let retry = next_overlay_label();
+            build_glow_window(app, &retry, pos)?
+        }
+    };
     if let Ok(mut state) = OVERLAY_STATE.lock() {
         state.window_created = true;
     }
-    glow_log("overlay window created + hwnd ready");
+    // 【self-evolution-bot · 2026-11-19 · 第73轮】原日志写「hwnd ready」是撒谎：
+    // 这里并没有验过 HWND（也不该验，验就要回主线程 = 死锁）。改成陈述事实。
+    glow_log(&format!("overlay window built (label={label}), show() will drive creation"));
     Ok((window, true))
 }
 
@@ -234,21 +907,90 @@ async fn wait_overlay_ready(created: bool) {
 }
 
 /// 显示顶部「正在操作电脑」提示条。
+///
+/// 【self-evolution-bot · 2026-11-19 · 第68轮 · 模型:deepseek-v4.1-flash-1017】
+/// 新增 `step` / `steps_done`：前端轮询 `/cua/glow-status` 拿到当前动作后透传进来，
+/// 提示条就显示「正在点击 · 第 3 步」，而不是一句固定文案。
+///
+/// 【self-evolution-bot · 2026-11-19 · 第72轮 · 模型:deepseek-v4.1-flash-1017】
+/// 再加 `elapsed_ms` / `running`：用户要「时长」。
+/// running=true 时页面自走秒，false 时停在被冻结的值 —— 两处都要传，
+/// 否则卡片只能显示上一次推送时的死数字。
 #[tauri::command]
-pub async fn cua_glow_overlay_show(app: tauri::AppHandle) -> Result<(), String> {
+pub async fn cua_glow_overlay_show(
+    app: tauri::AppHandle,
+    step: Option<String>,
+    steps_done: Option<i64>,
+    elapsed_ms: Option<i64>,
+    running: Option<bool>,
+) -> Result<(), String> {
+    let step_text = step.unwrap_or_default();
+    let done = steps_done.unwrap_or(0);
+    let elapsed = elapsed_ms.unwrap_or(0).max(0);
+    let is_running = running.unwrap_or(true);
     let app_create = app.clone();
     let (window, created) =
         tauri::async_runtime::spawn_blocking(move || ensure_overlay_window(&app_create))
             .await
             .map_err(|e| format!("CUA indicator create join failed: {e}"))??;
 
+    // 【self-evolution-bot · 2026-11-19 · 第73轮 · 模型:deepseek-v4.1-flash-1017】
+    // 改了什么：把 `apply_overlay_chrome` 从 `show()` **之前**挪到**之后**。
+    //
+    // 为什么：它内部用 `window.hwnd()` 调 `SetWindowDisplayAffinity`，而在
+    // `show()` 之前 WebView2 尚未附着、HWND 还不存在（实测 `hwnd=<the underlying
+    // handle is not available>`）。先 show 再 chrome，HWND 必已就绪。
+    //
+    // 【self-evolution-bot · 2026-11-22】补一条**前置**：`WS_EX_NOACTIVATE` 必须
+    // 在任何一次 show 之前钉上，否则 `show()` 已经把前台抢走了，事后再摘属性也
+    // 追不回来（前台不会自己还给 Paint）。这就是「拖拽被拒、提示条顶在最前」的病根。
+    apply_noactivate(&window);
+    // 【self-evolution-bot · 2026-11-22】记下此刻真正的使用者（比如正在被自动化的
+    // 画图），show 完如果提示条把它顶掉了就还回去。见 `restore_foreground`。
+    let prev_fg = foreground_window();
+    // 【self-evolution-bot · 2026-11-22 · 第N轮】改了什么：**只在新建窗时调 `show()`**。
+    //
+    // 为什么 —— 这里才是「前台被反复抢走」的真正放大器：
+    //   前端 `cua-glow-poll.js` 在 CUA 活跃期间每 500ms 轮询一次
+    //   `/cua/glow-status`，每次都走到本命令。原来无论窗是不是刚建好都调
+    //   `window.show()`，而 Tauri 的 `show()` 最终是 `ShowWindow(SW_SHOW)` ——
+    //   **带激活语义**，对已存在的窗口同样会把它推到前台。
+    //   于是形成 500ms 一次的心跳式抢前台：自动化刚把画图拉到前台、还没发完
+    //   一次 `left_click_drag`，提示条又顶上来 ⇒
+    //   `raw foreground event for app_ref pid X was refused because the live
+    //    frontmost application is pid <面板>. action_sent=false.`
+    //   表现就是用户说的「工具坏了、点了没反应」。
+    //
+    // 只有**新建**窗口这一次需要 `show()` 把 HWND 推出来（第78轮已证真：
+    // 建窗不 visible 时 tao 不产出句柄）。复用路径改用 `SW_SHOWNOACTIVATE`
+    // 复显即可 —— 可见、置顶、不抢焦点。
+    if created {
+        window
+            .show()
+            .map_err(|e| format!("show CUA operation indicator failed: {e}"))?;
+    }
     apply_overlay_chrome(&window);
-    let _ = window.eval(
-        "document.documentElement.dataset.state='active';window.__cuaGlowOverlay&&window.__cuaGlowOverlay.setActive&&window.__cuaGlowOverlay.setActive()",
-    );
-    window
-        .show()
-        .map_err(|e| format!("show CUA operation indicator failed: {e}"))?;
+    // show 之后 tao/WebView2 可能重置 exstyle；再钉一次并用 SW_SHOWNOACTIVATE 复显。
+    apply_noactivate(&window);
+    show_noactivate(&window);
+    restore_foreground(prev_fg, &window);
+    log_foreground("overlay-show");
+    // 入场动画只在新建窗时播一次。复用已亮窗口再 setActive = 整条每秒闪一下。
+    if created {
+        let _ = window.eval(
+            "document.documentElement.dataset.state='active';window.__cuaGlowOverlay&&window.__cuaGlowOverlay.setActive&&window.__cuaGlowOverlay.setActive()",
+        );
+    } else {
+        let _ = window.eval("document.documentElement.dataset.state='active'");
+    }
+    push_overlay_step(&window, &step_text, done, elapsed, is_running);
+    push_overlay_stop_handler(&window);
+    // 【self-evolution-bot · 2026-11-19 · 第68轮】只拉起一条常驻热区轮询；
+// 它自己处理「可见才判光标、不可见保持穿透」，重复 show 不会叠线程。
+    if !HIT_TEST_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        let a = app.clone();
+        std::thread::spawn(move || spawn_stop_button_hit_test_thread(a));
+    }
     let _ = window.set_always_on_top(true);
     force_topmost(&window);
 
@@ -256,28 +998,42 @@ pub async fn cua_glow_overlay_show(app: tauri::AppHandle) -> Result<(), String> 
     let _ = window.set_always_on_top(true);
     force_topmost(&window);
     let _ = window.eval("document.documentElement.dataset.state='active'");
+    // 窗口刚建好时页面还没跑完脚本，补推一次步骤，否则首屏只有主文案。
+    push_overlay_step(&window, &step_text, done, elapsed, is_running);
 
     // Loud proof: FE used to log "invoke ok" while no HWND existed.
-    let app_verify = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        if let Some(w) = app_verify.get_webview_window(OVERLAY_LABEL) {
+    // 【self-evolution-bot · 2026-11-19 · 第73轮 · 模型:deepseek-v4.1-flash-1017】
+    // 改了什么：这段「事后验收」从 `spawn_blocking` 挪回主线程直接执行。
+    // 为什么：`active_overlay()` / `is_visible()` / `show()` 都可能要主线程句柄，
+    // 放在 blocking 线程里会与 await 它的主线程互等（就是 hwnd timeout 那个死锁）。
+    //
+    // 另加一轮短等待：实测 `show()` 返回后 WebView2 仍可能没附着完，
+    // 此刻 `outer_size()`/`hwnd()` 会报 `failed to receive message from webview`。
+    // 那是**诊断日志**的瞬时失败，不代表窗口没出来，所以这里等一拍再记，
+    // 并把失败保留成日志（不给用户看），不据此判死。
+    for attempt in 0..15 {
+        let Some(w) = active_overlay(&app) else {
+            glow_log("after-show window missing from manager");
+            return Err("CUA indicator show returned but window is missing".into());
+        };
+        let visible = w.is_visible().unwrap_or(false);
+        if visible || attempt == 14 {
             log_overlay_state(&w, "after-show");
-            let visible = w.is_visible().unwrap_or(false);
             if !visible {
                 glow_log("after-show NOT visible — retry show+topmost");
-                let _ = w.show();
+                apply_noactivate(&w);
+                show_noactivate(&w);
                 let _ = w.set_always_on_top(true);
                 force_topmost(&w);
                 log_overlay_state(&w, "after-show-retry");
             }
-        } else {
-            glow_log("after-show window missing from manager");
+            break;
         }
-    })
-    .await
-    .ok();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
 
-    if let Some(w) = app.get_webview_window(OVERLAY_LABEL) {
+    // 【self-evolution-bot · 2026-11-19 · 第73轮】同上：label 唯一化后必须走 active_overlay。
+    if let Some(w) = active_overlay(&app) {
         if !w.is_visible().unwrap_or(false) {
             return Err("CUA indicator show returned but window is not visible".into());
         }
@@ -287,10 +1043,76 @@ pub async fn cua_glow_overlay_show(app: tauri::AppHandle) -> Result<(), String> 
     Ok(())
 }
 
+/// 提示条上「解除控制」按钮的 Rust 落点。
+///
+/// 【self-evolution-bot · 2026-11-19 · 第68轮 · 模型:deepseek-v4.1-flash-1017】
+/// 提示条是一个独立 webview，拿不到主窗口的 api/会话上下文；这里只做「单向上报」：
+/// 前端点击 → invoke 本命令 → emit ``cua-glow-user-stop`` 给主窗口 →
+/// 主窗口按它现有的停止链路（stopSessionExecution）收尾。
+/// 不在 Rust 里直接调 HTTP：会话 key 只有前端知道，硬拼会在多会话时停错。
+#[tauri::command]
+pub async fn cua_glow_overlay_stop(app: tauri::AppHandle) -> Result<(), String> {
+    glow_log("user pressed stop on CUA indicator");
+    app.emit("cua-glow-user-stop", serde_json::json!({ "reason": "user_button" }))
+        .map_err(|e| format!("emit cua-glow-user-stop failed: {e}"))?;
+    // 立刻清掉指示器，别等前端往返（用户点了必须马上有反馈）。
+    // 【self-evolution-bot · 2026-11-19 · 第73轮】label 唯一化后走 active_overlay。
+    if let Some(window) = active_overlay(&app) {
+        let _ = window.eval(
+            "document.documentElement.dataset.state='leaving';window.__cuaGlowOverlay&&window.__cuaGlowOverlay.setLeaving&&window.__cuaGlowOverlay.setLeaving()",
+        );
+    }
+    Ok(())
+}
+
+fn push_overlay_stop_handler(window: &WebviewWindow) -> bool {
+    // 【self-evolution-bot · 2026-11-19 · 第68轮 · 模型:deepseek-v4.1-flash-1017】
+    // 提示条是独立 webview，注入 onStop 让它按钮 → invoke('cua_glow_overlay_stop')。
+    // 只在窗口创建后注入一次；重复注入会叠加监听（虽然 idempotent 赋值，但没必要）。
+    let js = "window.__cuaGlowOverlay&&(window.__cuaGlowOverlay.onStop=function(){\
+try{window.__TAURI_INTERNALS__.invoke('cua_glow_overlay_stop')}catch(e){}})";
+    window.eval(js).is_ok()
+}
+
+/// 只更新提示条上的步骤文案（不重新 show / 不重放动画）。
+///
+/// 【self-evolution-bot · 2026-11-19 · 第68轮 · 模型:deepseek-v4.1-flash-1017】
+/// 为什么单独一条命令：步骤每 500ms 就可能变一次，如果复用 ``cua_glow_overlay_show``，
+/// 会连带重跑 show / force_topmost / 入场动画 —— 用户看到的是整条提示条一直在抖。
+/// 这里只做一次 eval，窗口不可见时直接返回 false 由调用方兜底。
+///
+/// 【self-evolution-bot · 2026-11-19 · 第72轮 · 模型:deepseek-v4.1-flash-1017】
+/// 加 `elapsed_ms` / `running`：把「已操作多久」和「秒表还在不在走」一起送达。
+#[tauri::command]
+pub async fn cua_glow_overlay_step(
+    app: tauri::AppHandle,
+    step: Option<String>,
+    steps_done: Option<i64>,
+    elapsed_ms: Option<i64>,
+    running: Option<bool>,
+) -> Result<bool, String> {
+    // 【self-evolution-bot · 2026-11-19 · 第73轮】label 唯一化后走 active_overlay，
+    // 否则重试换名建成的窗口会被当成「不存在」，步骤文案永远推不进去。
+    let Some(window) = active_overlay(&app) else {
+        return Ok(false);
+    };
+    if !window.is_visible().unwrap_or(false) {
+        return Ok(false);
+    }
+    Ok(push_overlay_step(
+        &window,
+        &step.unwrap_or_default(),
+        steps_done.unwrap_or(0),
+        elapsed_ms.unwrap_or(0).max(0),
+        running.unwrap_or(true),
+    ))
+}
+
 /// 隐藏顶部操作提示条。
 #[tauri::command]
 pub async fn cua_glow_overlay_hide(app: tauri::AppHandle) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window(OVERLAY_LABEL) {
+    // 【self-evolution-bot · 2026-11-19 · 第73轮】label 唯一化后走 active_overlay。
+    if let Some(window) = active_overlay(&app) {
         let _ = window.eval(
             "document.documentElement.dataset.state='leaving';window.__cuaGlowOverlay&&window.__cuaGlowOverlay.setLeaving&&window.__cuaGlowOverlay.setLeaving()",
         );
@@ -298,6 +1120,11 @@ pub async fn cua_glow_overlay_hide(app: tauri::AppHandle) -> Result<(), String> 
         window
             .hide()
             .map_err(|e| format!("hide CUA operation indicator failed: {e}"))?;
+        // 【self-evolution-bot · 2026-11-19 · 第68轮】隐藏后必须恢复整窗穿透：
+        // 热区轮询在窗口不可见时才把 ignore_cursor_events 置回 true，
+        // 但用户可能正好在按钮上隐藏 —— 那一拍会残留「收事件」状态，
+        // 让一个看不见的窗口继续吃掉桌面点击。这里显式复位。
+        let _ = window.set_ignore_cursor_events(true);
         glow_log("hide ok");
     }
     Ok(())

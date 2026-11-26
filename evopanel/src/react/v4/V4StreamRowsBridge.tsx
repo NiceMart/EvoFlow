@@ -8,6 +8,7 @@
 //   全部是 ZCode 显示区域的正式实现，不经过任何行适配。
 // - payload = null：V4 未就绪（开关关闭/会话无 threadId/订阅中），调用方回落老链路。
 import {
+  useEffect,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -15,6 +16,10 @@ import {
   useSyncExternalStore,
   type ReactNode,
 } from "react";
+import {
+  loadV4SnapshotDiskCache,
+  scheduleV4SnapshotDiskCache,
+} from "./v4-snapshot-disk-cache.js";
 import {
   SessionDataLayer,
   type SessionLease,
@@ -32,7 +37,8 @@ import {
 import { markStreamCompareSession } from "../lib/stream-compare-file-log.js";
 import { bindOpenTraceThread, endOpenTrace, markOpenStage } from "@zcode/ui/lib/openTrace.js";
 import { publishV4DisplayAuthority } from "./v4Gate.js";
-import { setV4TimelineBusy } from "./v4-timeline-busy-store.js";
+import { getV4TimelineBusy, setV4TimelineBusy } from "./v4-timeline-busy-store.js";
+import { isSessionExecuting } from "../lib/session-execution/queries.js";
 import { resolveSessionBusyFromControl } from "./control-busy.js";
 import {
   getSessionRuntime,
@@ -43,10 +49,14 @@ import {
 import { isSessionRecoveryCooldownActive } from "../lib/stream-reattach-cooldown.js";
 import { evoflowFetch } from "../../lib/ws-client.js";
 import {
+  memoryWatchIntervalMs,
   noteRendererMemoryPressure,
   pinMaxForMemoryLevel,
+  readRendererHeapMb,
   resolveRendererMemoryLevel,
+  shouldContinueCriticalEviction,
 } from "../lib/renderer-memory-pressure.js";
+import { shrinkAllLiveProjectionWindows } from "../../zcode-ui/v4/conversationProjectionStore.js";
 
 export interface V4TimelinePayload {
   sessionId: string;
@@ -56,6 +66,20 @@ export interface V4TimelinePayload {
   onLoadOlder: () => Promise<void> | void;
   /** 快照自动补拉（恢复可视性）：fresh subscribe / resync 后尾窗截断历史时用。 */
   onAutoBackfill: () => Promise<void> | void;
+  /**
+   * 对齐 ZCode SessionPane：宽屏问题导航 `loadAllOlder`（rows/range 到顶一次合并）。
+   * 缺这条时 Timeline 只显示尾窗 2–3 轮，滚动条突然被撑高。
+   */
+  onLoadAllOlder: () => Promise<{
+    status: "hydrated" | "not-enough-queries" | "retryable-failure" | "stale";
+    logEpoch: string;
+  }>;
+  /** 问题导航目录失效代际（real-user 增删后重探测）。 */
+  turnNavigatorDirectoryRevision: number;
+  /**
+   * 跟底 / 回底部钩子（releaseBalloon 已退役为 no-op；保留签名兼容 Timeline）。
+   */
+  onFollowingTip?: () => void;
 }
 
 export type V4BridgePhase =
@@ -84,79 +108,161 @@ export function getSharedV4SessionDataLayer(): SessionDataLayer {
 }
 
 /**
- * 悬停预热限流：每个未命中快照的预热 = 一条完整 V4 快照订阅（单帧 370–854KB，
- * 主线程 JSON.parse）。鼠标扫过会话列表会连续触发，实测一次滑过 8+ 会话可在
- * 1s 内产生 ~4MB 解析导致整窗卡死（2026-10-27 00:44 复现）。
- * 命中已有快照的预热零成本，不受限；冷启动订阅按滑动窗口限量 + 总数封顶。
+ * 悬停预热限流：每个未命中快照的预热 = 一条完整 V4 快照订阅 + 主线程 JSON.parse。
+ * 2026-10-27 实测单帧曾到 370–854KB 并把整窗卡死；同日服务端已加 256KB 字节预算
+ * （60 行尾窗超限对半收缩，conversation.py _SNAPSHOT_MAX_BYTES），帧体积已受控，
+ * 但 parse 仍在主线程，鼠标扫过列表仍会连续触发订阅——限流保留作为主线程防御。
+ * 命中已有快照的预热零成本，不受限；冷启动只按滑动窗口限量。
+ * 不对 layer.size 封顶——pin 会计入 size，封顶会让第 5 路悬停永远预热不到（偏离 ZCode）。
  */
 const WARM_COLD_WINDOW_MS = 3_000;
-/** 1 cold hydrate at a time in the window — parallel 1k+ row hydrates stall Gateway. */
-const WARM_COLD_MAX_PER_WINDOW = 1;
-const WARM_MAX_LIVE_SESSIONS = 4;
+/** 并行冷 hydrate 会拖死 Gateway；窗内最多 2 条。 */
+const WARM_COLD_MAX_PER_WINDOW = 2;
 /** 多会话并跑：钉住最近/执行中会话的租约，避免 30s keep-warm 过期后冷开空白。 */
 const PIN_MAX_SESSIONS_DEFAULT = 4;
 /**
- * 超大投影（复刻长会话常 1k–2k+ 行）后台 pin 会拖死 Gateway hydrate / context PATCH，
- * 表现为「两个对话在跑时点别的会话一直 connecting」。同屏最多钉住 1 条超大会话。
+ * 超大投影（复刻长会话常 1k–2k+ 行）仅用于观测 / 悬停冷预热节流。
+ * pin 数量只走 pinMaxForMemoryLevel（与普通会话同一上限）——对齐 ZCode：
+ * 执行中/最近的长会话一样常驻投影，不再因「超大」少钉一条导致互切冷开。
  */
 const MEGA_PIN_ROW_SOFT_CAP = 900;
-const MEGA_PIN_MAX = 1;
 let _warmColdTimestamps: number[] = [];
 const _pinnedLeases = new Map<string, SessionLease>();
 /** threadId → 取消 pin busy 订阅 */
 const _pinBusyUnsubs = new Map<string, () => void>();
 /** threadId → sessionKey（侧栏 busy 与 runtime lastEventAt 用 sessionKey） */
 const _pinSessionKeyByThread = new Map<string, string>();
-let _memPressureTimer: ReturnType<typeof setInterval> | null = null;
+/**
+ * 跨 Bridge remount 的 sticky 快照（KeepAlive linger 卸掉后再挂也能画 ≤8s）。
+ * 对齐 ZCode：旧投影优于空白。
+ */
+const _stickySnapshotByThread = new Map<
+  string,
+  { snapshot: ConversationSnapshot; at: number }
+>();
+const STICKY_SNAPSHOT_MS = 8_000;
+let _memPressureTimer: ReturnType<typeof setTimeout> | null = null;
+
+function _rememberStickySnapshot(
+  sessionId: string,
+  snapshot: ConversationSnapshot,
+): void {
+  const id = String(sessionId || "").trim();
+  if (!id || !snapshot) return;
+  _stickySnapshotByThread.set(id, { snapshot, at: Date.now() });
+  if (_stickySnapshotByThread.size > 24) {
+    const cutoff = Date.now() - STICKY_SNAPSHOT_MS;
+    for (const [k, v] of _stickySnapshotByThread) {
+      if (v.at < cutoff) _stickySnapshotByThread.delete(k);
+    }
+  }
+}
+
+function _peekStickySnapshot(sessionId: string): ConversationSnapshot | null {
+  const id = String(sessionId || "").trim();
+  if (!id) return null;
+  const hit = _stickySnapshotByThread.get(id);
+  if (!hit) return null;
+  if (Date.now() - hit.at > STICKY_SNAPSHOT_MS) {
+    _stickySnapshotByThread.delete(id);
+    return null;
+  }
+  return hit.snapshot;
+}
+
+/** 侧栏/调试：该 thread 是否已有可画投影（peek 或 sticky）。 */
+export function peekEvoflowV4HasPaintableSnapshot(sessionId: string): boolean {
+  const id = String(sessionId || "").trim();
+  if (!id) return false;
+  try {
+    const store = getSharedLayer().peekStore(id);
+    if (store?.getState()?.snapshot) return true;
+  } catch {
+    /* ignore */
+  }
+  return !!_peekStickySnapshot(id);
+}
+
+function _clearStickySnapshots(): number {
+  const n = _stickySnapshotByThread.size;
+  _stickySnapshotByThread.clear();
+  return n;
+}
+
+function _runMemoryPressurePass(): void {
+  const level = noteRendererMemoryPressure({
+    pinned: _pinnedLeases.size,
+    layerSize: getSharedLayer().size,
+  });
+  if (level === "normal") return;
+
+  // high：挤无快照冷 hydrate；同时强制把已常驻窗口裁到当前 softCap。
+  // critical：heap 仍涨则清空全部 keep-warm + sticky，并对所有 live store 再裁一遍。
+  if (level === "critical" && !shouldContinueCriticalEviction()) {
+    const shrunk = shrinkAllLiveProjectionWindows();
+    if (shrunk > 0) {
+      logV4Life({
+        event: "mem_pressure_shrink_windows",
+        level: "warn",
+        zh: `渲染内存危急但 heap 回落：仍强制裁了 ${shrunk} 个投影窗口。`,
+        detail: { shrunk, heapMb: readRendererHeapMb() },
+        skipDedupe: true,
+      });
+    }
+    return;
+  }
+
+  const keep = [..._pinnedLeases.keys()];
+  const onlyWithoutSnapshot = level === "high";
+  const closed = getSharedLayer().releaseKeepWarmExcept(keep, {
+    onlyWithoutSnapshot,
+    preferLargest: true,
+    // critical：一次清空空闲投影，别每次只挤 2 条看着 heap 涨到 3GB。
+    ...(level === "critical" ? {} : { limit: 4 }),
+  });
+  const shrunk = shrinkAllLiveProjectionWindows();
+  const stickyCleared = level === "critical" ? _clearStickySnapshots() : 0;
+  if (closed > 0 || shrunk > 0 || stickyCleared > 0) {
+    logV4Life({
+      event: "mem_pressure_evict_warm",
+      // warn only — critical eviction is protective, not a product failure.
+      // skipDedupe=false so 2s critical polls don't flood frontend ERROR logs.
+      level: "warn",
+      zh:
+        level === "critical"
+          ? `渲染内存危急：清 keep-warm ${closed}、裁窗口 ${shrunk}、清 sticky ${stickyCleared}，避免 Out of Memory。`
+          : `渲染内存偏高：清 keep-warm ${closed}、裁窗口 ${shrunk}。`,
+      detail: {
+        closed,
+        shrunk,
+        stickyCleared,
+        level,
+        pinned: _pinnedLeases.size,
+        heapMb: readRendererHeapMb(),
+        onlyWithoutSnapshot,
+      },
+    });
+  }
+}
 
 function _ensureMemoryPressureWatch(): void {
   if (_memPressureTimer != null || typeof window === "undefined") return;
-  _memPressureTimer = setInterval(() => {
+  const tick = () => {
     try {
-      const level = noteRendererMemoryPressure({
-        pinned: _pinnedLeases.size,
-        layerSize: getSharedLayer().size,
-      });
-      if (level === "normal") return;
-      // 高压：只留 pin + 当前层已有 ref 的会话，清掉纯 keep-warm，防多会话投影叠爆 WebView。
-      const keep = [..._pinnedLeases.keys()];
-      const closed = getSharedLayer().releaseKeepWarmExcept(keep);
-      if (closed > 0) {
-        logV4Life({
-          event: "mem_pressure_evict_warm",
-          level: level === "critical" ? "error" : "warn",
-          zh: `渲染内存${level === "critical" ? "危急" : "偏高"}：清掉 ${closed} 条 keep-warm 投影，避免 WebView Out of Memory。`,
-          detail: { closed, level, pinned: _pinnedLeases.size },
-          skipDedupe: true,
-        });
-      }
+      _runMemoryPressurePass();
     } catch {
       /* best-effort */
     }
-  }, 15_000);
+    const level = resolveRendererMemoryLevel();
+    _memPressureTimer = setTimeout(tick, memoryWatchIntervalMs(level));
+  };
+  _memPressureTimer = setTimeout(tick, memoryWatchIntervalMs("normal"));
 }
 
 try {
   _ensureMemoryPressureWatch();
 } catch {
   /* ignore */
-}
-
-function _leaseRowCount(lease: SessionLease): number {
-  try {
-    const st = lease.store.getState();
-    return st.snapshot?.rows?.totalCount ?? st.snapshot?.rows?.window?.length ?? 0;
-  } catch {
-    return 0;
-  }
-}
-
-function _pinnedMegaCount(): number {
-  let n = 0;
-  for (const lease of _pinnedLeases.values()) {
-    if (_leaseRowCount(lease) >= MEGA_PIN_ROW_SOFT_CAP) n += 1;
-  }
-  return n;
 }
 
 /** pin busy 订阅指纹：同 store+sk 已订则只推一次，避免 sync 循环撕订触发 #185 */
@@ -261,10 +367,8 @@ export function warmEvoflowV4Session(
     _warmColdTimestamps = _warmColdTimestamps.filter((t) => now - t < WARM_COLD_WINDOW_MS);
     const known = layer.has(id);
     if (!known && !opts?.force) {
-      if (layer.size >= WARM_MAX_LIVE_SESSIONS) return;
+      // 只限「在途冷 hydrate」，不限 layer.size（pin 已占名额时仍应能悬停预热第五路）。
       if (_warmColdTimestamps.length >= WARM_COLD_MAX_PER_WINDOW) return;
-      // 已钉住超大会话时禁止再冷预热：否则 keep_warm 排队把切会话 subscribe 拖到十几秒。
-      if (_pinnedMegaCount() >= MEGA_PIN_MAX) return;
       _warmColdTimestamps.push(now);
     }
     const lease = layer.acquire(id, { intent: "prefetch" });
@@ -358,28 +462,81 @@ try {
 }
 
 /**
- * 用户点开会话前调用：取消其它 keep-warm 中的冷 hydrate，
+ * 用户点开会话前调用：取消其它 keep-warm 中仍在冷 hydrate 的投影，
  * 把 Gateway 订阅槽让给当前会话（仍保留已 pin 的执行中投影）。
+ *
+ * 对齐 ZCode：已有 snapshot 的 keep-warm 不杀——多路并跑切来切去应直接画缓存，
+ * 只有「悬停预热占着冷 hydrate 槽」才需要让路。危急水位仍全清。
  */
 export function focusEvoflowV4SessionForOpen(sessionId: string): void {
   const id = String(sessionId || "").trim();
   if (!id) return;
   try {
     const level = noteRendererMemoryPressure({ focus: id });
-    // 危急水位：只保当前点开，连 pin 也先让路（随后 sync pin 会按更小上限重钉）。
-    const keep =
-      level === "critical" ? [id] : [id, ..._pinnedLeases.keys()];
-    const closed = getSharedLayer().releaseKeepWarmExcept(keep);
+    // 危急水位：仍保 pin + 当前点开；只额外挤掉最多 1 条最大空闲 keep-warm（随后 sync 会按 pinMax 重钉）。
+    const keep = [id, ..._pinnedLeases.keys()];
+    const onlyWithoutSnapshot = level !== "critical";
+    const closed = getSharedLayer().releaseKeepWarmExcept(keep, {
+      onlyWithoutSnapshot,
+      ...(level === "critical"
+        ? { limit: 1, preferLargest: true }
+        : {}),
+    });
     if (closed > 0) {
       logV4Life({
         event: "focus_cancel_warm",
         threadId: id,
-        zh: `用户打开会话：取消 ${closed} 条后台 keep-warm 投影，避免 hydrate 排队堵点击。`,
-        detail: { closed, keepCount: keep.length, memLevel: level },
+        zh: onlyWithoutSnapshot
+          ? `用户打开会话：取消 ${closed} 条无快照冷 hydrate keep-warm，保留已有投影缓存。`
+          : `用户打开会话（内存危急）：挤掉 ${closed} 条最大空闲 keep-warm，保留 pin/当前投影。`,
+        detail: {
+          closed,
+          keepCount: keep.length,
+          memLevel: level,
+          onlyWithoutSnapshot,
+        },
       });
     }
   } catch {
     /* best effort */
+  }
+}
+
+/**
+ * Agent 应用（无限画布等）要在同 WebView 里再挂重 iframe / 本地服务。
+ * 开签前主动挤掉 keep-warm，避免对话投影 + SPA 叠爆渲染进程（点不动 / OOM）。
+ */
+export function prepareRendererForHeavyStage(detail?: Record<string, unknown>): void {
+  try {
+    const level = noteRendererMemoryPressure({
+      reason: "heavy_stage",
+      ...(detail || {}),
+    });
+    const keep = [..._pinnedLeases.keys()];
+    const closed = getSharedLayer().releaseKeepWarmExcept(keep, {
+      // 开重 UI：有快照的空闲投影也挤，只保 pin（执行中）。
+      onlyWithoutSnapshot: false,
+      preferLargest: true,
+    });
+    const shrunk = shrinkAllLiveProjectionWindows();
+    if (level === "critical") _clearStickySnapshots();
+    if (closed > 0 || shrunk > 0) {
+      logV4Life({
+        event: "heavy_stage_evict_warm",
+        level: level === "critical" ? "error" : "warn",
+        zh: `打开重型右栏前：清 keep-warm ${closed}、裁窗口 ${shrunk}，给 Agent 应用腾渲染内存。`,
+        detail: {
+          closed,
+          shrunk,
+          level,
+          pinned: _pinnedLeases.size,
+          ...(detail || {}),
+        },
+        skipDedupe: true,
+      });
+    }
+  } catch {
+    /* best-effort */
   }
 }
 
@@ -401,7 +558,19 @@ export function syncEvoflowV4PinnedSessions(
   targets: readonly (string | V4PinTarget)[],
 ): void {
   const memLevel = resolveRendererMemoryLevel();
-  const pinMax = pinMaxForMemoryLevel(memLevel) || PIN_MAX_SESSIONS_DEFAULT;
+  // high：执行中+选中可能 ≥3；保底 max(水位上限, min(请求数, 4))，避免第 3/4 路被挤冷开。
+  const basePinMax = pinMaxForMemoryLevel(memLevel) || PIN_MAX_SESSIONS_DEFAULT;
+  const requested = targets.reduce((n, raw) => {
+    const id =
+      typeof raw === "string"
+        ? String(raw || "").trim()
+        : String(raw?.threadId || "").trim();
+    return id ? n + 1 : n;
+  }, 0);
+  const pinMax =
+    memLevel === "high"
+      ? Math.max(basePinMax, Math.min(requested, 6))
+      : basePinMax;
   const want: string[] = [];
   const seen = new Set<string>();
   const sessionByThread = new Map<string, string>();
@@ -441,31 +610,11 @@ export function syncEvoflowV4PinnedSessions(
     });
   }
   const layer = getSharedLayer();
-  const primaryId = want[0] || "";
-  let megaPinned = _pinnedMegaCount();
   for (const id of want) {
     const sk = sessionByThread.get(id) || _pinSessionKeyByThread.get(id) || "";
     const existing = _pinnedLeases.get(id);
     if (existing) {
-      const existingRows = _leaseRowCount(existing);
-      // 非首选的超大 pin：一律释放，把 Gateway 留给当前点开的会话 hydrate。
-      if (existingRows >= MEGA_PIN_ROW_SOFT_CAP && id !== primaryId) {
-        try {
-          existing.release();
-        } catch {
-          /* ignore */
-        }
-        _pinnedLeases.delete(id);
-        _releasePinBusy(id, true);
-        megaPinned = Math.max(0, megaPinned - 1);
-        logV4Life({
-          event: "pin_release",
-          threadId: id,
-          zh: `释放超大投影钉住（行数≈${existingRows}）→ 避免拖死其它会话打开。`,
-          detail: { rowCount: existingRows, pinned: _pinnedLeases.size },
-        });
-        continue;
-      }
+      // 已钉住（含超长会话）切走主选也不释放：对齐 ZCode「有投影继续显示」。
       try {
         existing.store.ensureConnected();
       } catch {
@@ -475,36 +624,24 @@ export function syncEvoflowV4PinnedSessions(
       continue;
     }
     try {
-      // pin 集合已截断到 PIN_MAX；允许冷 acquire，不被悬停 warm 的 live 上限挡住。
+      // pin 集合已截断到 pinMax；长/短会话同一配额，允许冷 acquire。
       const lease = layer.acquire(id);
       const st = lease.store.getState();
       const rowCount =
         st.snapshot?.rows?.totalCount ?? st.snapshot?.rows?.window?.length ?? 0;
       const isMega = rowCount >= MEGA_PIN_ROW_SOFT_CAP;
-      if (isMega && megaPinned >= MEGA_PIN_MAX && id !== primaryId) {
-        try {
-          lease.release();
-        } catch {
-          /* ignore */
-        }
-        logV4Life({
-          event: "pin_skip_mega",
-          threadId: id,
-          zh: `跳过钉住超大投影（行数≈${rowCount}，已有 ${megaPinned} 条）→ 保护切会话。`,
-          detail: { rowCount, megaPinned, primaryId: primaryId || null },
-        });
-        continue;
-      }
       _pinnedLeases.set(id, lease);
-      if (isMega) megaPinned += 1;
       if (sk) _pushPinBusyFromStore(id, sk, lease.store);
       logV4Life({
         event: "pin_acquire",
         threadId: id,
-        zh: `钉住 V4 投影租约（openKind=${lease.openKind}，行数≈${rowCount}）→ 切回不应冷开空白。`,
+        zh: isMega
+          ? `钉住超长会话 V4 投影（行数≈${rowCount}，openKind=${lease.openKind}）→ 与普通会话同配额，切回不冷开。`
+          : `钉住 V4 投影租约（openKind=${lease.openKind}，行数≈${rowCount}）→ 切回不应冷开空白。`,
         detail: {
           openKind: lease.openKind,
           rowCount,
+          isMega,
           storeStatus: st.status,
           pinned: _pinnedLeases.size,
           sessionKey: sk || null,
@@ -518,14 +655,57 @@ export function syncEvoflowV4PinnedSessions(
 
 /** In-flight + last catchup — coalesce observer 1.5s ticks. */
 const _catchupInFlight = new Set<string>();
-const _catchupStableAt = new Map<string, { at: number; reason: string }>();
+export type LastV4CatchupSnap = {
+  at: number;
+  reason: string;
+  hubTip?: number | null;
+  clientTip?: number | null;
+  notified?: number | null;
+  subscriberCount?: number | null;
+  changed?: boolean;
+};
+const _catchupStableAt = new Map<string, LastV4CatchupSnap>();
 /** V4 已有投影时，旁观只做低频 soft reconcile；高频 catchup 会与 live mirror 对打（189↔351）。 */
 const CATCHUP_READY_SOFT_MS = 20_000;
 const CATCHUP_AFTER_REHYDRATE_MS = 12_000;
 const CATCHUP_STABLE_MS = 2_800;
+/**
+ * 直播中 catchup 采样常比本机 delta 慢 1～几行（现场 FE=2447 hub=2445）。
+ * 小于此阈值的 tip 差不当幽灵/落后，禁止 recoverFromStaleAuthority（会打飞进行中订阅 → 等不到首字）。
+ */
+const TIP_DIVERGE_MIN = 5;
+
+function tipAheadBy(
+  a: number | null | undefined,
+  b: number | null | undefined,
+): boolean {
+  return (
+    typeof a === "number" &&
+    typeof b === "number" &&
+    Number.isFinite(a) &&
+    Number.isFinite(b) &&
+    a - b >= TIP_DIVERGE_MIN
+  );
+}
+
+/** 视口根因对账：读最近一次 catchup 对账快照（无则 null）。 */
+export function peekLastV4Catchup(
+  sessionId: string,
+): LastV4CatchupSnap | null {
+  const id = String(sessionId || "").trim();
+  if (!id) return null;
+  return _catchupStableAt.get(id) ?? null;
+}
 
 function _catchupCooldownMs(reason: string, softIntervalMs = CATCHUP_READY_SOFT_MS): number {
-  if (reason === "post-rehydrate" || reason === "rehydrated") return CATCHUP_AFTER_REHYDRATE_MS;
+  if (
+    reason === "post-rehydrate" ||
+    reason === "rehydrated" ||
+    reason === "client-stale-resync" ||
+    reason === "client-behind-resync"
+  ) {
+    return CATCHUP_AFTER_REHYDRATE_MS;
+  }
   if (reason === "ready-soft") return softIntervalMs;
   return CATCHUP_STABLE_MS;
 }
@@ -536,7 +716,18 @@ export type RefreshEvoflowV4Opts = {
    * 默认 20s（飞书旁观防与 live mirror 对打）；工作流节点右栏无本机流式时可传 ~2–3s。
    */
   softIntervalMs?: number;
+  /**
+   * 切回校准：服务端只 settle phase / 指纹，禁止 clear_projection wipe
+   *（对齐 ZCode：客户端已有投影继续显示）。
+   */
+  preferSettleOnly?: boolean;
 };
+
+/** 旁观/切回 catchup 是否在途（Timeline autoBackfill 避让）。 */
+export function isEvoflowV4CatchupInFlight(sessionId: string): boolean {
+  const id = String(sessionId || "").trim();
+  return !!id && _catchupInFlight.has(id);
+}
 
 /**
  * 手动重连入口（v4-failed 终态「重新连接」按钮落点）：重燃该会话 store 的
@@ -580,6 +771,7 @@ export function refreshEvoflowV4Session(
     500,
     Number(opts?.softIntervalMs) > 0 ? Number(opts?.softIntervalMs) : CATCHUP_READY_SOFT_MS,
   );
+  const preferSettleOnly = opts?.preferSettleOnly === true;
   if (_catchupInFlight.has(id)) {
     console.info("[observer-hw] v4 catchup skipped (in-flight)", { threadId: id });
     return;
@@ -595,34 +787,57 @@ export function refreshEvoflowV4Session(
     return;
   }
 
-  // 已有 V4 投影：旁观 tick 不要每 1.5s wipe；只低频 soft reconcile。
+  // 先读本机 tip/epoch：既用于请求体对账，也用于判断是否跳过 soft coalesce。
+  let clientTipRowId: number | null = null;
+  let clientLogEpoch: string | null = null;
+  let clientTotalCount: number | null = null;
+  let localRowCount = 0;
   try {
     const layer = getSharedLayer();
     if (layer.has(id)) {
       const lease = layer.acquire(id);
       try {
-        const st = lease.store.getState();
-        const n =
-          st.snapshot?.rows?.totalCount ?? st.snapshot?.rows?.window?.length ?? 0;
-        if (st.snapshot && n > 0) {
-          const last = _catchupStableAt.get(id);
-          const softDue = !last || Date.now() - last.at >= softIntervalMs;
-          if (!softDue) {
-            console.info("[observer-hw] v4 catchup skipped (ready)", {
-              threadId: id,
-              rows: n,
-              ageMs: last ? Date.now() - last.at : null,
-              softIntervalMs,
-            });
-            return;
-          }
-        }
+        const snap = lease.store.getState().snapshot;
+        const win = snap?.rows?.window ?? [];
+        const last = win.length ? win[win.length - 1] : null;
+        const tip = Number(last?.rowId);
+        clientTipRowId = Number.isFinite(tip) && tip > 0 ? tip : null;
+        clientLogEpoch = snap?.logEpoch != null ? String(snap.logEpoch) : null;
+        const total = Number(snap?.rows?.totalCount);
+        clientTotalCount =
+          Number.isFinite(total) && total > 0 ? Math.floor(total) : null;
+        localRowCount =
+          clientTotalCount ?? (win.length > 0 ? win.length : 0);
       } finally {
         try {
           lease.release();
         } catch {
           /* ignore */
         }
+      }
+    }
+  } catch {
+    /* ignore local meta */
+  }
+
+  // 已有 V4 投影：旁观 tick 不要每 1.5s wipe；只低频 soft reconcile。
+  // 例外：
+  // - 本机 tip 高于上次 hub tip → 幽灵膨胀
+  // - 本机 tip 低于上次 hub tip → frames 丢了（AG-UI 在跑、V4 钉死）
+  try {
+    if (localRowCount > 0) {
+      const last = _catchupStableAt.get(id);
+      const softDue = !last || Date.now() - last.at >= softIntervalMs;
+      const tipGhostVsLastHub = tipAheadBy(clientTipRowId, last?.hubTip);
+      const tipLagVsLastHub = tipAheadBy(last?.hubTip, clientTipRowId);
+      if (!softDue && !tipGhostVsLastHub && !tipLagVsLastHub) {
+        console.info("[observer-hw] v4 catchup skipped (ready)", {
+          threadId: id,
+          rows: localRowCount,
+          ageMs: last ? Date.now() - last.at : null,
+          softIntervalMs,
+        });
+        return;
       }
     }
   } catch {
@@ -634,11 +849,20 @@ export function refreshEvoflowV4Session(
     let catchupChanged = false;
     let catchupOk = false;
     let catchupReason = "";
+    let serverTip: number | null = null;
+    let serverRows: number | null = null;
+    let serverEpoch: string | null = null;
+    let subscriberCount: number | null = null;
     try {
       const resp = await evoflowFetch("/api/v4/conversation/catchup", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sessionId: id }),
+        body: JSON.stringify({
+          sessionId: id,
+          ...(preferSettleOnly ? { preferSettleOnly: true } : {}),
+          ...(clientTipRowId != null ? { clientTipRowId } : {}),
+          ...(clientLogEpoch ? { clientLogEpoch } : {}),
+        }),
       });
       if (resp.ok) {
         catchupOk = true;
@@ -647,20 +871,64 @@ export function refreshEvoflowV4Session(
             changed?: boolean;
             rows?: number;
             reason?: string;
+            tipRowId?: number | null;
+            logEpoch?: string | number | null;
+            notified?: number | null;
+            subscriberCount?: number | null;
           };
           catchupChanged = Boolean(body?.changed);
           catchupReason = String(body?.reason || "");
+          const tipN = Number(body?.tipRowId);
+          serverTip = Number.isFinite(tipN) && tipN > 0 ? tipN : null;
+          const rowsN = Number(body?.rows);
+          serverRows = Number.isFinite(rowsN) && rowsN >= 0 ? rowsN : null;
+          serverEpoch =
+            body?.logEpoch != null && String(body.logEpoch).trim()
+              ? String(body.logEpoch)
+              : null;
+          const notifiedN = Number(body?.notified);
+          const subCountN = Number(body?.subscriberCount);
+          const notified =
+            Number.isFinite(notifiedN) ? notifiedN : null;
+          subscriberCount =
+            Number.isFinite(subCountN) ? subCountN : null;
+          // recovery 广播无人收（双订阅后退订光了）→ 必须当 tip 落后处理，强制重连。
+          if (
+            catchupChanged &&
+            notified != null &&
+            notified <= 0 &&
+            (catchupReason === "client-behind-resync" ||
+              catchupReason === "client-stale-resync" ||
+              catchupReason === "rehydrated")
+          ) {
+            catchupReason = `${catchupReason}+notified0`;
+          }
           console.info("[observer-hw] v4 catchup", {
             threadId: id,
             changed: catchupChanged,
             rows: body?.rows,
+            tipRowId: body?.tipRowId,
+            logEpoch: body?.logEpoch,
+            notified,
+            subscriberCount,
+            clientTipRowId,
+            clientLogEpoch,
             reason: catchupReason,
           });
           _catchupStableAt.set(id, {
             at: Date.now(),
             reason: catchupChanged
-              ? "post-rehydrate"
+              ? catchupReason === "client-stale-resync" ||
+                  catchupReason === "client-behind-resync" ||
+                  catchupReason.includes("notified0")
+                ? catchupReason
+                : "post-rehydrate"
               : catchupReason || "ready-soft",
+            hubTip: serverTip ?? serverRows,
+            clientTip: clientTipRowId,
+            notified,
+            subscriberCount,
+            changed: catchupChanged,
           });
         } catch {
           /* ignore parse */
@@ -683,21 +951,85 @@ export function refreshEvoflowV4Session(
         warmEvoflowV4Session(id, { force: true });
         return;
       }
-      // catchup HTTP 成功则禁止再 resync：
-      // - changed=true：服务端已广播 recovery
-      // - changed=false：投影未变 / live-mirror，再 resync 也会整页 recovery → 抖动
-      // 仅 catchup 失败时才 recoverFromStaleAuthority。
-      if (catchupOk) {
+      // catchup HTTP 成功：
+      // - changed=true：服务端已广播 recovery（client-stale / client-behind）
+      // - 但本机 tip 仍与 hub tip 分叉 / epoch 不一致时，说明错过了帧 → 主动 recover
+      // - changed=false 且 tip 对齐：禁止再 resync（防抖动）
+      // 仅 catchup 失败时才无条件 recoverFromStaleAuthority。
+      const hubTip = serverTip ?? serverRows;
+      // 微差（< TIP_DIVERGE_MIN）= live 采样噪声，不当 clientStale。
+      const tipGhost = tipAheadBy(clientTipRowId, hubTip);
+      const tipLag = tipAheadBy(hubTip, clientTipRowId);
+      const microTipNoise =
+        clientTipRowId != null &&
+        hubTip != null &&
+        clientTipRowId !== hubTip &&
+        !tipGhost &&
+        !tipLag;
+      const totalGhost =
+        clientTotalCount != null &&
+        serverRows != null &&
+        clientTotalCount - serverRows >= TIP_DIVERGE_MIN;
+      const epochMismatch =
+        !!clientLogEpoch &&
+        !!serverEpoch &&
+        clientLogEpoch !== serverEpoch &&
+        (tipGhost || tipLag);
+      // hub 回报 subscriberCount=0：本机 store 以为 live，hub 侧已无订户
+      // （unsubscribe 风暴后常见）→ recovery 帧没人收，必须重订。
+      const hubNoSubs =
+        subscriberCount != null && subscriberCount <= 0;
+      const clientStale =
+        tipGhost ||
+        tipLag ||
+        totalGhost ||
+        epochMismatch ||
+        hubNoSubs ||
+        catchupReason === "client-stale-resync" ||
+        catchupReason === "client-behind-resync" ||
+        catchupReason.includes("notified0");
+
+      // live-mirror / hub-subscribed：tip 对齐或仅微差噪声 → 别 resync（防打飞直播订阅）。
+      // tip 真落后/幽灵（≥TIP_DIVERGE_MIN）或 notified0：才 recoverFromStaleAuthority。
+      if (catchupOk && !clientStale) {
         if (catchupChanged) {
           console.info("[observer-hw] v4 skip resync (catchup already recovered)", {
             threadId: id,
             reason: catchupReason || "rehydrated",
           });
+        } else if (microTipNoise) {
+          console.info("[observer-hw] v4 skip resync (micro tip noise)", {
+            threadId: id,
+            clientTipRowId,
+            hubTip,
+            reason: catchupReason || "ready-soft",
+          });
         }
+        return;
+      }
+      if (
+        catchupOk &&
+        (catchupReason === "live-mirror" || catchupReason === "hub-subscribed") &&
+        !tipLag &&
+        !tipGhost &&
+        !hubNoSubs
+      ) {
         return;
       }
       const lease = layer.acquire(id);
       try {
+        if (catchupOk && clientStale) {
+          console.warn("[observer-hw] v4 tip diverge after catchup → recover", {
+            threadId: id,
+            reason: catchupReason || (tipLag ? "tip-lag" : "tip-ghost"),
+            clientTipRowId,
+            hubTip,
+            clientTotalCount,
+            serverRows,
+            clientLogEpoch,
+            serverEpoch,
+          });
+        }
         lease.store.recoverFromStaleAuthority();
       } finally {
         try {
@@ -778,29 +1110,42 @@ export function V4StreamRowsBridge(props: {
   /** v4 session id = LangGraph threadId。 */
   sessionId: string | null;
   enabled: boolean;
+  /**
+   * 前台可见 host（主聊选中）。KeepAlive 隐藏 host 传 false：
+   * 仍 acquire 常驻投影，但不抢 focus/display authority（对齐 ZCode hidden pane）。
+   */
+  foreground?: boolean;
   children: (payload: V4TimelinePayload | null, phase: V4BridgePhase) => ReactNode;
 }): ReactNode {
   const { sessionId, enabled, children } = props;
+  const foreground = props.foreground !== false;
   const layer = useMemo(() => getSharedLayer(), []);
   const [lease, setLease] = useState<SessionLease | null>(null);
   /** 重入补拉节流：sessionKey → 上次触发时间（refreshEvoflowV4Session 自身还有去重/冷却）。 */
   const switchBackCatchupAtRef = useRef<Map<string, number>>(new Map());
+  /**
+   * peek/lease 都 miss 时（刚被 mem 驱逐 / keep-warm 过期）仍用上一帧同 thread 快照画 ≤8s，
+   * 避免 connecting 空闪——对齐 ZCode「旧投影优于空白」。
+   * 模块级 Map：KeepAlive remount 后仍可命中。
+   */
+  const stickySnapRef = useRef<{
+    sessionId: string;
+    snapshot: ConversationSnapshot;
+    at: number;
+  } | null>(null);
 
-  // layout：尽量在绘制前换租约，减少「新 sessionId + 旧 store」错配一帧。
+  // 租约只跟 sessionId：KeepAlive 前后台切换不 release/re-acquire（对齐 ZCode pane 常驻）。
   useLayoutEffect(() => {
     if (!enabled || !sessionId) {
       setLease(null);
       return;
     }
-    bindV4OpenThread(sessionId);
-    bindOpenTraceThread(sessionId);
-    // 先清掉其它 keep-warm 冷 hydrate，再 acquire——用户点击插队。
-    focusEvoflowV4SessionForOpen(sessionId);
     const acquireStartedAt = Date.now();
     const acquired = layer.acquire(sessionId);
     const acquireMs = Date.now() - acquireStartedAt;
     const st = acquired.store.getState();
     const hasSnap = Boolean(st.snapshot);
+    const stickyHit = !hasSnap ? _peekStickySnapshot(sessionId) : null;
     const rowCount =
       st.snapshot?.rows?.totalCount ?? st.snapshot?.rows?.window?.length ?? 0;
     const since = v4OpenSinceClickMs({ threadId: sessionId });
@@ -808,19 +1153,24 @@ export function V4StreamRowsBridge(props: {
       "acquire",
       hasSnap
         ? `V4 租约已挂上（命中缓存快照，openKind=${acquired.openKind}，行数≈${rowCount}）`
-        : `V4 租约已挂上（无缓存快照，openKind=${acquired.openKind}，store=${st.status}）`,
+        : stickyHit
+          ? `V4 租约已挂上（无 store 快照，sticky 可先画，openKind=${acquired.openKind}）`
+          : `V4 租约已挂上（无缓存快照，openKind=${acquired.openKind}，store=${st.status}）`,
       {
         acquireMs,
         openKind: acquired.openKind,
         hasSnapshot: hasSnap,
+        stickyPaint: !!stickyHit,
         rowCount,
         storeStatus: st.status,
       },
       {
         reason: hasSnap
           ? undefined
-          : `openKind=${acquired.openKind}：这是冷开（没有可复用的投影 store），后面还要等服务端 subscribe + 首帧 snapshot 才会上屏。` +
-            `openKind=cold 且会话很久没打开过 → 慢在服务端 hydrate 拉库；openKind=warm 说明刚被预热过。`,
+          : stickyHit
+            ? undefined
+            : `openKind=${acquired.openKind}：这是冷开（没有可复用的投影 store），后面还要等服务端 subscribe + 首帧 snapshot 才会上屏。` +
+              `openKind=cold 且会话很久没打开过 → 慢在服务端 hydrate 拉库；openKind=warm 说明刚被预热过。`,
       },
     );
     logV4Life({
@@ -828,10 +1178,13 @@ export function V4StreamRowsBridge(props: {
       threadId: sessionId,
       zh: hasSnap
         ? `点击后租约已挂上：命中缓存快照（openKind=${acquired.openKind}，行数≈${rowCount}）→ 应几乎立刻上屏。`
-        : `点击后租约已挂上：无缓存快照（openKind=${acquired.openKind}，store=${st.status}）→ 需等 subscribe/首帧，这是「慢」的主路径。`,
+        : stickyHit
+          ? `点击后租约已挂上：store 无快照但 sticky 可先画（openKind=${acquired.openKind}）→ 等 subscribe 校准。`
+          : `点击后租约已挂上：无缓存快照（openKind=${acquired.openKind}，store=${st.status}）→ 需等 subscribe/首帧，这是「慢」的主路径。`,
       detail: {
         openKind: acquired.openKind,
         hasSnapshot: hasSnap,
+        stickyPaint: !!stickyHit,
         rowCount,
         storeStatus: st.status,
         subscriptionId: st.subscriptionId,
@@ -839,8 +1192,6 @@ export function V4StreamRowsBridge(props: {
       },
       skipDedupe: true,
     });
-    // acquire 后立刻自愈卡住的 connecting（SessionDataLayer 已 ensureConnected；
-    // 这里再兜一层，覆盖 lease 已挂上但首帧仍未到的 hung HTTP：短延迟 retry）。
     let earlyRetryTimer: number | null = null;
     if (!hasSnap && st.status === "connecting" && !st.subscriptionId) {
       earlyRetryTimer = window.setTimeout(() => {
@@ -861,39 +1212,233 @@ export function V4StreamRowsBridge(props: {
         }
       }, 1_200);
     }
-    // 重入（warm/keep_warm 命中缓存快照）≠ 冷开：缓存快照可能是切走期间冻结
-    // 的旧投影——后台 run 的终态与新增行不会自己走进来，且服务端 10s 收口
-    // reconcile 只覆盖「已终态」。补拉一次 catchup：mirror 活着会被服务端拒绝，
-    // 幂等且有 in-flight/冷却去重，同会话 8s 内不重复触发。
-    if (hasSnap && rowCount > 0) {
-      const key = String(sessionId);
-      const now = Date.now();
-      const last = switchBackCatchupAtRef.current.get(key) ?? 0;
-      if (now - last > 8_000) {
-        switchBackCatchupAtRef.current.set(key, now);
-        if (switchBackCatchupAtRef.current.size > 64) {
-          const cutoff = now - 60_000;
-          for (const [k, at] of switchBackCatchupAtRef.current) {
-            if (at < cutoff) switchBackCatchupAtRef.current.delete(k);
-          }
-        }
-        queueMicrotask(() => refreshEvoflowV4Session(key, { softIntervalMs: 2_800 }));
-        logV4Life({
-          event: "switch_back_catchup",
-          threadId: sessionId,
-          zh: "切回会话：缓存快照可能是冻结的旧投影，补拉一次 catchup 校准。",
-          detail: { openKind: acquired.openKind, rowCount },
-          skipDedupe: true,
-        });
-      }
-    }
     setLease(acquired);
     return () => {
       if (earlyRetryTimer != null) window.clearTimeout(earlyRetryTimer);
       acquired.release();
-      setLease(null);
     };
   }, [layer, enabled, sessionId]);
+
+  // 前台冷开可观测；后台 host keep 连接（失活 forceMount 切回不冷开）。
+  // 故意不绑进 acquire effect：前后台切换不得 release/re-acquire。
+  useLayoutEffect(() => {
+    if (!enabled || !sessionId) return;
+    const store =
+      (lease && lease.sessionId === sessionId ? lease.store : null) ||
+      layer.peekStore(sessionId);
+    if (!store) return;
+    if (!foreground) {
+      try {
+        store.ensureConnected();
+      } catch {
+        /* best-effort */
+      }
+      return;
+    }
+    const st = store.getState();
+    const hasSnap = Boolean(st.snapshot);
+    const stickyHit = !hasSnap ? _peekStickySnapshot(sessionId) : null;
+    if (!hasSnap && !stickyHit) {
+      logV4Life({
+        event: "open_cold",
+        level: "warn",
+        threadId: sessionId,
+        zh: `将冷开上屏：无 pin/keep-warm/sticky 快照（store=${st.status}）。悬停预热或 KeepAlive 可避免。`,
+        detail: {
+          storeStatus: st.status,
+          pinned: _pinnedLeases.has(sessionId),
+        },
+        skipDedupe: true,
+      });
+    }
+  }, [foreground, enabled, sessionId, lease, layer]);
+
+  // 前台：focus 插队 + 非 live 时 soft catchup。后台 KeepAlive 不抢槽、不 catchup。
+  useLayoutEffect(() => {
+    if (!foreground || !enabled || !sessionId) return;
+    bindV4OpenThread(sessionId);
+    bindOpenTraceThread(sessionId);
+    focusEvoflowV4SessionForOpen(sessionId);
+    const storeForCatchup =
+      (lease && lease.sessionId === sessionId ? lease.store : null) ||
+      layer.peekStore(sessionId);
+    if (!storeForCatchup) return;
+    const st = storeForCatchup.getState();
+    const hasSnap = Boolean(st.snapshot);
+    const rowCount =
+      st.snapshot?.rows?.totalCount ?? st.snapshot?.rows?.window?.length ?? 0;
+    if (!hasSnap || rowCount <= 0) return;
+    const liveSubscribed =
+      st.status === "live" && Boolean(st.subscriptionId);
+    // live+订阅仍可能 frames 丢了（WIRE_WITHOUT_V4_TIP：AG-UI 在跑、v4 行不涨）。
+    // 现场 09:37：sub active、frames up，但 hub tip=1 / FE=2155 / subscriberCount=0；
+    // 旧逻辑「无 tipLag 就 skip」在 catchup 从未跑过（hub=∅）时永久跳过对账。
+    if (liveSubscribed) {
+      const win = st.snapshot?.rows?.window ?? [];
+      const tipN = Number(win.length ? win[win.length - 1]?.rowId : 0);
+      const localTip = Number.isFinite(tipN) && tipN > 0 ? tipN : null;
+      const lastCatchup = _catchupStableAt.get(String(sessionId));
+      const lastHub = lastCatchup?.hubTip ?? null;
+      const tipLag = tipAheadBy(lastHub, localTip);
+      const tipGhost = tipAheadBy(localTip, lastHub);
+      const neverCaughtUp = !lastCatchup;
+      const hubSubsZero =
+        lastCatchup?.subscriberCount != null &&
+        lastCatchup.subscriberCount <= 0;
+      const notified0 =
+        lastCatchup?.notified != null && lastCatchup.notified <= 0;
+      const mustReconcile =
+        tipLag || tipGhost || neverCaughtUp || hubSubsZero || notified0;
+      if (!mustReconcile) {
+        logV4Life({
+          event: "switch_back_catchup_skip",
+          threadId: sessionId,
+          zh: "切回会话：投影仍 live 且有订阅，跳过 catchup（避免 rehydrate 闪烁）。",
+          detail: {
+            rowCount,
+            storeStatus: st.status,
+            subscriptionId: st.subscriptionId,
+          },
+          skipDedupe: true,
+        });
+        return;
+      }
+      logV4Life({
+        event: "switch_back_catchup_force",
+        threadId: sessionId,
+        zh: tipGhost
+          ? "切回会话：本机 tip 高于 hub（幽灵膨胀），强制 soft catchup。"
+          : neverCaughtUp
+            ? "切回会话：从未 catchup 对账过，强制 soft catchup。"
+            : hubSubsZero || notified0
+              ? "切回会话：hub 订户为 0 / notified=0，强制 soft catchup 重订。"
+              : "切回会话：live 订阅但本机 tip 落后上次 hub tip，强制 soft catchup。",
+        detail: {
+          localTip,
+          lastHub,
+          rowCount,
+          subscriptionId: st.subscriptionId,
+          neverCaughtUp,
+          hubSubsZero,
+          notified0,
+        },
+        skipDedupe: true,
+      });
+    }
+    const key = String(sessionId);
+    const now = Date.now();
+    const last = switchBackCatchupAtRef.current.get(key) ?? 0;
+    if (now - last <= 8_000) return;
+    switchBackCatchupAtRef.current.set(key, now);
+    if (switchBackCatchupAtRef.current.size > 64) {
+      const cutoff = now - 60_000;
+      for (const [k, at] of switchBackCatchupAtRef.current) {
+        if (at < cutoff) switchBackCatchupAtRef.current.delete(k);
+      }
+    }
+    const lastCatchupForSettle = _catchupStableAt.get(key);
+    // tip 已分叉 / hub 无订户：不许 preferSettleOnly（否则服务端 settle-only 跳过 resync）。
+    let tipMayDiverge = !lastCatchupForSettle;
+    if (lastCatchupForSettle) {
+      const winNow = st.snapshot?.rows?.window ?? [];
+      const tipNow = Number(winNow.length ? winNow[winNow.length - 1]?.rowId : 0);
+      const localNow = Number.isFinite(tipNow) && tipNow > 0 ? tipNow : null;
+      if (
+        tipAheadBy(localNow, lastCatchupForSettle.hubTip) ||
+        tipAheadBy(lastCatchupForSettle.hubTip, localNow)
+      ) {
+        tipMayDiverge = true;
+      }
+      if (
+        lastCatchupForSettle.subscriberCount != null &&
+        lastCatchupForSettle.subscriberCount <= 0
+      ) {
+        tipMayDiverge = true;
+      }
+    }
+    queueMicrotask(() =>
+      refreshEvoflowV4Session(key, {
+        softIntervalMs: 2_800,
+        preferSettleOnly: !tipMayDiverge,
+      }),
+    );
+    logV4Life({
+      event: "switch_back_catchup",
+      threadId: sessionId,
+      zh: tipMayDiverge
+        ? "切回会话：tip/订户可能分叉，catchup 对账（允许 client-stale/behind recovery）。"
+        : "切回会话：缓存快照可能已冻结（非 live），settle-only catchup 校准（不 wipe）。",
+      detail: {
+        rowCount,
+        storeStatus: st.status,
+        preferSettleOnly: !tipMayDiverge,
+      },
+      skipDedupe: true,
+    });
+  }, [foreground, enabled, sessionId, lease, layer]);
+
+  // AG-UI 在跑但 V4 帧/对账静默：每 ~4s 强制 soft catchup（不 preferSettleOnly）。
+  // 现场：乐观泡「工作中」+ streamMax=∅ + hub 订户 0，切回 skip 把恢复堵死。
+  useEffect(() => {
+    if (!foreground || !enabled || !sessionId) return;
+    const tid = String(sessionId);
+    let cancelled = false;
+    const tick = () => {
+      if (cancelled) return;
+      try {
+        const storeForWatch =
+          (lease && lease.sessionId === sessionId ? lease.store : null) ||
+          layer.peekStore(sessionId);
+        if (!storeForWatch) return;
+        const st = storeForWatch.getState();
+        if (st.status !== "live" || !st.subscriptionId) return;
+        const sessionKey = _pinSessionKeyByThread.get(tid) || tid;
+        const rt = getSessionRuntime(sessionKey);
+        const executing =
+          getV4TimelineBusy(sessionKey) ||
+          isSessionExecuting(sessionKey) ||
+          isTurnBusy(rt) ||
+          isLivePostStreamOpen(rt);
+        const win = st.snapshot?.rows?.window ?? [];
+        const hasLiveRow = win.some((r) => {
+          const state = String((r as { state?: string }).state || "");
+          const status = String((r as { status?: string }).status || "");
+          return (
+            state === "streaming" ||
+            state.startsWith("running") ||
+            status === "running" ||
+            status === "executing"
+          );
+        });
+        const last = _catchupStableAt.get(tid);
+        const hubSubsZero =
+          last?.subscriberCount != null && last.subscriberCount <= 0;
+        const neverCaughtUp = !last;
+        const tipN = Number(win.length ? win[win.length - 1]?.rowId : 0);
+        const localTip = Number.isFinite(tipN) && tipN > 0 ? tipN : null;
+        const tipGhost = tipAheadBy(localTip, last?.hubTip);
+        const tipLag = tipAheadBy(last?.hubTip, localTip);
+        // 健康：有直播行且 hub 有订户、无明显 tip 分叉 → 不打扰。
+        if (hasLiveRow && !hubSubsZero && !tipGhost && !tipLag) return;
+        // 冷闲且已对账过 → 不打扰。
+        if (!executing && !hubSubsZero && !neverCaughtUp && !tipGhost && !tipLag) {
+          return;
+        }
+        refreshEvoflowV4Session(tid, {
+          softIntervalMs: 3_500,
+          preferSettleOnly: false,
+        });
+      } catch {
+        /* best effort */
+      }
+    };
+    const id = window.setInterval(tick, 4_000);
+    queueMicrotask(tick);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [foreground, enabled, sessionId, lease, layer]);
 
   // sessionId 已变但 effect 尚未提交时，绝不能读上一会话的 store（会 ready 错配 → 误 hold 老面板）。
   // 但 pin/keep-warm 里若已有目标 session 的投影，peek 出来先画——对齐 ZCode「旧投影优于空白」。
@@ -922,7 +1467,100 @@ export function V4StreamRowsBridge(props: {
     [store],
   );
 
-  const snapshot: ConversationSnapshot | null = state?.snapshot ?? null;
+  const onLoadAllOlder = useMemo(
+    () => async () => {
+      // 每次调用现取 store：避免闭包拿到已释放/错代 lease；sticky 先画时 store 可能刚 recover。
+      const liveStore =
+        (lease && sessionId && lease.sessionId === sessionId ? lease.store : null) ||
+        (sessionId ? layer.peekStore(sessionId) : null);
+      if (!liveStore) {
+        return {
+          status: "stale" as const,
+          logEpoch: state?.snapshot?.logEpoch ?? "unknown",
+        };
+      }
+      const st = liveStore.getState();
+      if (!st.snapshot) {
+        // subscribe timeout / error 后无投影：先拉活再让 Timeline 按 retryable 退避重试。
+        try {
+          if (st.status === "error") void liveStore.retry();
+          else liveStore.ensureConnected();
+        } catch {
+          /* best-effort */
+        }
+        return {
+          status: "retryable-failure" as const,
+          logEpoch: state?.snapshot?.logEpoch ?? "unknown",
+        };
+      }
+      return liveStore.loadAllOlder();
+    },
+    [lease, layer, sessionId, state?.snapshot?.logEpoch],
+  );
+
+  const onFollowingTip = useMemo(
+    () => () => {
+      try {
+        store?.releaseBalloonForFollowingTip();
+      } catch {
+        /* best-effort */
+      }
+    },
+    [store],
+  );
+
+  const liveSnapshot: ConversationSnapshot | null = state?.snapshot ?? null;
+  // 磁盘缓存 → sticky：从未打开 / keep-warm 过期后仍能先画。
+  const [diskSticky, setDiskSticky] = useState<ConversationSnapshot | null>(null);
+  useEffect(() => {
+    if (!sessionId || liveSnapshot) {
+      setDiskSticky(null);
+      return;
+    }
+    let cancelled = false;
+    void loadV4SnapshotDiskCache(sessionId).then((snap) => {
+      if (cancelled || !snap) return;
+      _rememberStickySnapshot(sessionId, snap);
+      setDiskSticky(snap);
+      logV4Life({
+        event: "open_disk_cache_hit",
+        threadId: sessionId,
+        zh: `磁盘投影缓存命中（行≈${snap.rows?.window?.length ?? 0}）→ 冷开可先画再等 subscribe。`,
+        detail: {
+          rows: snap.rows?.window?.length ?? 0,
+          totalCount: snap.rows?.totalCount ?? null,
+        },
+        skipDedupe: true,
+      });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId, liveSnapshot]);
+  // 刷新 sticky（实例 + 模块级 + 磁盘）：有真快照就记，remount 后仍可先画。
+  if (sessionId && liveSnapshot) {
+    stickySnapRef.current = {
+      sessionId,
+      snapshot: liveSnapshot,
+      at: Date.now(),
+    };
+    _rememberStickySnapshot(sessionId, liveSnapshot);
+    scheduleV4SnapshotDiskCache(sessionId, liveSnapshot);
+  }
+  const stickyLocal =
+    !liveSnapshot &&
+    sessionId &&
+    stickySnapRef.current &&
+    stickySnapRef.current.sessionId === sessionId &&
+    Date.now() - stickySnapRef.current.at <= STICKY_SNAPSHOT_MS
+      ? stickySnapRef.current.snapshot
+      : null;
+  const sticky =
+    stickyLocal ||
+    (!liveSnapshot && sessionId ? _peekStickySnapshot(sessionId) : null) ||
+    (!liveSnapshot ? diskSticky : null);
+  const snapshot: ConversationSnapshot | null = liveSnapshot ?? sticky;
+  const usedStickyPaint = !liveSnapshot && !!sticky;
   const storeFailed = !!sessionId && !snapshot && state?.status === "error";
   const pathState = !enabled
     ? "legacy:off"
@@ -944,14 +1582,15 @@ export function V4StreamRowsBridge(props: {
   const hasSnapshot = !!snapshot;
   const authorityRef = useRef<string | null>(null);
   useLayoutEffect(() => {
-    const live = enabled && !!sessionId && hasSnapshot;
+    // 仅前台 host 持有 display authority；后台 KeepAlive 有快照也不抢闸门。
+    const live = foreground && enabled && !!sessionId && hasSnapshot;
     const tid = live ? sessionId! : null;
     const prev = authorityRef.current;
     if (prev === tid) return;
     if (prev) publishV4DisplayAuthority({ threadId: prev, live: false });
     if (tid) publishV4DisplayAuthority({ threadId: tid, live: true });
     authorityRef.current = tid;
-  }, [enabled, sessionId, hasSnapshot]);
+  }, [enabled, sessionId, hasSnapshot, foreground]);
   // 卸载 / 换会话：只在 session 边界清权威，勿绑 snapshot 引用。
   useLayoutEffect(() => {
     return () => {
@@ -1244,17 +1883,35 @@ export function V4StreamRowsBridge(props: {
   const payload = useMemo<V4TimelinePayload | null>(() => {
     // 切会话瞬间 lease effect 尚未提交：leaseForSession=null，但 pin/peek 里已有
     // 目标 thread 投影。旧逻辑强依赖 lease → payload=null → 时间线空白一帧。
-    // store 已是「本 session 的 lease 或 peek」，不会误交上一会话快照。
-    if (!snapshot || !sessionId || !store) return null;
+    // sticky：peek/lease 都 miss 时仍用同 thread 上一帧快照，避免 connecting 空闪。
+    if (!snapshot || !sessionId) return null;
+    if (!store && !usedStickyPaint) return null;
     return {
       sessionId,
       snapshot,
-      status,
-      loadingOlder,
+      status: usedStickyPaint ? "connecting" : status,
+      loadingOlder: usedStickyPaint ? false : loadingOlder,
       onLoadOlder,
       onAutoBackfill,
+      onLoadAllOlder,
+      turnNavigatorDirectoryRevision: usedStickyPaint
+        ? 0
+        : (state?.turnNavigatorDirectoryRevision ?? 0),
+      onFollowingTip,
     };
-  }, [sessionId, snapshot, status, loadingOlder, onLoadOlder, onAutoBackfill, store]);
+  }, [
+    sessionId,
+    snapshot,
+    status,
+    loadingOlder,
+    onLoadOlder,
+    onAutoBackfill,
+    onLoadAllOlder,
+    onFollowingTip,
+    state?.turnNavigatorDirectoryRevision,
+    store,
+    usedStickyPaint,
+  ]);
 
   if (!enabled || !sessionId) {
     return children(null, !enabled ? "disabled" : "no-thread");

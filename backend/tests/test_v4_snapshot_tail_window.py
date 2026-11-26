@@ -233,6 +233,361 @@ def test_live_turn_pin_keeps_early_assistant_text():
     assert pinned[0]["kind"] == "turnHeader"
 
 
+def test_live_turn_span_prefers_inflight_over_newer_completed_user():
+    """工具洪峰轮仍在跑时，不能改钉到窗尾已完成的后一问（否则 6666 蒸发）。"""
+    rows: list[dict] = []
+    rows.append(
+        {
+            "rowId": 1,
+            "kind": "turnHeader",
+            "turnId": "done",
+            "origin": "userInput",
+            "state": "completedSuccess",
+        }
+    )
+    rows.append(
+        {
+            "rowId": 2,
+            "kind": "userInput",
+            "turnId": "done",
+            "text": "333",
+            "origin": "realUser",
+        }
+    )
+    rows.append(
+        {
+            "rowId": 3,
+            "kind": "assistantText",
+            "turnId": "done",
+            "text": "333",
+            "state": "complete",
+        }
+    )
+    rows.append(
+        {
+            "rowId": 4,
+            "kind": "turnHeader",
+            "turnId": "live",
+            "origin": "userInput",
+            "state": "running",
+        }
+    )
+    rows.append(
+        {
+            "rowId": 5,
+            "kind": "userInput",
+            "turnId": "live",
+            "text": "6666",
+            "origin": "realUser",
+        }
+    )
+    for rid in range(6, 80):
+        rows.append(
+            {
+                "rowId": rid,
+                "kind": "toolCall",
+                "turnId": "live",
+                "toolName": f"t{rid}",
+                "status": "success",
+            }
+        )
+    rows.append(
+        {
+            "rowId": 80,
+            "kind": "toolCall",
+            "turnId": "live",
+            "toolName": "platform",
+            "status": "running",
+        }
+    )
+    span = V4ConversationHub._live_turn_span(rows)
+    assert span is not None
+    turn_start, user_idx = span
+    assert rows[turn_start]["turnId"] == "live"
+    assert rows[user_idx]["text"] == "6666"
+
+    raw_tail = rows[-(conv._SNAPSHOT_TAIL_ROWS) :]
+    pinned = V4ConversationHub._pin_live_turn_into_window(
+        rows, raw_tail, soft_cap=conv._SNAPSHOT_TAIL_ROWS
+    )
+    texts = [
+        str(r.get("text") or "")
+        for r in pinned
+        if str(r.get("kind") or "") == "userInput"
+    ]
+    assert "6666" in texts
+    assert any(
+        str(r.get("status") or "") == "running" for r in pinned if r.get("kind") == "toolCall"
+    )
+
+
+def test_live_turn_span_demotes_zombie_low_rowid_running_tool():
+    """旧轮 bash 永久 running（低 rowId）不能压过已存在的新 tip 轮。"""
+    rows: list[dict] = [
+        {
+            "rowId": 45,
+            "kind": "turnHeader",
+            "turnId": "zombie",
+            "origin": "userInput",
+            "state": "running",
+            "createdAt": 1_000,
+        },
+        {
+            "rowId": 46,
+            "kind": "userInput",
+            "turnId": "zombie",
+            "text": "旧问",
+            "origin": "realUser",
+            "createdAt": 1_000,
+        },
+        {
+            "rowId": 80,
+            "kind": "toolCall",
+            "turnId": "zombie",
+            "toolName": "bash",
+            "status": "running",
+        },
+        {
+            "rowId": 290,
+            "kind": "turnHeader",
+            "turnId": "tip",
+            "origin": "userInput",
+            "state": "completedSuccess",
+            "createdAt": 9_000,
+        },
+        {
+            "rowId": 291,
+            "kind": "userInput",
+            "turnId": "tip",
+            "text": "新问",
+            "origin": "realUser",
+            "createdAt": 9_000,
+        },
+        {
+            "rowId": 299,
+            "kind": "assistantText",
+            "turnId": "tip",
+            "text": "46",
+            "state": "complete",
+        },
+    ]
+    span = V4ConversationHub._live_turn_span(rows)
+    assert span is not None
+    turn_start, user_idx = span
+    assert rows[turn_start]["turnId"] == "tip"
+    assert rows[user_idx]["text"] == "新问"
+    pinned = V4ConversationHub._pin_live_turn_into_window(
+        rows, [r for r in rows if int(r["rowId"]) <= 80], soft_cap=12
+    )
+    assert 299 in {int(r["rowId"]) for r in pinned}
+    assert max(int(r["rowId"]) for r in pinned) == 299
+
+
+def test_live_turn_span_prefers_higher_tip_over_earlier_inflight_turn():
+    """多轮：旧问工具仍 running 时，必须钉新 tip 轮，否则 recovery 漏 tip → delta no-op。
+
+    现场 STREAM_AHEAD：streamRow=2154 > winLast=2080；SSE 已涨、页面空白。
+    """
+    rows: list[dict] = [
+        {
+            "rowId": 2000,
+            "kind": "turnHeader",
+            "turnId": "old",
+            "origin": "userInput",
+            "state": "running",
+            "createdAt": 5_000,
+        },
+        {
+            "rowId": 2001,
+            "kind": "userInput",
+            "turnId": "old",
+            "text": "这",
+            "origin": "realUser",
+            "createdAt": 5_000,
+        },
+        {
+            "rowId": 2080,
+            "kind": "toolCall",
+            "turnId": "old",
+            "toolName": "platform",
+            "status": "running",
+        },
+        {
+            "rowId": 2100,
+            "kind": "turnHeader",
+            "turnId": "new",
+            "origin": "userInput",
+            "state": "running",
+            "createdAt": 6_000,
+        },
+        {
+            "rowId": 2101,
+            "kind": "userInput",
+            "turnId": "new",
+            "text": "下一问",
+            "origin": "realUser",
+            "createdAt": 6_000,
+        },
+        {
+            "rowId": 2154,
+            "kind": "assistantText",
+            "turnId": "new",
+            "text": "流式",
+            "state": "streaming",
+        },
+        {
+            "rowId": 2366,
+            "kind": "toolCall",
+            "turnId": "orphan",
+            "toolName": "late",
+            "status": "success",
+        },
+    ]
+
+    span = V4ConversationHub._live_turn_span(rows)
+    assert span is not None
+    turn_start, user_idx = span
+    assert rows[turn_start]["turnId"] == "new"
+    assert rows[user_idx]["text"] == "下一问"
+
+    # 模拟尾窗只剩旧轮工具（recovery / soft-cap 误钉最早 inflight 的现场）
+    raw_tail = [r for r in rows if int(r["rowId"]) <= 2080]
+    pinned = V4ConversationHub._pin_live_turn_into_window(
+        rows, raw_tail, soft_cap=40
+    )
+    pinned_ids = {int(r["rowId"]) for r in pinned}
+    assert 2154 in pinned_ids
+    assert max(pinned_ids) >= 2154
+    assert any(str(r.get("turnId") or "") == "new" for r in pinned)
+    assert any(
+        str(r.get("text") or "") == "下一问"
+        for r in pinned
+        if str(r.get("kind") or "") == "userInput"
+    )
+
+
+def test_build_snapshot_multi_turn_keeps_streaming_tip():
+    """整链路：旧轮仍 running + 新轮 streaming，snapshot window 必须含 tip。"""
+    hub = V4ConversationHub()
+    sess = hub._get_or_create_session("s-multi-tip")
+    # 灌满尾窗容量，逼出截断 + pin 路径
+    pad_end = conv._SNAPSHOT_TAIL_ROWS + 80
+    for rid in range(1, pad_end):
+        sess.rows[rid] = {
+            "rowId": rid,
+            "kind": "toolCall",
+            "turnId": "pad",
+            "toolName": f"p{rid}",
+            "status": "success",
+        }
+    old_header = pad_end
+    sess.rows[old_header] = {
+        "rowId": old_header,
+        "kind": "turnHeader",
+        "turnId": "old",
+        "origin": "userInput",
+        "state": "running",
+        "createdAt": 5_000,
+    }
+    sess.rows[old_header + 1] = {
+        "rowId": old_header + 1,
+        "kind": "userInput",
+        "turnId": "old",
+        "text": "旧问",
+        "origin": "realUser",
+        "createdAt": 5_000,
+    }
+    sess.rows[old_header + 2] = {
+        "rowId": old_header + 2,
+        "kind": "toolCall",
+        "turnId": "old",
+        "toolName": "platform",
+        "status": "running",
+    }
+    new_header = old_header + 3
+    tip_id = new_header + 2
+    sess.rows[new_header] = {
+        "rowId": new_header,
+        "kind": "turnHeader",
+        "turnId": "new",
+        "origin": "userInput",
+        "state": "running",
+        "createdAt": 6_000,
+    }
+    sess.rows[new_header + 1] = {
+        "rowId": new_header + 1,
+        "kind": "userInput",
+        "turnId": "new",
+        "text": "新问",
+        "origin": "realUser",
+        "createdAt": 6_000,
+    }
+    sess.rows[tip_id] = {
+        "rowId": tip_id,
+        "kind": "assistantText",
+        "turnId": "new",
+        "text": "已经在流",
+        "state": "streaming",
+    }
+    sess.phase = "running"
+
+    window = hub._build_snapshot(sess)["rows"]["window"]
+    ids = [int(r["rowId"]) for r in window]
+    assert tip_id in ids, f"tip {tip_id} missing from snapshot window={ids[-12:]}"
+    assert max(ids) >= tip_id
+    assert any(
+        str(r.get("text") or "") == "新问"
+        for r in window
+        if str(r.get("kind") or "") == "userInput"
+    )
+
+
+def test_snapshot_pins_when_rows_inflight_even_if_control_idle():
+    """control 未标 running 但行上仍有 streaming 时，snapshot 也必须钉直播轮。"""
+    hub = V4ConversationHub()
+    sess = hub._get_or_create_session("s-inflight-pin")
+    sess.rows[1] = {
+        "rowId": 1,
+        "kind": "turnHeader",
+        "turnId": "turn-live",
+        "origin": "userInput",
+        "state": "running",
+    }
+    sess.rows[2] = {
+        "rowId": 2,
+        "kind": "userInput",
+        "turnId": "turn-live",
+        "text": "6666",
+        "origin": "realUser",
+    }
+    tool_end = 3 + conv._SNAPSHOT_TAIL_ROWS + 40
+    for rid in range(3, tool_end):
+        sess.rows[rid] = {
+            "rowId": rid,
+            "kind": "toolCall",
+            "turnId": "turn-live",
+            "toolName": f"tool-{rid}",
+            "status": "success",
+        }
+    sess.rows[tool_end] = {
+        "rowId": tool_end,
+        "kind": "assistantText",
+        "turnId": "turn-live",
+        "text": "666 收到",
+        "state": "streaming",
+    }
+    sess.phase = "completed"
+    sess.control_override = None
+
+    window = hub._build_snapshot(sess)["rows"]["window"]
+    texts = [
+        str(r.get("text") or "")
+        for r in window
+        if str(r.get("kind") or "") == "userInput"
+    ]
+    assert "6666" in texts
+
+
 def test_live_turn_pins_user_input_squeezed_out_of_tail():
     """流式长回合把 userInput 挤出尾窗后，切会话重订阅仍须看见本轮用户气泡。
 
@@ -293,3 +648,59 @@ def test_live_turn_pins_user_input_squeezed_out_of_tail():
     ]
     assert "请继续排查切换丢气泡" not in idle_texts
     assert idle_window[0]["kind"] != "turnHeader" or idle_window[0].get("rowId") != 1
+
+
+def test_align_keeps_user_input_before_inverted_header():
+    """userInput 行号小于同 turn turnHeader（ensure/remint 颠倒序）时，对齐不得裁掉气泡。"""
+    rows: list[dict] = []
+    for rid in range(1, 40):
+        rows.append(
+            {
+                "rowId": rid,
+                "kind": "assistantText",
+                "turnId": "old",
+                "text": f"pad-{rid}",
+                "state": "complete",
+            }
+        )
+    # 颠倒：先 user 后 header，再正文
+    rows.append(
+        {
+            "rowId": 40,
+            "kind": "userInput",
+            "turnId": "live",
+            "text": "每个部门的负责人都在吗",
+            "origin": "realUser",
+        }
+    )
+    rows.append(
+        {
+            "rowId": 41,
+            "kind": "turnHeader",
+            "turnId": "live",
+            "origin": "userInput",
+            "state": "completedSuccess",
+        }
+    )
+    rows.append(
+        {
+            "rowId": 42,
+            "kind": "assistantText",
+            "turnId": "live",
+            "text": "不全在",
+            "state": "complete",
+        }
+    )
+    # rows 下标：0..38 pad，39=user，40=header，41=assistant
+    header_idx = next(i for i, r in enumerate(rows) if r.get("kind") == "turnHeader" and r.get("turnId") == "live")
+    user_idx = header_idx - 1
+    assert rows[user_idx]["kind"] == "userInput"
+    # 裸截断起点落在 header；对齐后必须把紧前同 turn userInput 收进来。
+    start = V4ConversationHub._align_snapshot_window_start(rows, header_idx)
+    assert start == user_idx
+    assert rows[start]["kind"] == "userInput"
+    span = V4ConversationHub._live_turn_span(rows)
+    assert span is not None
+    turn_start, live_user_idx = span
+    assert live_user_idx == user_idx
+    assert turn_start == user_idx  # 同 turn 首行即颠倒的 userInput

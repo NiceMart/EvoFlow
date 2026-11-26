@@ -38,6 +38,8 @@ import os
 import time
 from typing import Any
 
+from evoflow.models.think_tags import merge_reasoning, strip_inline_think_tags
+
 logger = logging.getLogger(__name__)
 
 _HYDRATION_MAX_MESSAGES = 2000
@@ -133,6 +135,60 @@ def _is_hidden_task_notification_message_id(message_id: str | None) -> bool:
     )
 
 
+def _transcript_msg_is_visible_user(msg: dict[str, Any]) -> bool:
+    """与落 userInput 行同一套过滤：无可见用户气泡的 run 段应并进上一轮。"""
+    if str(msg.get("role") or "") != "user":
+        return False
+    content = msg.get("content_json")
+    if isinstance(content, str):
+        try:
+            payload = json.loads(content)
+        except Exception:
+            payload = None
+    else:
+        payload = content
+    text = _text_from_message_content(payload)
+    attachments = _attachments_from_user_payload(payload)
+    if not text and not attachments:
+        return False
+    from app.gateway.v4.agui_mirror import _is_hidden_tool_approval_user_text
+
+    if text and _is_hidden_tool_approval_user_text(text) and not attachments:
+        return False
+    tool_name = str(msg.get("tool_name") or msg.get("toolName") or "").strip()
+    if tool_name and _is_hidden_context_user_tool_name(tool_name):
+        return False
+    if text and _is_hidden_duty_brief_text(text) and not attachments:
+        return False
+    msg_id = str(msg.get("id") or msg.get("message_id") or "")
+    if not attachments and (
+        (text and _is_hidden_task_notification_text(text))
+        or _is_hidden_task_notification_message_id(msg_id)
+    ):
+        return False
+    if text and _is_hidden_context_compaction_text(text) and not attachments:
+        return False
+    return True
+
+
+def _merge_continuation_turns(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """无可见 user 的 run 段并进上一轮，避免 catchup 按 run_id 把 AI 回复劈成两截。
+
+    对齐 agui_mirror：FINISHED 后再开无 note 的 RUN 续挂同一 product turn。
+    """
+    if len(turns) <= 1:
+        return turns
+    merged: list[dict[str, Any]] = []
+    for turn in turns:
+        msgs = list(turn.get("messages") or [])
+        has_user = any(_transcript_msg_is_visible_user(m) for m in msgs if isinstance(m, dict))
+        if merged and not has_user:
+            merged[-1]["messages"].extend(msgs)
+            continue
+        merged.append({"run_id": turn.get("run_id"), "messages": msgs})
+    return merged
+
+
 def _text_from_message_content(content: Any) -> str:
     """message content 的文本提取：字符串 / 块数组（有无 type 均收）/ 嵌套 payload。"""
     if content is None:
@@ -218,17 +274,23 @@ def _attachments_from_user_payload(payload: Any) -> list[dict[str, Any]]:
         elif isinstance(image, str):
             url = image.strip()
         # data: URL（桌面 chatSend 的图片编码）：前端 readAttachment 对 data: ref
-        # 直接当 URL 用，因此不再跳过；仅尺寸封顶，防止未压缩大图撑爆 V4 帧。
-        # 封顶值与 app/gateway/routers/langgraph_proxy.py 的提取器保持一致。
+        # 直接当 URL 用，因此不再跳过。对齐 ZCode：小图保持行内（即时渲染），
+        # 大图落盘 v4-image-cache、ref 换本地路径（前端走 convertFileSrc/serve-file），
+        # 行与快照帧不再背大媒体字节。2.8MB 封顶保留作落盘失败时的兜底。
         if url and url.lower().startswith("data:"):
             if len(url) <= 2_800_000:
                 header, _, _ = url.partition(",")
                 mime = header[5:].split(";", 1)[0].strip().lower()
-                _push(
-                    ref=url,
-                    file_name="image",
-                    mime=mime if mime.startswith("image/") else "image/png",
-                )
+                if not mime.startswith("image/"):
+                    mime = "image/png"
+                ref = url
+                try:
+                    from app.gateway.v4.image_cache import materialize_image_data_url
+
+                    ref = materialize_image_data_url(url) or url
+                except Exception:
+                    ref = url
+                _push(ref=ref, file_name="image", mime=mime)
             continue
         if url:
             _push(ref=url, mime="image/jpeg")
@@ -754,6 +816,8 @@ def hydrate_session_from_transcript(hub: Any, thread_id: str) -> int:
         return content
 
     # 1) 分组成轮：连续段按 run_id；缺 run_id 的消息归入前一段。
+    #    随后把「无可见 user」的续跑段并进上一轮——否则 catchup remint 会把
+    #    live mirror 已续挂的一轮重新劈成 turnHeader(goalContinuation) 假新轮。
     turns: list[dict[str, Any]] = []
     current: dict[str, Any] | None = None
     for msg in messages:
@@ -762,6 +826,7 @@ def hydrate_session_from_transcript(hub: Any, thread_id: str) -> int:
             current = {"run_id": run or f"turn-seq-{len(turns) + 1}", "messages": []}
             turns.append(current)
         current["messages"].append(msg)
+    turns = _merge_continuation_turns(turns)
 
     def _msg_timestamp_ms(msg: dict[str, Any]) -> int | None:
         """消息时间戳（ms）：display 路径 turn_started_at；raw 路径 created_at（ISO）。"""
@@ -818,8 +883,15 @@ def hydrate_session_from_transcript(hub: Any, thread_id: str) -> int:
             msg_id = str(msg.get("id") or msg.get("message_id") or "")
             payload = parse_content(msg)
             msg_ts = _msg_timestamp_ms(msg) or turn_start or now_ms
-            created_at = max(int(msg_ts), seed_clock_ms)
-            seed_clock_ms = created_at
+
+            def _next_created_at() -> int:
+                """跨行单调 +1ms：同毫秒多段 assistantText 不能共用一个 createdAt。"""
+                nonlocal seed_clock_ms
+                created = max(int(msg_ts), seed_clock_ms)
+                if created <= seed_clock_ms:
+                    created = seed_clock_ms + 1
+                seed_clock_ms = created
+                return created
 
             if role == "user":
                 text = _text_from_message_content(payload)
@@ -857,6 +929,7 @@ def hydrate_session_from_transcript(hub: Any, thread_id: str) -> int:
                     continue
                 # 值班节拍不可编辑（系统开场，非真人输入）。
                 can_edit = tool_name != "proactive_duty_beat"
+                created_at = _next_created_at()
                 row: dict[str, Any] = {
                     "rowId": next_row_id(),
                     "turnId": turn_id,
@@ -875,13 +948,19 @@ def hydrate_session_from_transcript(hub: Any, thread_id: str) -> int:
                 rows.append(row)
             elif role == "assistant":
                 reasoning = str((payload or {}).get("reasoning") or "") if isinstance(payload, dict) else ""
-                if reasoning:
+                text_raw = _text_from_message_content(
+                    payload.get("content") if isinstance(payload, dict) else None
+                )
+                text, inline_think = strip_inline_think_tags(text_raw)
+                reasoning_merged = merge_reasoning(reasoning or None, inline_think) or ""
+                if reasoning_merged:
+                    created_at = _next_created_at()
                     rows.append(
                         {
                             "rowId": next_row_id(),
                             "turnId": turn_id,
                             "kind": "reasoning",
-                            "text": reasoning,
+                            "text": reasoning_merged,
                             "state": "complete",
                             "createdAt": created_at,
                             "createdAtSeq": 0,
@@ -891,6 +970,10 @@ def hydrate_session_from_transcript(hub: Any, thread_id: str) -> int:
                     if not isinstance(tc, dict):
                         continue
                     tcid = str(tc.get("id") or "").strip()
+                    # 失败轮 / remint 偶发把上一轮 tool_call id 再挂到新 assistant；
+                    # 同 id 已有行则跳过，避免再开一张空红卡。
+                    if tcid and tcid in tool_row_by_call_id:
+                        continue
                     args = tc.get("args")
                     try:
                         args_text = (
@@ -898,6 +981,7 @@ def hydrate_session_from_transcript(hub: Any, thread_id: str) -> int:
                         )
                     except Exception:
                         args_text = "{}"
+                    created_at = _next_created_at()
                     row = {
                         "rowId": next_row_id(),
                         "turnId": turn_id,
@@ -927,8 +1011,9 @@ def hydrate_session_from_transcript(hub: Any, thread_id: str) -> int:
                                 "subagentType": sa_type or "general",
                                 "summary": desc or "子任务",
                             }
-                text = _text_from_message_content(payload.get("content") if isinstance(payload, dict) else None)
-                if text:
+                # strip_inline_think_tags 故意不 .strip()（保流式换行）；此处只判断是否有可见正文。
+                if text.strip():
+                    created_at = _next_created_at()
                     row = {
                         "rowId": next_row_id(),
                         "turnId": turn_id,
@@ -947,6 +1032,7 @@ def hydrate_session_from_transcript(hub: Any, thread_id: str) -> int:
                 payload_d = payload if isinstance(payload, dict) else {}
                 status = _tool_status_from_payload(payload_d)
                 out_text = _tool_output_text_from_payload(payload_d)
+                created_at = _next_created_at()
                 if target is not None:
                     target["status"] = status
                     target["endedAt"] = created_at
@@ -1034,12 +1120,52 @@ def hydrate_session_from_transcript(hub: Any, thread_id: str) -> int:
                     row["usage"] = turn_usage_row
                     break
 
+        # 无可见 userInput 时勿写 origin=userInput——否则浮层右栏「有头无气泡」，
+        # 左栏像把同一段 AI 回复劈成两轮。
+        has_visible_user = any(
+            str(r.get("kind") or "") == "userInput"
+            and str(r.get("origin") or "") in ("", "realUser", "goalContinuation")
+            for r in rows
+        )
+
+        def _rows_have_assistant_work(turn_rows: list[dict[str, Any]]) -> bool:
+            for row in turn_rows:
+                kind = str(row.get("kind") or "")
+                if kind not in ("assistantText", "reasoning", "toolCall", "subagent"):
+                    continue
+                eid = str(row.get("entityId") or "")
+                if eid.startswith("empty-run-"):
+                    continue
+                if kind == "assistantText" and not str(row.get("text") or "").strip():
+                    continue
+                return True
+            return False
+
+        # 持久 transcript 里确有 user、却无助手/工具产出（真实 API 空跑）：
+        # remint/hydrate 也要落空跑占位，否则浮层仍是 !EMPTY_ASSISTANT。
+        if has_visible_user and not _rows_have_assistant_work(rows):
+            from app.gateway.v4.agui_mirror import EMPTY_RUN_NOTICE_TEXT
+
+            notice_at = _next_created_at()
+            rows.append(
+                {
+                    "rowId": next_row_id(),
+                    "turnId": turn_id,
+                    "kind": "assistantText",
+                    "text": EMPTY_RUN_NOTICE_TEXT,
+                    "state": "complete",
+                    "createdAt": notice_at,
+                    "createdAtSeq": 0,
+                    "entityId": f"empty-run-{turn_id}",
+                }
+            )
+
         header_row: dict[str, Any] = {
             "rowId": header_row_id,
             "turnId": turn_id,
             "entityId": turn_id,
             "kind": "turnHeader",
-            "origin": "userInput",
+            "origin": "userInput" if has_visible_user else "goalContinuation",
             "state": "completedSuccess",
             "startedAt": turn_start,
             "endedAt": turn_end,

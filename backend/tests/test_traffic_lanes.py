@@ -38,6 +38,12 @@ def test_resolve_target_is_best_effort() -> None:
     )
 
 
+def test_workspaces_search_is_best_effort() -> None:
+    # Settings code-index graph search must shed under lag (2026-11-23 100s hang).
+    assert classify_path("/api/workspaces/search").lane == Lane.BEST_EFFORT
+    assert classify_path("/api/workspaces/search", method="GET").lane == Lane.BEST_EFFORT
+
+
 def test_unknown_api_defaults_to_data_not_control() -> None:
     """Coverage guarantee: new slow endpoints are isolated until allow-listed."""
     assert classify_path("/api/brand-new-slow-thing").lane == Lane.DATA
@@ -100,10 +106,44 @@ def test_execution_history_is_best_effort() -> None:
         classify_path("/api/tasks/2611141704_a169/execution-history", method="GET").lane
         == Lane.BEST_EFFORT
     )
+
+
+def test_execution_state_and_index_status_are_best_effort() -> None:
+    path = (
+        "/api/chat/sessions/proactive:self-evolution-bot:chat:2026-11-16T11-40-50.047Z"
+        "/execution/state"
+    )
+    assert classify_path(path, method="GET").lane == Lane.BEST_EFFORT
+    assert (
+        classify_path(
+            "/api/chat/sessions/agent:main:x/runtime-status", method="GET"
+        ).lane
+        == Lane.BEST_EFFORT
+    )
+    assert classify_path("/api/workspaces/index-status", method="GET").lane == Lane.BEST_EFFORT
+    assert classify_path("/api/workspaces/index-warm", method="POST").lane == Lane.BEST_EFFORT
     assert (
         classify_path("/api/tasks/2611141704_a169/execution-history/", method="GET").lane
         == Lane.BEST_EFFORT
     )
+
+
+def test_embedding_probe_is_best_effort_not_control() -> None:
+    """Local embedding probe must not sit under /api/models CONTROL prefix."""
+    assert (
+        classify_path("/api/models/embedding-probe", method="POST").lane == Lane.BEST_EFFORT
+    )
+    assert (
+        classify_path("/api/models/local-embedding/download", method="POST").lane
+        == Lane.BEST_EFFORT
+    )
+    assert (
+        classify_path("/api/models/local-embedding/runtime", method="GET").lane
+        == Lane.BEST_EFFORT
+    )
+    # Ordinary model list stays CONTROL (composer snappy).
+    assert classify_path("/api/models", method="GET").lane == Lane.CONTROL
+    assert classify_path("/api/models/foo", method="GET").lane == Lane.CONTROL
 
 
 def test_sessions_list_slot_reusable() -> None:

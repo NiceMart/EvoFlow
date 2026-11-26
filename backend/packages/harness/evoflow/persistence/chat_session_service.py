@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -478,11 +479,13 @@ async def create_new_session(
 ) -> dict[str, Any]:
     """Persist a new sidebar session row and optionally create LangGraph thread."""
     sk = str(session_key or "").strip() or make_new_session_key(agent_id)
-    if sess_repo.is_session_deleted(sk):
+    if await asyncio.to_thread(sess_repo.is_session_deleted, sk):
         raise ValueError("session_key is deleted")
     merged_ctx = {**_default_session_context(agent_id), **(context or {})}
     now = _now_ms()
-    sess_repo.upsert_session_row(
+    # async handler 内禁同步 DB（写持锁时冻 loop 0.5s）——以下各处同理 offload。
+    await asyncio.to_thread(
+        sess_repo.upsert_session_row,
         sk,
         thread_id=None,
         created_at_ms=now,
@@ -554,7 +557,8 @@ async def create_new_session(
                 if default_root:
                     lwr = default_root
                     merged_ctx["local_workspace_root"] = lwr
-                    sess_repo.upsert_session_row(
+                    await asyncio.to_thread(
+                        sess_repo.upsert_session_row,
                         sk,
                         thread_id=None,
                         created_at_ms=now,
@@ -576,10 +580,10 @@ async def create_new_session(
         from evoflow.persistence import workspace_repositories as ws_repo
 
         try:
-            ws_repo.touch_session_workspace(sk, lwr, set_current=True, stamp=stamp)
+            await asyncio.to_thread(ws_repo.touch_session_workspace, sk, lwr, set_current=True, stamp=stamp)
         except Exception:
             pass
-    row = sess_repo.get_session_row_for_ui(sk)
+    row = await asyncio.to_thread(sess_repo.get_session_row_for_ui, sk)
     if row:
         return row
     return {
@@ -607,7 +611,10 @@ def bind_session_thread(
     tid = resolve_langgraph_lead_thread_id(thread_id)
     if not sk or not tid:
         raise ValueError("session_key and valid LangGraph lead thread_id required")
-    existing = sess_repo.load_session_map().get(sk) or {}
+    # 【self-evolution-bot · 2026-11-18 · 第49轮 · 模型:deepseek-v4.1-flash-1017】
+    # 只取 context 合并进 merged_ctx，原实现调 load_session_map()（全表 547 行、
+    # 冷 6976ms / 热 124ms vs 单行 0.017ms）。返回形状不变。
+    existing = sess_repo.get_session_map_entry(sk) or {}
     ui_row = sess_repo.get_session_row_for_ui(sk)
     now = _now_ms()
     merged_ctx = dict(existing.get("context") if isinstance(existing.get("context"), dict) else {})
@@ -663,7 +670,11 @@ async def ensure_session_thread(
         raise ValueError("session_key required")
     _t0 = _time.perf_counter()
     _phase_ms: dict[str, float] = {}
-    existing = sess_repo.load_session_map().get(sk) or {}
+    # 【self-evolution-bot · 2026-11-18 · 第49轮 · 模型:deepseek-v4.1-flash-1017】
+    # 原来这里为读一个 threadId 调 load_session_map()（全表 547 行、冷 6976ms / 热
+    # 124ms），而本函数在每次发消息的 stream 起点 —— 是本类缺陷里调用最频繁的一处。
+    # 改单行查询（0.017ms），返回形状仍是侧栏 map 的那一行，取值语义不变。
+    existing = (await asyncio.to_thread(sess_repo.get_session_map_entry, sk)) or {}
     tid = resolve_langgraph_lead_thread_id(str(existing.get("threadId") or "").strip()) or ""
     if tid:
         try:
@@ -741,7 +752,7 @@ async def ensure_session_thread(
         try:
             from evoflow.persistence import task_repositories as task_repo
 
-            old_collab = task_repo.load_thread_collab(tid)
+            old_collab = await asyncio.to_thread(task_repo.load_thread_collab, tid)
             if old_collab:
                 old_bound = str(old_collab.get("bound_task_id") or "").strip()
         except Exception:
@@ -762,8 +773,8 @@ async def ensure_session_thread(
     # Keep transcript rows pointing at the live lead (truncate + stream-404 remint).
     _t_remap = _time.perf_counter()
     try:
-        if msg_repo.count_messages(sk) > 0:
-            msg_repo.remap_session_messages_thread_id(sk, new_tid)
+        if await asyncio.to_thread(msg_repo.count_messages, sk) > 0:
+            await asyncio.to_thread(msg_repo.remap_session_messages_thread_id, sk, new_tid)
     except Exception:
         logger.debug(
             "ensure_session_thread remap messages failed sk=%s new_tid=%s",
@@ -782,12 +793,14 @@ async def ensure_session_thread(
     if old_bound:
         merged_ctx["collab_task_id"] = old_bound
     # Thread recreation after LangGraph restart is not user activity — keep updated_at.
-    sess_repo.upsert_session_row(
+    _msg_count = await asyncio.to_thread(msg_repo.count_messages, sk)
+    await asyncio.to_thread(
+        sess_repo.upsert_session_row,
         sk,
         thread_id=new_tid,
         created_at_ms=_session_created_at_ms(existing, now=now),
         updated_at_ms=0,
-        message_count=int(existing.get("messageCount") or 0) or msg_repo.count_messages(sk),
+        message_count=int(existing.get("messageCount") or 0) or _msg_count,
         context=merged_ctx,
         title=str(existing.get("title") or ""),
         session_mode=str(merged_ctx.get("session_mode") or "agent"),
@@ -799,7 +812,7 @@ async def ensure_session_thread(
 
             migrated = dict(old_collab)
             migrated["bound_task_id"] = old_bound
-            task_repo.save_thread_collab(new_tid, migrated)
+            await asyncio.to_thread(task_repo.save_thread_collab, new_tid, migrated)
         except Exception:
             logger.debug("ensure_session_thread migrate collab failed sk=%s new_tid=%s", sk, new_tid, exc_info=True)
     _phase_ms["persist_session_row_ms"] = round((_time.perf_counter() - _t_persist) * 1000.0, 2)
@@ -827,27 +840,31 @@ async def delete_session_full(session_key: str) -> dict[str, Any]:
     sk = str(session_key or "").strip()
     if not sk:
         raise ValueError("session_key required")
-    row = sess_repo.load_session_map().get(sk) or {}
+    # 【self-evolution-bot · 2026-11-18 · 第49轮 · 模型:deepseek-v4.1-flash-1017】
+    # 只取 threadId，原实现调 load_session_map()（全表 547 行、冷 6976ms / 热 124ms
+    # vs 单行 0.017ms）。返回形状不变（侧栏 map 那一行）。
+    row = (await asyncio.to_thread(sess_repo.get_session_map_entry, sk)) or {}
     tid = str(row.get("threadId") or "").strip()
 
-    msg_repo.delete_messages_for_session(sk)
+    # 删除链路 6+ 次写事务，全部 offload（角色删除几百 session 时在 loop 上会秒级冻结）。
+    await asyncio.to_thread(msg_repo.delete_messages_for_session, sk)
     from evoflow.persistence import workspace_repositories as ws_repo
     from evoflow.persistence.session_tool_binding_repositories import delete_bindings_for_session
     from evoflow.persistence.tool_approval_repositories import delete_approvals_for_session
 
-    ws_repo.clear_session_workspace_history(sk)
-    delete_bindings_for_session(sk)
-    delete_approvals_for_session(sk)
-    _delete_session_business_data(sk)
-    sess_repo.mark_session_deleted(sk)
+    await asyncio.to_thread(ws_repo.clear_session_workspace_history, sk)
+    await asyncio.to_thread(delete_bindings_for_session, sk)
+    await asyncio.to_thread(delete_approvals_for_session, sk)
+    await asyncio.to_thread(_delete_session_business_data, sk)
+    await asyncio.to_thread(sess_repo.mark_session_deleted, sk)
 
     lg_ok = True
     if tid:
         lg_ok = await delete_langgraph_thread(tid)
-        delete_local_thread_data(tid)
-        delete_thread_collab_sqlite(tid)
-        delete_thread_tool_approval_sqlite(tid)
-        sess_repo.delete_sessions_by_thread_id(tid)
+        await asyncio.to_thread(delete_local_thread_data, tid)
+        await asyncio.to_thread(delete_thread_collab_sqlite, tid)
+        await asyncio.to_thread(delete_thread_tool_approval_sqlite, tid)
+        await asyncio.to_thread(sess_repo.delete_sessions_by_thread_id, tid)
 
     return {"ok": True, "sessionKey": sk, "threadId": tid or None, "langgraph_deleted": lg_ok}
 
@@ -890,7 +907,7 @@ async def delete_sessions_bulk(session_keys: list[str]) -> dict[str, Any]:
     tids: list[str] = []
     for sk in keys:
         try:
-            row = sess_repo.get_session_row_for_ui(sk) or {}
+            row = await asyncio.to_thread(sess_repo.get_session_row_for_ui, sk) or {}
         except Exception:
             row = {}
         tid = str(row.get("threadId") or "").strip()
@@ -924,7 +941,9 @@ async def delete_sessions_bulk(session_keys: list[str]) -> dict[str, Any]:
             )
 
     try:
-        run_db_transaction(_wipe_all)
+        # N×7 表 DELETE + N tombstone 的大事务——offload 到 worker 线程，loop 上直调
+        # 会在写锁竞争时把事件循环冻住（角色删除几百 session 时秒级）。
+        await asyncio.to_thread(run_db_transaction, _wipe_all)
     except Exception:
         logger.warning("bulk session wipe failed, falling back per-session", exc_info=True)
         for sk in keys:
@@ -977,10 +996,14 @@ async def fork_session_full(
     src = str(session_key or "").strip()
     if not src:
         raise ValueError("session_key required")
-    if sess_repo.is_session_deleted(src):
+    if await asyncio.to_thread(sess_repo.is_session_deleted, src):
         raise ValueError("session not found")
 
-    parent = sess_repo.get_session_row_for_ui(src) or sess_repo.load_session_map().get(src) or {}
+    parent = (
+        await asyncio.to_thread(sess_repo.get_session_row_for_ui, src)
+        or (await asyncio.to_thread(sess_repo.get_session_map_entry, src))
+        or {}
+    )
     if not parent:
         raise ValueError("session not found")
 
@@ -988,12 +1011,12 @@ async def fork_session_full(
     mid = str(through_message_id or "").strip()
     before_mid = str(before_message_id or "").strip()
     if mid:
-        resolved = msg_repo.resolve_seq_for_message_id(src, mid)
+        resolved = await asyncio.to_thread(msg_repo.resolve_seq_for_message_id, src, mid)
         if resolved is None:
             raise ValueError("through_message_id not found in session")
         cut = resolved if cut is None else min(cut, resolved)
     if before_mid:
-        resolved_before = msg_repo.resolve_seq_for_message_id(src, before_mid)
+        resolved_before = await asyncio.to_thread(msg_repo.resolve_seq_for_message_id, src, before_mid)
         if resolved_before is None:
             raise ValueError("before_message_id not found in session")
         exclusive = max(0, int(resolved_before) - 1)
@@ -1052,14 +1075,16 @@ async def fork_session_full(
     if not dst:
         raise RuntimeError("fork failed: no child session_key")
 
-    copied = msg_repo.copy_messages_for_fork(
+    copied = await asyncio.to_thread(
+        msg_repo.copy_messages_for_fork,
         src,
         dst,
         through_seq=cut,
         new_thread_id=new_tid,
     )
     now = _now_ms()
-    sess_repo.upsert_session_row(
+    await asyncio.to_thread(
+        sess_repo.upsert_session_row,
         dst,
         thread_id=new_tid,
         created_at_ms=int(child_row.get("createdAt") or now),
@@ -1087,11 +1112,11 @@ async def fork_session_full(
         from evoflow.persistence import workspace_repositories as ws_repo
 
         try:
-            ws_repo.touch_session_workspace(dst, lwr, set_current=True)
+            await asyncio.to_thread(ws_repo.touch_session_workspace, dst, lwr, set_current=True)
         except Exception:
             logger.debug("fork_session_full touch workspace failed sk=%s", dst, exc_info=True)
 
-    ui = sess_repo.get_session_row_for_ui(dst) or child_row
+    ui = await asyncio.to_thread(sess_repo.get_session_row_for_ui, dst) or child_row
     return {
         "ok": True,
         "sessionKey": dst,
@@ -1109,26 +1134,29 @@ async def reset_session_full(session_key: str) -> dict[str, Any]:
     if not sk:
         raise ValueError("session_key required")
 
-    row = sess_repo.load_session_map().get(sk) or {}
+    # 【self-evolution-bot · 2026-11-18 · 第49轮 · 模型:deepseek-v4.1-flash-1017】
+    # 只取 threadId + context，原实现调 load_session_map()（全表 547 行）。
+    row = (await asyncio.to_thread(sess_repo.get_session_map_entry, sk)) or {}
     old_tid = str(row.get("threadId") or "").strip()
     ctx = row.get("context") if isinstance(row.get("context"), dict) else {}
 
-    msg_repo.delete_messages_for_session(sk)
+    await asyncio.to_thread(msg_repo.delete_messages_for_session, sk)
 
     # Compaction state is now stored as chat message rows — deleted by delete_messages_for_session above.
 
     if old_tid:
         await delete_langgraph_thread(old_tid)
-        delete_local_thread_data(old_tid)
-        delete_thread_collab_sqlite(old_tid)
-        delete_thread_tool_approval_sqlite(old_tid)
+        await asyncio.to_thread(delete_local_thread_data, old_tid)
+        await asyncio.to_thread(delete_thread_collab_sqlite, old_tid)
+        await asyncio.to_thread(delete_thread_tool_approval_sqlite, old_tid)
 
     new_tid = await create_langgraph_thread(sk)
     if not new_tid:
         raise RuntimeError("Failed to create LangGraph thread after reset")
 
     now = _now_ms()
-    sess_repo.upsert_session_row(
+    await asyncio.to_thread(
+        sess_repo.upsert_session_row,
         sk,
         thread_id=new_tid,
         created_at_ms=_session_created_at_ms(row, now=now),
@@ -1156,19 +1184,23 @@ async def truncate_session_from_message(
         raise ValueError("session_key required")
     if not mid:
         raise ValueError("from_message_id required")
-    if sess_repo.is_session_deleted(sk):
+    if await asyncio.to_thread(sess_repo.is_session_deleted, sk):
         raise ValueError("session not found")
 
-    row = sess_repo.get_session_row_for_ui(sk) or sess_repo.load_session_map().get(sk) or {}
+    row = (
+        await asyncio.to_thread(sess_repo.get_session_row_for_ui, sk)
+        or (await asyncio.to_thread(sess_repo.get_session_map_entry, sk))
+        or {}
+    )
     if not row:
         raise ValueError("session not found")
 
-    cut = msg_repo.resolve_seq_for_message_id(sk, mid)
+    cut = await asyncio.to_thread(msg_repo.resolve_seq_for_message_id, sk, mid)
     if cut is None:
         raise ValueError("from_message_id not found in session")
 
-    deleted = msg_repo.delete_messages_from_seq(sk, cut)
-    remaining = msg_repo.count_messages(sk)
+    deleted = await asyncio.to_thread(msg_repo.delete_messages_from_seq, sk, cut)
+    remaining = await asyncio.to_thread(msg_repo.count_messages, sk)
 
     old_tid = str(row.get("threadId") or row.get("thread_id") or "").strip()
     ctx = row.get("context") if isinstance(row.get("context"), dict) else {}
@@ -1179,9 +1211,9 @@ async def truncate_session_from_message(
 
     if old_tid:
         await delete_langgraph_thread(old_tid)
-        delete_local_thread_data(old_tid)
-        delete_thread_collab_sqlite(old_tid)
-        delete_thread_tool_approval_sqlite(old_tid)
+        await asyncio.to_thread(delete_local_thread_data, old_tid)
+        await asyncio.to_thread(delete_thread_collab_sqlite, old_tid)
+        await asyncio.to_thread(delete_thread_tool_approval_sqlite, old_tid)
 
     new_tid = await create_langgraph_thread(sk)
     if not new_tid:
@@ -1217,7 +1249,7 @@ async def truncate_session_from_message(
         )
 
     if remaining > 0:
-        msg_repo.remap_session_messages_thread_id(sk, new_tid)
+        await asyncio.to_thread(msg_repo.remap_session_messages_thread_id, sk, new_tid)
 
     try:
         from evoflow.agents.middlewares.session_transcript_hydration_middleware import (
@@ -1229,7 +1261,8 @@ async def truncate_session_from_message(
         logger.debug("truncate_session clear hydration cache failed", exc_info=True)
 
     now = _now_ms()
-    sess_repo.upsert_session_row(
+    await asyncio.to_thread(
+        sess_repo.upsert_session_row,
         sk,
         thread_id=new_tid,
         created_at_ms=_session_created_at_ms(row, now=now),
@@ -1270,7 +1303,9 @@ async def persist_user_message(
         return None
     try:
         thread_id = await ensure_session_thread(sk)
-        append_message_and_touch_session(
+        # 聊天最热写路径（10-20 语句事务含 usage ledger），offload 防 loop 等锁。
+        await asyncio.to_thread(
+            append_message_and_touch_session,
             sk,
             role="user",
             content=content,

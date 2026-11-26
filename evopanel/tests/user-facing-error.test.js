@@ -62,6 +62,14 @@ describe('toUserFacingError', () => {
     expect(toUserFacingError('Error\n  File "foo.py", line 1')).toBe('操作失败，请稍后重试')
   })
 
+  it('maps concurrent viewed_images graph update away from generic fallback', () => {
+    const raw =
+      "At key 'viewed_images': Can receive only one value per step. Use an Annotated key to handle multiple values.\nFor troubleshooting, visit: https://docs.langchain.com/oss/python/langgraph/errors/INVALID_CONCURRENT_GRAPH_UPDATE"
+    const out = toUserFacingError(raw)
+    expect(out).toMatch(/并行生图/)
+    expect(out).not.toBe('操作失败，请稍后重试')
+  })
+
   it('suppresses user_interrupt variants (underscore/space/camel)', () => {
     expect(toUserFacingError('user_interrupt')).toBe('')
     expect(toUserFacingError('user interrupt')).toBe('')
@@ -74,6 +82,37 @@ describe('toUserFacingError', () => {
     expect(
       toUserFacingError('httpx.RemoteProtocolError: Server disconnected without sending a response.'),
     ).toMatch(/模型服务中断|负载过高|开新会话/)
+  })
+
+  // 【self-evolution-bot · 2026-11-21 · 第115轮 · 模型:deepseek-v4.1-flash-1017】
+  // 改了什么：为「上游只回一句通用英文错误」这一档加回归断言。
+  // 为什么：2026-11-21 23:26:49 文档撰写师第二轮真实失败，上游回
+  //   "An internal error occurred"；旧实现把它原样投给用户（无原因、无下一步）。
+  //   实测同一句重发一次即成功，故文案必须含「再发一次」。
+  // 反证边界：带冒号细节 / 带中文 / 超长的原文不得被本档吞掉。
+  it('maps generic upstream error to actionable retry copy', () => {
+    const out = toUserFacingError('An internal error occurred')
+    expect(out).toMatch(/临时内部错误/)
+    expect(out).toMatch(/再发一次/)
+    // 不得把英文原文直接当文案投出去
+    expect(out).not.toMatch(/internal error occurred/i)
+  })
+
+  it('maps generic upstream error case/dot variants', () => {
+    expect(toUserFacingError('an internal error occurred.')).toMatch(/再发一次/)
+    expect(toUserFacingError('Internal Server Error occurred')).toMatch(/再发一次/)
+    expect(toUserFacingError('Something went wrong')).toMatch(/再发一次/)
+  })
+
+  it('does not swallow upstream errors that still carry detail', () => {
+    // 带冒号后跟具体细节 —— 必须保留可归因信息，不得并进通用档
+    const detailed = toUserFacingError(
+      'an internal error occurred: tool schema invalid for knowledge',
+    )
+    expect(detailed).not.toMatch(/临时内部错误/)
+    // 带中文的原文说明上游已给本地化信息，也不并档
+    const cjk = toUserFacingError('An internal error occurred 请联系管理员')
+    expect(cjk).not.toMatch(/临时内部错误/)
   })
 
   it('marks gateway connectivity copy as toast noise', () => {

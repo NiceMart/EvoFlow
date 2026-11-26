@@ -18,6 +18,14 @@ export type WakeJobSnapshot = {
   error?: string
   /** 触发这条叫醒的消息（用于派工条对状态） */
   sourceMsgId?: string
+  /**
+   * 【self-evolution-bot · 2026-11-20 · 第88轮 · 模型:deepseek-v4.1-flash-1017】
+   * 恢复队列时需要它们才能重建防环语义：depth 决定「是不是新一轮用户点名」，
+   * chainKey 决定 A→B→C 是否成环。没有这两个字段，刷新后恢复出来的任务
+   * 会把「嵌套叫醒」当成「用户点名」，从而绕开防环。
+   */
+  depth?: number
+  chainKey?: string
   updatedAt: number
 }
 
@@ -28,6 +36,8 @@ export type WakeEnqueueInput = {
   depth: number
   fromAgentName?: string
   stewardMode?: boolean
+  /** 无人 @ 时由部门负责人默认承接 */
+  headDefaultCatcher?: boolean
   contextSummary?: string
   sourceMsgId?: string
   /** A→B 防环键；已存在则跳过 */
@@ -162,6 +172,10 @@ export class DeptGroupWakeQueue {
         attempts: j.attempts,
         error: j.error,
         sourceMsgId: j.sourceMsgId,
+        // 【self-evolution-bot · 2026-11-20 · 第88轮 · 模型:deepseek-v4.1-flash-1017】
+        // 必须透出，否则恢复队列时防环语义丢失
+        depth: j.depth,
+        chainKey: j.chainKey,
         updatedAt: j.updatedAt,
       }))
       .sort((a, b) => a.updatedAt - b.updatedAt)
@@ -290,6 +304,7 @@ export class DeptGroupWakeQueue {
         detail: {
           depth: input.depth,
           stewardMode: !!input.stewardMode,
+          headDefaultCatcher: !!input.headDefaultCatcher,
           fromAgentName: input.fromAgentName || undefined,
           queueLen: list.length,
           goal: goal.slice(0, 160),
@@ -361,6 +376,7 @@ export class DeptGroupWakeQueue {
           depth: job.depth,
           fromAgentName: job.fromAgentName,
           stewardMode: job.stewardMode,
+          headDefaultCatcher: job.headDefaultCatcher,
           contextSummary: job.contextSummary,
           sourceMsgId: job.sourceMsgId,
           signal,

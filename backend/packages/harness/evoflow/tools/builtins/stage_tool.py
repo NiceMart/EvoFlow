@@ -3,17 +3,56 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Annotated, Any, Literal
 
-from langchain.tools import InjectedToolCallId, ToolRuntime, tool
 from langchain_core.messages import ToolMessage
+from langchain_core.tools import InjectedToolCallId, tool
 from langgraph.config import get_stream_writer
 from langgraph.types import Command
 from langgraph.typing import ContextT
 from pydantic import BeforeValidator, Field
 
+from evoflow.core.tool_runtime_type import ToolRuntime
 from evoflow.stage.stage_context import clear_thread_stage, set_thread_stage
+
+# 【self-evolution-bot · 2026-11-20 · 第100轮续 · 模型:deepseek-v4.1-flash-1017】
+# 改了什么：新增专用 logger。为什么：右栏推送失败原先被 `except: pass` 吞掉，
+# 工具返回 ok 而屏幕上什么都没发生，排查时一点线索都没有（用户明确要求加日志）。
+_RIGHT_STAGE_LOGGER_NAME = "evoflow.right_stage"
+
+# 【self-evolution-bot · 2026-11-21 · 第104轮 · 模型:deepseek-v4.1-flash-1017】
+# 改了什么：新增「会话级 kind」清单——这类面板属于某条会话，切到别的会话就看不见。
+# 为什么：回执原先只判「右栏是否收起」，报 visible:true 而用户屏幕上没有东西；
+#   真因是本轮实测的 44 秒里右栏挂的是另一条会话，事件按设计只写冻结记忆。
+# 口径来源与前端 right-stage-scope.ts 的 SESSION_SCOPED_KINDS 保持一致（唯一事实在前端）；
+#   这里只用于回执措辞判定，不参与任何写屏决策——漏一个 kind 只会少一句提示，不会写错屏。
+_SESSION_SCOPED_KINDS = frozenset(
+    {
+        "browser",
+        "web-embed",
+        "news-dashboard",
+        "platform-feedback",
+        "file",
+        "asset",
+        "codeViewer",
+        "terminal",
+        "summary",
+        "subagentTranscript",
+        "artifacts",
+        "screenshot",
+        "collab-workflow",
+        "collabSubtaskTranscript",
+        "employeeProcess",
+        "sessionRuntime",
+        "shell-page",
+    }
+)
+
+
+def get_right_stage_logger() -> logging.Logger:
+    return logging.getLogger(_RIGHT_STAGE_LOGGER_NAME)
 
 
 def _coerce_to_dict_or_none(v: Any) -> dict[str, Any] | None:
@@ -69,8 +108,52 @@ Deliverables: kind=artifacts, data.items[{type,path|url|content}].
 Web for the user: kind=web-embed, data.url — do not only paste a bare link in chat.
 Do not auto-open write preview after write/replace — only when user asks.
 Progress (any chat): collab-workflow data.mainTaskId; collabSubtaskTranscript data.mainTaskId+subtaskId;
-employeeProcess data.taskId+agentCode — only when user should watch live progress (not after every platform call).
+employeeProcess data.agentCode (taskId optional) — only when user should watch live progress (not after every platform call).
+【self-evolution-bot · 2026-11-20 · 第87轮 · 模型:deepseek-v4.1-flash-1017】
+改了什么：employeeProcess 那行由 data.taskId+agentCode 改为 data.agentCode (taskId optional)。
+为什么：上一处只改了 _build_progress_surface 的校验，没改这段给模型看的描述——
+校验说「只要 agentCode」，描述仍说「要 taskId+agentCode」，模型照描述传参就白传一个
+taskId 或以为必须带 task，等于同一件事又写了两份且互相矛盾。
 """
+
+
+def _hash_viewer_content(content: str) -> str:
+    """对齐前端 ``hashCodeViewerContent``：31 进制内容指纹（36 进制字符串）。
+
+    【self-evolution-bot · 2026-11-22 · 第120轮 · 模型:deepseek-v4.1-flash-1017】
+    改了什么：新增本函数，逐字复刻前端 open-right-stage-file.ts:190 的算法。
+    为什么：codeViewer 的 tab id 在 patch / multi-file-diff 时会追加这个指纹，
+      让「同一路径的不同 diff」各自占一个签。后端算不出同样的值，模型对同一文件
+      的新一轮 diff 发 ui.update 就会指向**上一轮那个签**（屏幕上是旧对比、工具回 ok）。
+    逐字一致性要点（少一个都会算出不同值）：
+      · 每步 ``hash = (hash * 31 + ord(ch))``，并按 32 位有符号截断（等价 JS 的 ``| 0``）；
+      · 取绝对值后转 36 进制；
+      · 必须按 **UTF-16 code unit** 迭代（JS 的 charCodeAt），所以非 BMP 字符
+        要按代理对逐个算，不能用 Python 的 ord(ch) 一次算完。
+    """
+    h = 0
+    for ch in content:
+        code = ord(ch)
+        if code > 0xFFFF:
+            # JS charCodeAt 逐 UTF-16 code unit：先高位代理再低位代理
+            code -= 0x10000
+            units = (0xD800 + (code >> 10), 0xDC00 + (code & 0x3FF))
+        else:
+            units = (code,)
+        for u in units:
+            h = (h * 31 + u) & 0xFFFFFFFF
+            if h >= 0x80000000:  # 等价 JS ``| 0`` 的有符号截断
+                h -= 0x100000000
+    v = abs(h)
+
+    if v == 0:
+        return "0"
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    out = ""
+    while v:
+        out = digits[v % 36] + out
+        v //= 36
+    return out
 
 
 def _first_str(*values: Any) -> str:
@@ -79,6 +162,60 @@ def _first_str(*values: Any) -> str:
         if text:
             return text
     return ""
+
+
+def _normalize_shell_path(raw: Any) -> str:
+    """把 shell-page 的 path 归一成站内路径；不是站内路径返回 ""（由调用方报错）。
+
+    【self-evolution-bot · 2026-11-21 · 第103轮 · 模型:deepseek-v4.1-flash-1017】
+    改了什么：新增本函数，规则与前端 ``open-shell-page-stage.ts:normalizePath`` /
+    ``shell-page-mount-table.ts:shellPageTabId`` 完全一致。
+    为什么（本轮现网实测）：``ui.show(kind=shell-page, data.path="https://example.com")``
+    返回 ok、日志里有 emit sent，右栏真的开出一个签 —— 契约写的是「path 必须是站内
+    路径（以 / 开头），外网用 web-embed」，实际却照单全收。前端 normalizePath 对
+    ``https://example.com`` 补成 ``/https://example.com``，于是出现一个永远挂不出来的
+    空壳签，还把用户原来 /tasks 的签顶掉了。契约只有后端能拦，前端只能兜。
+    判据：带 scheme（``a:``）、``//`` 开头、空串 → 一律拒；其余按前端规则归一。
+    """
+    p = str(raw or "").strip()
+    if not p:
+        return ""
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.\-]*:", p) or p.startswith("//"):
+        return ""
+    if p.startswith("#"):
+        p = p[1:]
+    if not p.startswith("/"):
+        p = f"/{p}"
+    p = p.split("?")[0].rstrip("/") or "/"
+    # 与挂载表一致：/employees → /proactive
+    if p == "/employees":
+        return "/proactive"
+    m = re.match(r"^/employees/([^/]+)$", p)
+    if m:
+        return f"/proactive/{m.group(1)}"
+    return p
+
+
+def _employee_process_tab_id(*, task_id: str, agent_code: str, session_key: str) -> str:
+    """员工执行过程签的 id —— 与前端 ``employeeProcessStageTabId`` 同一规则。
+
+    【self-evolution-bot · 2026-11-21 · 第103轮 · 模型:deepseek-v4.1-flash-1017】
+    改了什么：新增本函数，id 从 ``process:{task_id or code}`` 改为按前端规则算。
+    为什么（本轮现网实测）：我开 ``employeeProcess agentCode=xiaomi``，后端 surface.id
+    是 ``process:xiaomi`` → keyHint ``employeeProcess:process:xiaomi``；前端实际建签
+    是 ``process:live:xiaomi``（一人一签），真实 key ``employeeProcess:process:live:xiaomi``。
+    模型照 keyHint 调 ui.activate 一定「目标签不存在」。根因就是同一规则写了两个版本。
+    判据：对话侧 ``process:live:{code}``；任务中心（sessionKey 以 ``task-center:`` 开头）
+    ``tc:process:{taskId|live:{code}}`` —— 逐字对齐前端。
+    """
+    code = str(agent_code or "").strip()
+    tid = str(task_id or "").strip()
+    if str(session_key or "").strip().startswith("task-center:"):
+        base = tid or (f"live:{code}" if code else "")
+        return f"tc:process:{base}" if base else ""
+    if code:
+        return f"process:live:{code}"
+    return f"process:{tid}" if tid else ""
 
 
 def _normalize_panel_kind(kind: str) -> str:
@@ -110,12 +247,170 @@ def _normalize_panel_kind(kind: str) -> str:
     return aliases.get(k, k)
 
 
+def _content_tab_id(kind: str, data: dict[str, Any]) -> str:
+    """按前端同一规则派生签 id。
+
+    【self-evolution-bot · 2026-11-22 · 第120轮 · 模型:deepseek-v4.1-flash-1017】
+    改了什么：新增本函数，把四种内容预览 kind 的 id 规则逐字对齐前端 opener。
+    为什么：前端 tabKey 恒为 ``${kind}:${id}``（见 right-stage-store.tabKeyOf）；
+      id 若在模型入口恒为 ``primary``，不同文件就塌成同一个签 —— 打开第二个文件会把
+      第一个顶掉，用户观感是「右栏一次只能开一个文件」。这正是第103轮修 shell-page id
+      的同一条规则：**surface.id 必须与前端 opener 算出来的完全一致**，
+      否则 keyHint / ui.activate 指向不存在的签。
+    对齐来源（逐个手抄，勿凭记忆）：
+      file      → ``normalizePathId(path)``，\\ 全部转 /
+      asset     → ``{entityType}:{entityId}:{path}``（path 去掉前导 /）
+      codeViewer→ ``normalizePathId(source.path || source.title || 'diff')``
+                  + patch / multi-file-diff 追加 ``@<31进制内容指纹>``
+      screenshot→ ``uri`` 去空白、转 /、截 240 字符（可被 dedupeKey 覆盖）
+    """
+    k = str(kind or "").strip()
+
+    def _norm_path(value: Any) -> str:
+        return str(value or "").replace("\\", "/")
+
+    def _content_sig(src: dict[str, Any]) -> str:
+        """对齐前端 patchContentSignature：patch / multi-file-diff 才追加指纹。
+
+        【self-evolution-bot · 2026-11-22 · 第120轮 · 模型:deepseek-v4.1-flash-1017】
+        为什么必须补：前端 showRightStageCodeViewer 对同一路径的**不同 patch**
+          会算出不同 id（追加 31 进制内容指纹），而普通 file 类型不追加。
+          后端若只抄 path 不抄指纹，模型对「同一文件的新一轮 diff」发 ui.update 时，
+          算出的 key 会指向**上一轮 diff 那个签** —— 屏幕上看到的是旧对比，
+          工具却回 ok。这正是前端注释里写过的同款 bug（「diff 面板只能打开一个 tab」）。
+        """
+        if str(src.get("type") or "").strip() == "patch":
+            return _hash_viewer_content(str(src.get("patch") or ""))
+        if str(src.get("type") or "").strip() == "multi-file-diff":
+            before = str(src.get("beforeContent") or "")
+            after = str(src.get("afterContent") or "")
+            return _hash_viewer_content(f"{before}\u0000{after}")
+        return ""
+
+    if k == "file":
+        return _norm_path(_first_str(data.get("path"), data.get("filepath"), data.get("id"))) or "primary"
+    if k == "asset":
+        path = _norm_path(data.get("assetPath") or data.get("path")).lstrip("/").strip()
+        et = str(data.get("entityType") or "user").strip() or "user"
+        eid = str(data.get("entityId") or "user").strip() or "user"
+        return f"{et}:{eid}:{path}"
+    if k == "codeViewer":
+        src = data.get("source") if isinstance(data.get("source"), dict) else {}
+        path_or_title = _first_str(src.get("path"), src.get("title")) or "diff"
+        base = _norm_path(path_or_title)
+        sig = _content_sig(src)
+        return f"{base}@{sig}" if sig else base
+    if k == "screenshot":
+        raw = str(data.get("dedupeKey") or data.get("uri") or "").strip()
+        return _norm_path(raw).replace("\\", "/")[:240]
+    return "primary"
+
+
+def _build_content_surface(
+    *,
+    kind: str,
+    payload_data: dict[str, Any],
+    title: str | None,
+    layout: str | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """校验并构造「内容预览」类 surface（file / asset / codeViewer / screenshot）。
+
+    【self-evolution-bot · 2026-11-22 · 第120轮 · 模型:deepseek-v4.1-flash-1017】
+    改了什么：新增本函数，替代这四种 kind 原先走的通用分支（id 恒 primary、零校验）。
+    为什么（用户当场质问）：「为什么要说不能支持打开文件呀？打开文件、图片、视频
+      都可以的呀」——它们本来就渲染得出来，却既不在契约表（模型查不到）、
+      又缺必填校验（缺 path 也 emit 一个空白签）。工具说成功、屏幕是空的，
+      是本仓库反复出现的「契约写了、代码没执行」的反面：**代码能执行、契约没写**。
+    判据：缺必填字段时 ok:false 并点名字段 + 指向 ui.kinds，绝不 emit 空白签。
+    """
+    data = dict(payload_data)
+    k = str(kind or "").strip()
+
+    if k == "file":
+        path = _first_str(data.get("path"), data.get("filepath"), data.get("file"))
+        if not path:
+            return (
+                None,
+                "file requires data.path (absolute path or path relative to the workspace root); "
+                "call platform action=ui.kinds for the full contract",
+            )
+        data["path"] = path
+        name = _first_str(data.get("name"), data.get("title"))
+        if name:
+            data["name"] = name
+        if not title:
+            title = name or path.replace("\\", "/").rsplit("/", 1)[-1] or None
+
+    elif k == "asset":
+        path = _first_str(data.get("path"), data.get("assetPath"))
+        if not path:
+            return (
+                None,
+                "asset requires data.path (asset-relative path such as memory/standing.md); "
+                "call platform action=ui.kinds for the full contract",
+            )
+        path = path.replace("\\", "/").lstrip("/").strip()
+        data["path"] = path
+        data["assetPath"] = path
+        et = _first_str(data.get("entityType"), data.get("entity_type")) or "user"
+        eid = _first_str(data.get("entityId"), data.get("entity_id")) or "user"
+        data["entityType"] = et
+        data["entityId"] = eid
+        name = _first_str(data.get("name"), data.get("title"))
+        if name:
+            data["name"] = name
+        if not title:
+            title = name or path.rsplit("/", 1)[-1] or None
+
+    elif k == "codeViewer":
+        src = data.get("source")
+        if not isinstance(src, dict) or not src:
+            return (
+                None,
+                "codeViewer requires data.source (object with at least a 'type', e.g. "
+                "{'type':'file','path':'README.md'}); call platform action=ui.kinds "
+                "for the full contract",
+            )
+        stype = str(src.get("type") or "").strip()
+        if stype == "file" and not _first_str(src.get("path")):
+            return (
+                None,
+                "codeViewer source.type=file requires source.path; "
+                "for plain file preview use kind=file instead",
+            )
+        title = title or _first_str(src.get("title"), src.get("path")) or None
+
+    elif k == "screenshot":
+        uri = _first_str(data.get("uri"), data.get("url"), data.get("src"))
+        if not uri:
+            return (
+                None,
+                "screenshot requires data.uri (browser-snapshots / serve-file / http(s) / data URL); "
+                "call platform action=ui.kinds for the full contract",
+            )
+        data["uri"] = uri
+        if not title:
+            title = _first_str(data.get("title")) or "截图"
+
+    surface: dict[str, Any] = {
+        "id": _content_tab_id(k, data),
+        "kind": k,
+        "data": data,
+    }
+    if layout:
+        surface["layout"] = layout
+    if title:
+        surface["title"] = str(title)
+    return surface, None
+
+
 def _build_progress_surface(
     *,
     kind: str,
     payload_data: dict[str, Any],
     title: str | None,
     layout: str | None,
+    session_key: str = "",
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Validate progress kinds and return (surface, error)."""
     data = dict(payload_data)
@@ -125,7 +420,14 @@ def _build_progress_surface(
             data.get("mainTaskId"), data.get("main_task_id"), data.get("taskId"), data.get("task_id")
         )
         if not main_id:
-            return None, "collab-workflow requires data.mainTaskId (or taskId)"
+            # 【self-evolution-bot · 2026-11-20 · 第87轮 · 模型:deepseek-v4.1-flash-1017】
+            # 改了什么：缺字段报错补上「怎么查/怎么传」，指向 ui.kinds。
+            # 为什么：只报缺什么，模型下一轮仍要猜第二个字段叫什么。
+            return (
+                None,
+                "collab-workflow requires data.mainTaskId (or taskId); "
+                "call platform action=ui.kinds for the full contract",
+            )
         data["mainTaskId"] = main_id
         lead = _first_str(
             data.get("leadThreadId"),
@@ -173,13 +475,25 @@ def _build_progress_surface(
         return surface, None
 
     if kind == "employeeProcess":
+        # 【self-evolution-bot · 2026-11-20 · 第87轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：employeeProcess 只强制 agentCode，taskId 改为可选。
+        # 为什么：契约真源（stage/right_panel_kinds.py）里 taskId 本就是可选——
+        # 跟岗/唤醒场景只有 agent 没有 task，前端 open-progress-from-panel-set.ts
+        # 早就只查 agentCode。是这里多要了一个 taskId，导致「模型按前端能开的方式
+        # 调、后端却报错」这一类对不齐。生产侧自动开 CTA 一直靠 live:{code} 兜底
+        # 才没暴露，属规则写了两份且不一致。
         task_id = _first_str(
             data.get("taskId"), data.get("task_id"), data.get("mainTaskId"), data.get("main_task_id")
         )
         code = _first_str(data.get("agentCode"), data.get("agent_code"), data.get("assigned_to"))
-        if not task_id or not code:
-            return None, "employeeProcess requires data.taskId and data.agentCode"
-        data["taskId"] = task_id
+        if not code:
+            return None, "employeeProcess requires data.agentCode"
+        if task_id:
+            data["taskId"] = task_id
+        else:
+            # 跟岗占位：不写假 taskId，避免拼出 proactive:…:task:live-… 这种死链
+            data.pop("taskId", None)
+            data.pop("task_id", None)
         data["agentCode"] = code
         round_id = _first_str(data.get("roundId"), data.get("round_id"), data.get("source_ref"))
         if round_id:
@@ -189,12 +503,95 @@ def _build_progress_surface(
         label = str(title or "").strip() or _first_str(data.get("title")) or "执行过程"
         data["title"] = label
         surface = {
-            "id": f"process:{task_id}",
+            # 【self-evolution-bot · 2026-11-21 · 第103轮 · 模型:deepseek-v4.1-flash-1017】
+            # 改了什么：id 不再自己拼 ``process:{taskId|code}``，改为调用
+            # ``_employee_process_tab_id``（与前端 employeeProcessStageTabId 同一规则）。
+            # 为什么：后端 ``process:xiaomi`` vs 前端 ``process:live:xiaomi``，
+            #   keyHint 因此指向一个不存在的签（ui.activate 必失败）。
+            "id": _employee_process_tab_id(
+                task_id=task_id, agent_code=code, session_key=session_key
+            )
+            or f"process:{task_id or code}",
             "kind": kind,
             "title": label,
             "layout": layout or "wide",
             "data": data,
         }
+        return surface, None
+
+    if kind == "sessionRuntime":
+        # 【self-evolution-bot · 2026-11-21 · 第103轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：补上 sessionRuntime 分支（契约里有必填 data.sessionKey，代码里没有）。
+        # 为什么（本轮现网实测）：``ui.show(kind=sessionRuntime, data={})`` 被接受并 emit，
+        #   前端 opener（open-progress-from-panel-set.ts）查不到 sessionKey 直接 return ''
+        #   → 后端回 ok、用户屏幕上什么都没发生。对照 web-embed / employeeProcess 都会
+        #   正确报缺字段，唯独这个 kind 静默通过。
+        # 判据：缺 sessionKey 必须报错并指向 ui.kinds；补齐后 id 与前端
+        #   ``sessionRuntime:${sessionKey}`` 逐字一致（后端原先写 primary）。
+        sk_in = _first_str(data.get("sessionKey"), data.get("session_key"))
+        if not sk_in:
+            return (
+                None,
+                "sessionRuntime requires data.sessionKey "
+                "(the session key, e.g. agent:main:new-xxxx); "
+                "call platform action=ui.kinds for the full contract",
+            )
+        data["sessionKey"] = sk_in
+        works = data.get("works")
+        if works is not None and not isinstance(works, list):
+            data.pop("works", None)
+        surface = {
+            "id": f"sessionRuntime:{sk_in}",
+            "kind": kind,
+            "title": str(title or "").strip() or "运行中",
+            "layout": layout or "wide",
+            "data": data,
+        }
+        return surface, None
+
+    if kind == "shell-page":
+        # 【self-evolution-bot · 2026-11-21 · 第103轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：补上 shell-page 分支 —— 校验必填 path、必须是站内路径、id 用
+        #   ``shell:{归一后的 path}``（前端 shellPageTabId 的形状）。
+        # 为什么（本轮现网实测两条）：① ``data.path="https://example.com"`` 被接受并真的
+        #   开了个空壳签，还顶掉了用户原来的 /tasks 签；② 后端 id 恒为 primary，
+        #   而前端真实 key 是 ``shell-page:shell:/tasks``，keyHint 因此永远是错的。
+        norm = _normalize_shell_path(data.get("path") or data.get("route"))
+        if not norm:
+            raw_path = str(data.get("path") or data.get("route") or "").strip()
+            if raw_path:
+                return (
+                    None,
+                    "shell-page data.path must be an in-app path starting with '/' "
+                    f"(got {raw_path!r}); for an external page use kind=web-embed with data.url",
+                )
+            return (
+                None,
+                "shell-page requires data.path (e.g. '/tasks'), an in-app path starting with '/'; "
+                "call platform action=ui.kinds for the full contract",
+            )
+        data["path"] = norm
+        data["route"] = norm
+        label = str(title or "").strip() or _first_str(data.get("title")) or ""
+        if label:
+            data["title"] = label
+        # 【self-evolution-bot · 2026-11-21 · 第103轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：没有可读名时**不再**把裸路径塞进 ``surface.title``（原为 ``label or norm``）。
+        # 为什么（本轮真机实测抓到的回执缺陷）：``ui.show kind=shell-page data.path=/knowledge``
+        #   不传 title 时，底层 surface.title 变成 ``"/knowledge"`` —— 回执里就写
+        #   ``title: "/knowledge"``。用户签上最终显示的是「知识库」（前端
+        #   resolveShellPageTabTitle 按挂载表兜底），所以签本身没错，错的是**回执**：
+        #   模型自己读到的是一段路径，会以为名字丢了/要自己再传一遍。
+        # 判据：路径不是名字。宁可留空让前端那唯一一份挂载表去兜底，
+        #   也不要在后端再造一个"看起来像名字"的假值（两处真源必然漂移）。
+        surface = {
+            "id": f"shell:{norm}",
+            "kind": kind,
+            "layout": layout or "wide",
+            "data": data,
+        }
+        if label:
+            surface["title"] = label
         return surface, None
 
     return None, None
@@ -245,15 +642,143 @@ def _resolve_session_key(runtime: ToolRuntime[ContextT, Any]) -> str:
 
 
 def _emit(event: dict[str, Any]) -> None:
+    """把右栏事件推给前端。
+
+    【self-evolution-bot · 2026-11-20 · 第100轮续 · 模型:deepseek-v4.1-flash-1017】
+    改了什么：`except: pass` 改为记日志（含事件类型、action、是否真有 writer、失败原因）。
+    为什么（用户当场指出 + 明确建议）：「我看你调用右侧工具的时候，右侧的侧边面板
+      我没看到打开。如果你查不到问题的话，可以加一点日志呀。」
+      此前这里一旦 writer 为 None 或抛异常，工具照样返回 ok，而屏幕上什么都没有 ——
+      **工具层「成功」与「屏幕变了」之间没有任何留痕**，我只能靠猜。
+      日志落到 gateway 日志文件，排查时直接 grep `[right-stage-emit]`。
+    """
+    action = event.get("action") or event.get("type")
     try:
         writer = get_stream_writer()
-        if callable(writer):
-            writer(event)
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 - 取不到 writer 也是重要事实
+        _audit_emit("no-writer", event, action, detail=f"{type(exc).__name__}: {exc}")
+        get_right_stage_logger().warning(
+            "[right-stage-emit] no writer (error=%s) type=%s action=%s",
+            type(exc).__name__,
+            event.get("type"),
+            action,
+        )
+        return
+    if not callable(writer):
+        # 这条最关键：工具返回值仍是 ok，但根本没有通道把事件送到前端。
+        _audit_emit("writer-not-callable", event, action, detail=type(writer).__name__)
+        get_right_stage_logger().warning(
+            "[right-stage-emit] writer is not callable (writer=%r) type=%s action=%s",
+            type(writer).__name__,
+            event.get("type"),
+            action,
+        )
+        return
+    try:
+        writer(event)
+        _audit_emit("sent", event, action)
+        get_right_stage_logger().info(
+            "[right-stage-emit] sent type=%s action=%s surface=%s key=%s",
+            event.get("type"),
+            action,
+            (event.get("surface") or {}).get("kind") if isinstance(event.get("surface"), dict) else None,
+            event.get("key"),
+        )
+    except Exception as exc:  # noqa: BLE001 - 推送失败必须留痕，不许静默
+        _audit_emit("writer-failed", event, action, detail=f"{type(exc).__name__}: {exc}")
+        get_right_stage_logger().warning(
+            "[right-stage-emit] writer failed (error=%s: %s) type=%s action=%s",
+            type(exc).__name__,
+            exc,
+            event.get("type"),
+            action,
+        )
+
+
+def _audit_emit(outcome: str, event: dict[str, Any], action: Any, detail: str | None = None) -> None:
+    """把一次推送决策写进 ``right-stage-YYYY-MM-DD.log``（含事件全文）。
+
+    【self-evolution-bot · 2026-11-20 · 第101轮 · 模型:deepseek-v4.1-flash-1017】
+    改了什么：``_emit`` 的三个分支（取不到 writer / writer 不可调用 / 已发出）
+    统一落到专用审计文件，而不是只写 stdlib logger。
+    为什么（现网实测）：本轮检查 ``grep -c 'right-stage-emit'`` 在
+      ``gateway-2026-11-20.log`` 与 ``langgraph-2026-11-20.log`` 里都是 **0** ——
+      上一轮加的 logger 在这两个进程里根本没进文件（langgraph 会重建 logging 树）。
+      于是「工具说 ok、屏幕没动」这个现象我依然查不了。改成直接写文件，
+      与 ``browser_debug_log`` 同型：单锁 append、失败静默。
+    判据：调一次右栏工具后 ``right-stage-<今天>.log`` 必须新增一行 ``[py]``；
+      outcome 三态可区分（sent / no-writer / writer-failed），不许只写"成功"。
+    """
+    try:
+        from evoflow.stage.right_stage_audit_log import right_stage_log
+
+        payload = dict(event)
+        right_stage_log(
+            "py",
+            f"emit {outcome} type={event.get('type')} action={action}"
+            + (f" detail={detail}" if detail else "")
+            + f" event={json.dumps(payload, ensure_ascii=False, default=str)}",
+        )
+    except Exception:  # noqa: BLE001 - 审计绝不冒泡
         pass
 
 
+def _resolve_opened_by_actor() -> str:
+    """【self-evolution-bot · 2026-11-23 · 第128轮 · 模型:deepseek-v4.1-flash】
+
+    改了什么：新增「这个面板是谁打开的」后端盖章，返回 ``agent:<code>`` 或空串。
+    为什么（用户 2026-11-23 原话）：右栏面板必须能看出是用户 / 某个智能体 / 某条会话
+      打开的，否则「A 处打开的截图在别处出现时不知道来路」就会串台。
+      前端只能拿到 surface，拿不到「哪个运行体在调工具」，所以必须在这一层取环境 actor。
+    判据：只用 ``get_current_agent_actor()``（由 ``platform`` 工具按 runtime 注入的
+      ``proactive_agent_code`` 绑定）；取不到就返回空串，让前端按归属会话兜底成
+      ``session:<sessionKey>``——绝不在这里猜成 ``user``。
+    """
+    try:
+        from evoflow.authz.agent_actor import get_current_agent_actor
+
+        code = str(get_current_agent_actor() or "").strip()
+    except Exception:
+        return ""
+    if not code:
+        return ""
+    # 【self-evolution-bot · 2026-11-23 · 第128轮 · 模型:deepseek-v4.1-flash】
+    # 实测（本轮 `_resolve_opened_by_actor` 直接调用，7 个取值）：
+    #   'proactive:release-engineer:task' → agent:release-engineer ✓
+    #   'agent:release-engineer'          → **agent:agent:release-engineer** ✗
+    # `normalize_agent_actor` 只认 ``proactive:`` / ``agent:main:`` 两类前缀，
+    # 通用 ``agent:<code>`` 前缀会原样保留 → 二次加前缀就变成双前缀，
+    # 前端按 agent_code 查岗位中文名查不到，签上只能显示裸串。
+    # 判据：自愈式剥前缀，不管上游有没有已经加过、加了几层，
+    # 出口永远是**恰好一层** ``agent:``。循环剥是必须的——本轮实测输入
+    # ``agent:agent:tech-director`` 时，只剥一次仍会吐 ``agent:agent:tech-director``。
+    while code.lower().startswith("agent:"):
+        code = code[len("agent:") :].strip()
+    # 实测：runtime 注入的 proactive_agent_code 可能是 ``proactive:x:task``，
+    # normalize_agent_actor 剥掉 ``proactive:`` 后仍留 ``:task``。
+    # 前端按 agent_code 查岗位中文名，带后缀就查不到 → 签上显示裸 code。这里剥干净。
+    for marker in (":task", ":duty", ":chat"):
+        if code.endswith(marker):
+            code = code[: -len(marker)].strip()
+    # 【self-evolution-bot · 2026-11-23 · 第128轮 · 模型:deepseek-v4.1-flash】
+    # 为什么再排一次：`_bind_runtime_identity` 已把 main/user/auto 清成空，
+    # 但这是**另一条**入口（本函数直接读 ambient 变量）。若有人绕过那条入口设成
+    # `user`，这里会盖出 `agent:user` —— 把用户操作标成「智能体打开的」是谎报，
+    # 比不标更糟。宁可返回空让前端兜底成会话归属。
+    if code.lower() in {"user", "main", "auto", "lead_agent", "system"}:
+        return ""
+    return f"agent:{code}" if code else ""
+
+
 def _emit_surface(action: str, surface: dict[str, Any] | None = None) -> None:
+    # 【self-evolution-bot · 2026-11-23 · 第128轮 · 模型:deepseek-v4.1-flash】
+    # 改了什么：出站前统一盖一层 `openedBy`（surface 自带时不覆盖）。
+    # 为什么：本项目有 5 处 _emit_surface 调用点（show/update × 各分支），逐处加必漏；
+    #   统一钉在这个唯一出口，等于把「谁开的」变成结构保证而不是自觉。
+    if isinstance(surface, dict) and not str(surface.get("openedBy") or "").strip():
+        actor = _resolve_opened_by_actor()
+        if actor:
+            surface = {**surface, "openedBy": actor}
     _emit({"type": "right_stage", "action": action, "surface": surface})
 
 
@@ -313,11 +838,22 @@ def apply_right_panel(
     text: str | None = None,
     thread_id: str | None = None,
     session_key: str | None = None,
+    expand: bool = False,
+    key: str | None = None,
+    target_key: str | None = None,
 ) -> dict[str, Any]:
     """Core right-panel driver used by ``platform ui.*`` (and legacy ``panel_set`` wrapper).
 
     Emits ``right_stage`` / ``right_stage_stream`` / ``chat_artifacts`` SSE; returns a
     plain result dict (no LangChain Command).
+
+    【self-evolution-bot · 2026-11-20 · 第91轮 · 模型:deepseek-v4.1-flash-1017】
+    改了什么：新增 ``expand`` 参数；为真时在 surface 上带 ``expand: true``。
+    为什么：用户让我「直接用平台工具打开面板给他看」，我实测发现右栏一旦被用户
+    收起（``userCollapsed`` = true），``ui.show`` 返回 ok 但**完全不撑开**，
+    用户屏幕上什么都没有——工具说「已打开」，人看不见，这就是最直接的一步绕路。
+    默认仍为 False，保持「模型不得抢用户视线」的既有语义；只有调用方
+    （用户明确要求展示）显式传 expand 才撑开。
     """
     act = str(action or "show").strip().lower() or "show"
     tid = str(thread_id or "").strip() or _resolve_thread_id_loose()
@@ -327,7 +863,130 @@ def apply_right_panel(
         if tid:
             clear_thread_stage(tid)
         _emit_surface("hide", None)
-        return {"ok": True, "action": "hide", "surface": None}
+        # 【self-evolution-bot · 2026-11-21 · 第104轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：hide 回执补上 ``userScreen``，把「收起前有没有东西可收」如实说出来。
+        # 为什么（本轮真机实测）：10:29:30 我调 ui.hide 拿到 ``ok:true``，但右栏纹丝不动，
+        #   状态盘之后 24 秒仍写 collapsed=False / tabs=2 —— ok 只代表事件送出去了。
+        #   真因（前端）已单独修：applyRemote 的 hide 派给 store.hide()（关一个签）而不是
+        #   collapse()（整栏收起），遇到 shell-page 这类受保护 kind 直接 return 什么都不做。
+        #   后端这一侧的判据是：收起动作必须回读一份「收起前快照」，让调用方下一轮能自己核对
+        #   「到底收掉了几个签」，而不是继续把 ok 当结果。
+        try:
+            from app.gateway.routers.stage_right_panel import read_right_stage_state
+
+            prev_hide = read_right_stage_state()
+        except Exception:
+            prev_hide = {"known": False}
+        hide_out: dict[str, Any] = {"ok": True, "action": "hide", "surface": None}
+        if prev_hide.get("known"):
+            hide_tabs = prev_hide.get("tabs") or []
+            hide_out["userScreen"] = {
+                "known": True,
+                "action": "hide",
+                "before": {
+                    "activeKey": prev_hide.get("activeKey") or None,
+                    "collapsed": prev_hide.get("collapsed") is True,
+                    "tabs": len(hide_tabs),
+                },
+                "expect": "整栏收起：面板占位消失，标签全部保留（不是关签）。",
+                "verifyHint": "下一轮用 ui.current 看 collapsed 是否为 true；标签数应仍是 "
+                f"{len(hide_tabs)}。若 collapsed 仍为 false，说明前端没收到或没处理这条 hide。",
+            }
+            if prev_hide.get("stale") is True:
+                hide_out["userScreen"]["staleBefore"] = True
+                hide_out["userScreen"]["ageSeconds"] = prev_hide.get("ageSeconds")
+        return hide_out
+
+    if act == "activate":
+        # 【self-evolution-bot · 2026-11-20 · 第100轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：新增 act="activate" —— 把右栏**切到用户已有的某个标签页**。
+        # 为什么（用户明确指出）：「你要知道当前是哪一个，然后怎么去切换到哪一个要处理好。」
+        #   此前只有 show/update/hide：update 只能对着某个 kind 灌内容，hide 是整体收起，
+        #   **没有任何"切到第 N 个签"的表达**。模型想让用户看回某页时只能重新 show 一遍，
+        #   结果是同一份东西被新开成第二个签（用户原话担心的正是这个）。
+        # 与 show 的区别（这是本动作存在的唯一理由）：
+        #   show 会写标签/改 data，甚至 forceExpand 抢视线；
+        #   activate **只改 activeKey**，不新建签、不改内容、不删内容，
+        #   用户自己拉开的其它签原样保留（tabCount 不变）。
+        target = str(key or "").strip()
+        if not target:
+            return {
+                "ok": False,
+                "action": "activate",
+                "error": "key is required (read it from platform action=ui.current → activeKey/tabs[].key)",
+            }
+        _emit({"type": "right_stage", "action": "activate", "surface": None, "key": target})
+        return {
+            "ok": True,
+            "action": "activate",
+            "key": target,
+            "note": "已请求前端切到该标签；只改当前查看的签，不新建/不关闭任何标签。",
+            "userScreen": _describe_user_screen_for_activate(target),
+        }
+
+    if act == "close":
+        # 【self-evolution-bot · 2026-11-20 · 第101轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：新增 action=close，只关**一个**标签，不动其它签、不整栏收起。
+        # 为什么（用户当场要求，原话）：「你可以切换到哪个进行一个显示，或者是给它关掉，
+        #   或者是打开，或者给它调换位置。就这种像人一样的操作。」
+        #   此前只有 hide（整栏收起）：前端 store 明明有 closeTab(key)，后端一个动作都没暴露，
+        #   模型想「关掉那一个」只能整栏收起，用户的其它签被一起藏了 —— 这不是人的操作。
+        # 判据：close 必须带 key；发出去之后前端 tabCount 减 1，其它签的 key 原样保留。
+        target = str(key or "").strip()
+        if not target:
+            return {
+                "ok": False,
+                "action": "close",
+                "error": (
+                    "key is required (read it from platform action=ui.current → tabs[].key). "
+                    "若要整栏收起请用 ui.hide。"
+                ),
+            }
+        _emit({"type": "right_stage", "action": "close", "surface": None, "key": target})
+        return {
+            "ok": True,
+            "action": "close",
+            "key": target,
+            "note": "已请求前端关闭该标签；其它标签与整栏展开状态不受影响。",
+            "userScreen": _describe_user_screen_for_close(target),
+        }
+
+    if act == "move":
+        # 【self-evolution-bot · 2026-11-20 · 第101轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：新增 action=move，把某个标签调到另一个标签的位置（前端 reorderTab）。
+        # 为什么：用户要求「给它调换位置」。前端 store 有 reorderTab(activeId, overId)，
+        #   后端完全没有入口，模型无法做到 —— 用户只能自己拖。
+        # 判据：move 必须同时带 key 与 target（目标位置那个签）；发出去之后
+        #   tabCount 不变、两个签的先后顺序互换。
+        src = str(key or "").strip()
+        dst = str(target_key or "").strip() or str((data or {}).get("target") or "").strip()
+        if not src or not dst:
+            return {
+                "ok": False,
+                "action": "move",
+                "error": (
+                    "move requires key (要移动的签) and target (移到哪个签的位置)，"
+                    "两个都从 platform action=ui.current → tabs[].key 取。"
+                ),
+            }
+        if src == dst:
+            return {"ok": False, "action": "move", "error": "key and target are the same tab"}
+        _emit(
+            {
+                "type": "right_stage",
+                "action": "move",
+                "surface": None,
+                "key": src,
+                "target": dst,
+            }
+        )
+        return {
+            "ok": True,
+            "action": "move",
+            "key": src,
+            "target": dst,
+            "note": "已请求前端调整标签顺序；不新建、不关闭、不改内容。",
+        }
 
     if act == "stream":
         sid = str(stream_id or "write_file").strip() or "write_file"
@@ -353,6 +1012,16 @@ def apply_right_panel(
 
     payload_data = dict(data or {})
     if k == "artifacts":
+        # 【self-evolution-bot · 2026-11-21 · 第106轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：把 ``expand`` 透传进 artifacts 分支（此前这里只有 6 个参数，独缺它）。
+        # 为什么（同型缺陷的第三处，本轮扫全仓 expand 落点时发现）：artifacts 在
+        #   ``_SESSION_SCOPED_KINDS`` 里＝会话级 kind，跨会话会被前端冻进归属会话记忆；
+        #   而它的 surface 从来不携带 ``expand``，于是：
+        #     · 右栏收起时 ``ui.show(kind="artifacts", expand=True)`` 不会撑开；
+        #     · 本条回执也不会走 ``not expand`` 豁免，会报「切过去才看得到」。
+        #   即 44 秒那件事在 artifacts 上原样可复现，只是我这几轮都在测 web-embed。
+        # 判据：凡是 ``_SESSION_SCOPED_KINDS`` 里能被 ui.show 打开的 kind，
+        #   其 surface 都必须能带 ``expand``，回执都必须带 ``userScreen``。
         return _apply_artifacts_panel(
             act=act,
             payload_data=payload_data,
@@ -360,6 +1029,7 @@ def apply_right_panel(
             layout=layout,
             thread_id=tid,
             session_key=sk,
+            expand=expand,
         )
 
     panel_title = title
@@ -375,23 +1045,108 @@ def apply_right_panel(
             if not panel_title:
                 panel_title = "浏览器"
 
-    if k in ("collab-workflow", "collabSubtaskTranscript", "employeeProcess"):
-        progress_surface, err = _build_progress_surface(
+    # ── 小V：拒绝走通用分支，指路它自己的开场通道 ──────────────────────────
+    # 【self-evolution-bot · 2026-11-22 · 第121轮 · 模型:deepseek-v4.1-flash-1017】
+    # 改了什么：拦掉 ``ui.show kind="xiaomi"``，不再落到下面的通用分支。
+    # 为什么（现网实测坐实，不是推断）：xiaomi 只在 ``FRONTEND_ONLY_KINDS`` 里、
+    #   不在契约表，所以它走通用分支时 ``surface.id`` 恒为 ``primary`` → keyHint
+    #   变成 ``xiaomi:primary``；而前端真正的小V 签 id 是常量 ``global``
+    #   （``open-right-stage-xiaomi.ts`` 的 ``XIAOMI_STAGE_ID = 'global'``）。
+    #   我真跑了一次：右栏当场多出第 12 个标签「打开小V」，而
+    #   ``documentElement.dataset.xmStage`` 仍是 ``unset`` —— 前端没把它当小V 面板，
+    #   等于留了一个既打不开也收不掉的幽灵签。与第103轮 shell-page 的 id 漂移同型。
+    # 判据：小V 需要 ``ensureXiaomiSession`` + 语音绑定 + 会话列表整套状态，
+    #   不是「开一个签名」就够，所以这里**不派生 id、不放行**，只拒绝并指路。
+    #   本分支只覆盖 show / update 两种（hide / close / activate / move 走更上面的
+    #   独立分支，压根到不了这里），所以「认得这个 kind」不受影响。
+    if k == "xiaomi":
+        return {
+            "ok": False,
+            "error": (
+                "kind='xiaomi' must not be opened via ui.show: the 小V panel has its own entry "
+                "(session bootstrap + voice binding + history), and its real tab id is the constant "
+                "'global', not 'primary' —— a generic show would leave a ghost tab that never becomes "
+                "the real panel. Use platform action=ui.panel op=action name=openXiaomi instead "
+                "(same path as the sidebar 小V button)."
+            ),
+        }
+
+    # ── 内容预览类：file / asset / codeViewer / screenshot ──────────────────
+    # 【self-evolution-bot · 2026-11-22 · 第120轮 · 模型:deepseek-v4.1-flash-1017】
+    # 改了什么：新增本分支。这四种此前落到下面「通用分支」，surface.id 恒为 primary。
+    # 为什么：① 它们虽在 KNOWN_KINDS 里（内部调用方在用），但**不在契约表**，
+    #   所以 ui.kinds 查不到 —— 用户问「为什么不能支持打开文件」时我照着子集清答
+    #   「不能」，功能其实第113轮就真机验过（PNG/MP4/PDF 全正常）。
+    #   ② id 恒为 primary 意味着 tabKey 恒为 `file:primary`：打开第二个文件时
+    #   前一个签被顶掉，用户看到的是「右栏只能开一个文件」——同一目标塌成同一指纹。
+    # 判据：id 必须逐字等于前端 `showRightStageFilePreview` / `showRightStageAssetPreview`
+    #   / `showRightStageCodeViewer` / `showRightStageScreenshot` 里那四个 id，
+    #   否则 keyHint 指向不存在的签（ui.activate 必失败）。
+    if k in ("file", "asset", "codeViewer", "screenshot"):
+        content_surface, err = _build_content_surface(
             kind=k,
             payload_data=payload_data,
             title=panel_title,
             layout=layout,
         )
-        if err or not progress_surface:
-            return {"ok": False, "error": err or "invalid progress panel"}
-        surface = progress_surface
+        if err or not content_surface:
+            return {"ok": False, "error": err or "invalid content panel"}
+        surface = content_surface
+        if expand:
+            surface["expand"] = True
         if act == "update":
             _emit_surface("update", surface)
         else:
             _emit_surface("show", surface)
         if tid:
             set_thread_stage(tid, kind=k, data=surface.get("data"))
-        return {"ok": True, "action": act, "kind": k, "surface": surface}
+        return {
+            "ok": True,
+            "action": act,
+            "kind": k,
+            "surface": surface,
+            "userScreen": _describe_user_screen_before_after(
+                act=act, kind=k, surface=surface, expand=expand, owner_session_key=sk
+            ),
+        }
+
+    if k in ("collab-workflow", "collabSubtaskTranscript", "employeeProcess", "sessionRuntime", "shell-page"):
+        # 【self-evolution-bot · 2026-11-21 · 第103轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：把 sessionRuntime / shell-page 也交给 _build_progress_surface 校验，
+        #   并把 session_key 传进去（employeeProcess 的签 id 规则要用它区分任务中心）。
+        # 为什么：这两个 kind 此前落到下面「通用分支」，surface.id 恒为 primary —— 既不做
+        #   必填校验（缺 sessionKey 也 emit），又让 keyHint 与前端真实 key 不符。
+        progress_surface, err = _build_progress_surface(
+            kind=k,
+            payload_data=payload_data,
+            title=panel_title,
+            layout=layout,
+            session_key=sk,
+        )
+        if err or not progress_surface:
+            return {"ok": False, "error": err or "invalid progress panel"}
+        surface = progress_surface
+        if expand:
+            surface["expand"] = True
+        if act == "update":
+            _emit_surface("update", surface)
+        else:
+            _emit_surface("show", surface)
+        if tid:
+            set_thread_stage(tid, kind=k, data=surface.get("data"))
+        # 【self-evolution-bot · 2026-11-20 · 第100轮 · 模型:deepseek-v4.1-flash-1017】
+        # 为什么必须在这里也补：进度类面板（collab-workflow / collabSubtaskTranscript /
+        # employeeProcess）走的是这条**独立 return 分支**，主分支加的 userScreen 覆盖不到。
+        # 我第一次只改了主分支，测试当场红——这就是「改一处、漏另一处」的老毛病。
+        return {
+            "ok": True,
+            "action": act,
+            "kind": k,
+            "surface": surface,
+            "userScreen": _describe_user_screen_before_after(
+                act=act, kind=k, surface=surface, expand=expand, owner_session_key=sk
+            ),
+        }
 
     surface = {
         "id": "primary",
@@ -404,6 +1159,11 @@ def apply_right_panel(
         surface["layout"] = "workspace-write"
     if panel_title:
         surface["title"] = panel_title
+    # 【self-evolution-bot · 2026-11-20 · 第91轮 · 模型:deepseek-v4.1-flash-1017】
+    # 非进度类面板（web-embed / shell-page / file / mind-map …）同样要能把
+    # 「用户明确要我看」透传到前端，否则用户收起右栏后 ui.show 就是空转。
+    if expand:
+        surface["expand"] = True
 
     if act == "update":
         _emit_surface("update", surface)
@@ -418,7 +1178,305 @@ def apply_right_panel(
     if tid:
         set_thread_stage(tid, kind=k, data=surface.get("data"))
 
-    return {"ok": True, "action": act, "kind": k, "surface": surface}
+    return {
+        "ok": True,
+        "action": act,
+        "kind": k,
+        "surface": surface,
+        # 【self-evolution-bot · 2026-11-20 · 第100轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：每次开/更新面板都带回「用户原本在看哪一页」以及是否被顶掉。
+        # 为什么（用户明确指出）：模型开面板时不知道用户右栏正在看什么，抢了视线自己还不知道。
+        #   现在把 before/after 一起回给调用方，模型下一句就能说清楚「我把你原来的 X 换成 Y 了」。
+        "userScreen": _describe_user_screen_before_after(
+            act=act, kind=k, surface=surface, expand=expand, owner_session_key=sk
+        ),
+    }
+
+
+def _infer_tab_key(
+    *,
+    kind: str,
+    surface: dict[str, Any],
+    tabs: Any,
+) -> str:
+    """推算这个 surface 在前端的真实 tab key。
+
+    【self-evolution-bot · 2026-11-21 · 第103轮 · 模型:deepseek-v4.1-flash-1017】
+    改了什么：删掉「shell-page 自己按 path 推算 key」那段特例，收敛成唯一一条规则。
+    为什么：那段的根因判断错了 —— 问题不在 keyHint 的算法，而在 surface.id 本身
+      （后端恒为 primary）。修了 id 之后（shell-page→shell:{path}、
+      sessionRuntime→sessionRuntime:{sk}、employeeProcess→process:live:{code}），
+      ``${kind}:${id}`` 就逐字等于前端 ``tabKeyOf``。留着特例等于同一条规则写两份，
+      下次任何一侧改 id 规则，这里就会再飘一次 —— 正是本轮缺陷的同一个根因。
+    判据：先在用户已开的签里按 kind+id 找到真实 key（字面值最可信）；找不到再按
+      store 的 ``${kind}:${id}`` 推算。
+    """
+    kind_s = str(kind or "").strip()
+    ident = str(surface.get("id") or "").strip()
+    if isinstance(tabs, list) and ident:
+        for t in tabs:
+            if not isinstance(t, dict):
+                continue
+            if str(t.get("kind") or "") == kind_s and str(t.get("id") or "") == ident:
+                real = str(t.get("key") or "").strip()
+                if real:
+                    return real
+    return f"{kind_s}:{ident}" if ident else ""
+
+
+def _describe_user_screen_before_after(
+    *,
+    act: str,
+    kind: str,
+    surface: dict[str, Any],
+    expand: bool = False,
+    owner_session_key: str = "",
+) -> dict[str, Any]:
+    """把「用户原本停在哪一页」与「这次操作是复用还是新开」如实描述出来。"""
+    try:
+        from app.gateway.routers.stage_right_panel import read_right_stage_state
+
+        prev = read_right_stage_state()
+    except Exception:
+        prev = {"known": False}
+
+    if not prev.get("known"):
+        return {
+            "known": False,
+            "note": "前端还没上报过右栏状态，无法判断是否抢了用户的视线。",
+        }
+
+    prev_key = str(prev.get("activeKey") or "")
+    prev_kind = str(prev.get("activeKind") or "")
+    # 【self-evolution-bot · 2026-11-21 · 第102轮 · 模型:deepseek-v4.1-flash-1017】
+    # 改了什么：``reusedSameKindTab`` 改为按「目标 key 是否已在用户已开的标签里」判，
+    #   不再只看「activeKind 是否等于本次 kind」。
+    # 为什么（本轮现网实测 08:12:05）：我 ui.show path=/tasks 时右栏其实**新建了第 2 个签**
+    #   （web-state 紧接着上报 tabs=2），而回执写 ``reusedSameKindTab: true`` +
+    #   「用户原本就在同类页面上，本次多半是原地更新」—— 两句都与事实相反。
+    #   根因：上一次 activeKind 也是 ``shell-page``，但它是 ``/proactive`` 那一签；
+    #   "同 kind" 不等于 "同一个签"，shell-page 一个 kind 底下有几十个页面。
+    # 判据：本工具已经算出真实 key（``_infer_tab_key``），直接拿它去比对用户已开的签；
+    #   命中才算复用，未命中就是新开 —— 与前端 ``tabKeyOf`` 的唯一事实一致。
+    target_key_hint = _infer_tab_key(kind=kind, surface=surface, tabs=prev.get("tabs") or [])
+    existing_keys = {str((t or {}).get("key") or "") for t in (prev.get("tabs") or [])}
+    reused = bool(target_key_hint) and target_key_hint in existing_keys
+    # 【self-evolution-bot · 2026-11-20 · 第101轮 · 模型:deepseek-v4.1-flash-1017】
+    # 改了什么：``keyHint`` 改为按前端真实 tabKeyOf 规则算，不再硬套 ``${kind}:${id}``；
+    #   同时优先从用户已开的标签里找同 kind 同 path 的真实 key。
+    # 为什么（本轮现网实测）：我开 ``shell-page path=/tasks``，工具回我
+    #   ``keyHint="shell-page:primary"``，而真实 key 是 ``shell-page:shell:/tasks``
+    #   （前端 ``shell-page:${shellPageTabId(path)}``）。模型照 keyHint 去调 ui.activate
+    #   必然「目标签不存在」—— 这个错提示是我上一轮引入的。
+    # 判据：shell-page 的 keyHint 必须含 path 段；能在当前 tabs 里找到同 kind 同 path 时，
+    #   直接返回那个真实 key（用户看到的字面值）。
+    # （第102轮：这一行原本在这里重复计算 target_key_hint / same_kind，已上移到 reused 判据处；
+    #   same_kind 这条"同 kind"判据实测与事实相反，已彻底删除，不要再加回来。）
+    # 【self-evolution-bot · 2026-11-20 · 第101轮 · 模型:deepseek-v4.1-flash-1017】
+    # 改了什么：把「本次写入用户到底看不看得见」算成一个显式布尔 ``visible``，
+    #   并在看不见时给出可执行的下一步（传 expand=True 重发），而不是只丢个 ok。
+    # 为什么（本轮现网实测）：23:22:57 我调 ui.show（未传 expand），工具返回 ok:true，
+    #   同一秒 web-state 上报 ``collapsed=True`` —— 右栏压根没撑开，用户屏幕上没有东西。
+    #   我把 expand=true 补进参数后再发一次，23:23:28 上报变成 ``collapsed=False``。
+    #   同一条工具、同一秒的双侧日志证明：ok 只代表「事件送到了」，不代表「用户看见了」。
+    # 判据：右栏处于收起态且本次没带 expand → ``visible`` 必须为 False 且带 hint；
+    #   带 expand=True 或本来就没收起 → ``visible`` 为 True。不许再出现「ok 但看不见」无提示。
+    prev_collapsed = prev.get("collapsed") is True
+    visible = (not prev_collapsed) or bool(expand) or act == "update"
+    # 【self-evolution-bot · 2026-11-21 · 第104轮 · 模型:deepseek-v4.1-flash-1017】
+    # 改了什么：``visible`` 补第二种看不见的成因——「用户当前 UI 停在别的会话」。
+    # 为什么（本轮现网实测 13:26:37）：我在 proactive 会话发 ui.show(web-embed, expand=true)，
+    #   回执写 ``visible: true``；而用户屏幕上过了 44 秒什么都没出现。前端日志 13:27:20.825
+    #   「用户点击侧栏会话」切到我的会话之后，那签才显示出来。
+    #   根因：前端 right-stage-agui.ts 有一条设计正确的隔离分支——
+    #   ``isBackgroundOwner && scopeOfKind(kind) === 'session'`` 时只写该会话的冻结记忆、
+    #   绝不碰当前右栏。所以事件没丢、记忆也写了，只是**当时不可见**。
+    #   而回执只知道「右栏是否收起」，不知道「右栏挂在哪条会话上」，于是报了 visible:true。
+    # 判据：web-state 上报带 sessionKey；它若与本次事件归属会话不一致，且该 kind 是
+    #   会话级（会被冻结而不是写屏），visible 必须为 False 并说明「切到该会话才看得到」。
+    prev_session_key = str(prev.get("sessionKey") or "").strip()
+    if not prev_session_key:
+        # 【self-evolution-bot · 2026-11-21 · 第106轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：把第104轮的兜底保留下来（删过一次是手误，缩进当场就坏了），
+        #   但补上「顶层字段现在真的会有值」这一半 —— 见 stage_right_panel._clean_payload：
+        #   它此前把前端发的顶层 sessionKey 静默丢掉，导致本判据的 prev 侧长期为空。
+        # 为什么仍要兜底：老前端（未重建安装）只发 tabs[].sessionKey，
+        #   而这条判据不该等一次打包才生效。
+        active_key = str(prev.get("activeKey") or "").strip()
+        for _t in prev.get("tabs") or []:
+            if isinstance(_t, dict) and str(_t.get("key") or "") == active_key:
+                prev_session_key = str(_t.get("sessionKey") or "").strip()
+                break
+    # 【self-evolution-bot · 2026-11-21 · 第106轮 · 模型:deepseek-v4.1-flash-1017】
+    # 改了什么：本次事件的归属会话改为由调用方显式传入，不再只从 ``surface`` 里取。
+    # 为什么（本轮现网实证，这是「报可见其实不可见」的真根因）：
+    #   13:26:37 那条 emit 的原文是
+    #   ``{"action":"show","surface":{"id":"primary","kind":"web-embed","data":{...},
+    #     "title":"第104轮验证A","expand":true}}`` —— **surface 里没有 sessionKey**。
+    #   于是这里 ``owner_session_key`` 恒为空串，下面 ``frozen_in_other_session``
+    #   整个布尔表达式恒为 False，第104轮写的「切过去才看得到」分支是**死代码**，
+    #   一次都没执行过；回执照旧报 ``visible: true``，而用户屏幕上 44 秒什么都没有。
+    #   这正是我资产里那条「判据吃的字段在真实路径恒为空」的同型复发（第三次）。
+    # 判据：归属会话由 ui.show 的 sk（_resolve_session_key_loose 解析）传入；
+    #   surface.sessionKey 作为次要来源保留，两者取先有值的那个。
+    owner_session_key = (
+        str(owner_session_key or "").strip()
+        or str(surface.get("sessionKey") or "").strip()
+    )
+    # 【self-evolution-bot · 2026-11-21 · 第106轮 · 模型:deepseek-v4.1-flash-1017】
+    # 改了什么：``frozen_in_other_session`` 补 ``expand`` 豁免，与前端放宽后的隔离分支同口径。
+    # 为什么（同一缺陷改了两处、漏了第三处的当场自撞）：本轮已把前端
+    #   ``right-stage-agui.ts`` 那条会话级隔离分支改成「expand=true 时按用户当前 UI 会话
+    #   盖章写 live」——也就是说带 expand 的事件**用户当场就能看见**。
+    #   而这条后端判据仍在算 ``prev_session_key != owner_session_key`` → visible=False，
+    #   回执会告诉模型「用户看不见，切过去才有」——与前端实际行为相反，
+    #   模型据此对用户说错话，比不报更糟。
+    # 判据：expand=True 是调用方明确要求「让用户看见」，前端已保证按 ui 会话落地 →
+    #   本回执也不得判 frozen。两处必须同一口径，改一处必须回来改另一处。
+    frozen_in_other_session = bool(
+        not expand
+        and prev_session_key
+        and owner_session_key
+        and prev_session_key != owner_session_key
+        and kind in _SESSION_SCOPED_KINDS
+    )
+    if frozen_in_other_session:
+        visible = False
+    out: dict[str, Any] = {
+        "known": True,
+        "action": act,
+        "visible": visible,
+        "before": {
+            "activeKey": prev_key or None,
+            "activeKind": prev_kind or None,
+            "activeTitle": prev.get("activeTitle") or None,
+            "collapsed": prev.get("collapsed") is True,
+        },
+        "target": {"kind": kind, "id": surface.get("id") or "primary", "keyHint": target_key_hint},
+        # 同一 kind 通常沿用同一个签（store.tabKeyOf）；换 kind 才会多一个签。
+        # 【第102轮更正】但「同 kind」≠「同一个签」：shell-page 一个 kind 下有几十个页面。
+        # 复用的判据必须是目标 key 已在用户已开标签里，见上面 target_key_hint 的注释。
+        "reusedSameKindTab": reused,
+        "mayStealFocus": bool(prev_key) and not reused and act != "update",
+        "note": (
+            "目标签本来就在，本次是原地更新，不会多出标签。"
+            if reused
+            else "本次会在右栏多开一个标签（原标签保留）；若担心抢视线，用 ui.update 或先问一句。"
+        ),
+    }
+    if not visible:
+        if frozen_in_other_session:
+            out["hint"] = (
+                "右栏此刻挂在你正在看的另一条会话上（不是本条事件归属的会话），"
+                "本次只写进了归属会话的冻结记忆，用户屏幕上没有任何变化。"
+                "请如实说明「已写入你那条会话的右栏，切过去才能看到」，"
+                "不要声称已经显示在屏幕上。"
+            )
+            out["note"] = "右栏挂在别的会话上；本次写入对当前屏幕不可见。"
+        else:
+            out["hint"] = (
+                "右栏当前处于收起状态，本次只写入了标签、用户屏幕上没有任何变化。"
+                "若确实要让用户看到，请带 expand=True 重发一次；否则请如实告诉用户"
+                "「已准备好，但你的右栏是收起的」。"
+            )
+            out["note"] = "用户右栏是收起的；本次写入不可见。"
+    return out
+
+
+def _describe_user_screen_for_activate(target_key: str) -> dict[str, Any]:
+    """切换动作的前后描述：目标签在不在、切完会不会多出/少掉一个签。
+
+    【self-evolution-bot · 2026-11-20 · 第100轮 · 模型:deepseek-v4.1-flash-1017】
+    为什么单写一份：``_describe_user_screen_before_after`` 的判据是「kind 是否相同」，
+    而 activate 的判据是「这个 key 在不在用户已开的标签里」——两者混用会把
+    「切到不存在签」误报成「复用成功」，那正是用户担心的情况（他一拉开东西就被顶掉）。
+    """
+    try:
+        from app.gateway.routers.stage_right_panel import read_right_stage_state
+
+        prev = read_right_stage_state()
+    except Exception:
+        prev = {"known": False}
+
+    if not prev.get("known"):
+        return {
+            "known": False,
+            "target": target_key,
+            "note": (
+                "前端还没上报过右栏状态，无法确认该标签是否存在；"
+                "切换请求已发出，但请以用户看到的为准。"
+            ),
+        }
+
+    tabs = prev.get("tabs") if isinstance(prev.get("tabs"), list) else []
+    keys = [str((t or {}).get("key") or "") for t in tabs]
+    exists = target_key in keys
+    prev_key = str(prev.get("activeKey") or "")
+    return {
+        "known": True,
+        "target": target_key,
+        "targetExists": exists,
+        "before": {
+            "activeKey": prev_key or None,
+            "activeKind": prev.get("activeKind") or None,
+            "activeTitle": prev.get("activeTitle") or None,
+            "collapsed": prev.get("collapsed") is True,
+        },
+        # 切签不动标签集合：tabCount 前后必须一样，用户拉开的东西不会被关掉。
+        "tabCountBefore": len(keys),
+        "tabCountAfter": len(keys),
+        "note": (
+            "目标签确实存在，已切过去（其它标签原样保留）。"
+            if exists
+            else f"目标签不在用户当前标签里（现有 {len(keys)} 个：{keys}）；"
+            "请先 ui.current 核对 key，或改用 ui.show 新建。已开的标签不会被关掉。"
+        ),
+    }
+
+
+def _describe_user_screen_for_close(target_key: str) -> dict[str, Any]:
+    """关闭单个标签的前后描述：签数必须减 1，且不碰整栏展开状态。
+
+    【self-evolution-bot · 2026-11-21 · 第102轮 · 模型:deepseek-v4.1-flash-1017】
+    为什么单写一份（真机实测抓到的串台）：close 分支原先直接复用
+    ``_describe_user_screen_for_activate``，于是 ``ui.close`` 的回执里写着
+    「已切过去（其它标签原样保留）」和 ``tabCountBefore == tabCountAfter`` ——
+    两句话对关闭操作**全是错的**：关签恰恰要少一个签、也根本不切当前签。
+    判据：close 的回执必须给 ``tabCountAfter = 前 - 1``，并且显式说明
+    「整栏展开状态不受影响」，与 ui.hide（整栏收起、签还在）区分开。
+    """
+    try:
+        from app.gateway.routers.stage_right_panel import read_right_stage_state
+
+        prev = read_right_stage_state()
+    except Exception:
+        prev = {"known": False}
+
+    if not prev.get("known"):
+        return {
+            "known": False,
+            "target": target_key,
+            "note": "前端还没上报过右栏状态，无法确认该标签是否存在；关闭请求已发出。",
+        }
+
+    tabs = prev.get("tabs") if isinstance(prev.get("tabs"), list) else []
+    keys = [str((t or {}).get("key") or "") for t in tabs]
+    exists = target_key in keys
+    return {
+        "known": True,
+        "action": "close",
+        "target": target_key,
+        "targetExists": exists,
+        "tabCountBefore": len(keys),
+        # 关签就是少一个；目标不存在则签数不变（前端会忽略该请求）。
+        "tabCountAfter": (len(keys) - 1) if exists else len(keys),
+        "note": (
+            "目标签确实存在，已请求关闭它；整栏展开状态与其它标签不受影响。"
+            if exists
+            else f"目标签不在用户当前标签里（现有 {len(keys)} 个：{keys}）；"
+            "请先 ui.current 核对 key。若要收起整栏请用 ui.hide。"
+        ),
+    }
 
 
 def _apply_artifacts_panel(
@@ -429,6 +1487,7 @@ def _apply_artifacts_panel(
     layout: str | None,
     thread_id: str,
     session_key: str,
+    expand: bool = False,
 ) -> dict[str, Any]:
     from evoflow.artifacts.chat_artifact import artifact_state_key, normalize_chat_artifacts
 
@@ -483,6 +1542,13 @@ def _apply_artifacts_panel(
         "data": data_out,
         "layout": layout or "workspace-write",
     }
+    # 【self-evolution-bot · 2026-11-21 · 第106轮 · 模型:deepseek-v4.1-flash-1017】
+    # 改了什么：artifacts 的 surface 也带 ``expand``（与主分支 / 进度分支同口径）。
+    # 为什么：本函数是 apply_right_panel 的三个独立 return 分支之一；前两处都已在
+    #   ``if expand: surface["expand"] = True``，唯独这里没接 —— 右栏收起时
+    #   ``ui.show(kind="artifacts", expand=True)`` 收不到「用户要看」的信号。
+    if expand:
+        surface["expand"] = True
     if act == "update":
         _emit_surface("update", surface)
     else:
@@ -507,6 +1573,13 @@ def _apply_artifacts_panel(
         "count": len(panel_items),
         "items": panel_items,
         "surface": surface,
+        # 【self-evolution-bot · 2026-11-21 · 第106轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：artifacts 回执也带 ``userScreen``（此前三个分支里只有它没有）。
+        # 为什么：模型开产物面板时同样需要知道「用户原本在看哪一页 / 会不会抢视线 /
+        #   此刻看不看得见」；缺这一块时它只能凭 ok:true 猜，正是本轮 44 秒那件事的成因。
+        "userScreen": _describe_user_screen_before_after(
+            act=act, kind="artifacts", surface=surface, expand=expand, owner_session_key=sk
+        ),
     }
     if state_keys:
         out["artifact_state_keys"] = state_keys

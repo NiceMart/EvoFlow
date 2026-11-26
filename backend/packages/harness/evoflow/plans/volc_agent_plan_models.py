@@ -24,6 +24,7 @@ PREFERRED_PRIMARY_IDS = (
     "ark-code-latest",
     "doubao-seed-2.1-lite",
     "deepseek-v4.1-flash",
+    "glm-5.4",
     "glm-5.3",
     "deepseek-v4-flash",
 )
@@ -32,8 +33,8 @@ _TIER_RANK = {"small": 0, "medium": 1, "large": 2, "max": 3}
 _DATED_ID = re.compile(r"-\d{6}$")
 _SKIP_SUBSTR = ("embedding", "seedream", "seedance", "tts", "asr", "voice")
 
-# Official 套餐概览 chat IDs（对齐 https://www.volcengine.com/docs/82379/2366394 ，2026-11-08）
-# 2026-11-05 起官方列表已移除 minimax-m3、kimi-k2.7-code。
+# Official 套餐概览 chat IDs（对齐 https://www.volcengine.com/docs/82379/2366394 ，2026-11-24）
+# 2026-11-05 起官方列表已移除 minimax-m3、kimi-k2.7-code；2026-11-23 新增 glm-5.4。
 AGENT_PLAN_CHAT_MODELS: list[dict[str, Any]] = [
     {
         # Official Auto / latest alias for Agent & Coding Plan clients (not the literal id "auto").
@@ -109,6 +110,17 @@ AGENT_PLAN_CHAT_MODELS: list[dict[str, Any]] = [
         "min_tier": "small",
     },
     {
+        "id": "glm-5.4",
+        "label": "GLM 5.4",
+        "context_window": 1024000,
+        "max_output": 128000,
+        "vision": False,
+        "reasoning": True,
+        "min_tier": "small",
+        "preferred_primary": True,
+        "notes": "2026-11-23 上线；面向长程 Agent / 多文件开发；限时折扣覆盖",
+    },
+    {
         "id": "glm-5.3",
         "label": "GLM 5.3",
         "context_window": 1024000,
@@ -147,7 +159,7 @@ AGENT_PLAN_CHAT_MODELS: list[dict[str, Any]] = [
         "reasoning": True,
         "min_tier": "medium",
         "thinking_always_on": True,
-        "notes": "默认开启思考，不支持关闭；Small 档不可用",
+        "notes": "即将下线；默认开启思考，不支持关闭；Small 档不可用",
     },
     {
         "id": "kimi-k3.1-pro",
@@ -235,17 +247,21 @@ AGENT_PLAN_CAPABILITIES: list[dict[str, Any]] = [
     {
         "id": "image",
         "label": "生图",
-        "summary": "Seedream 5.0 系列，走 /api/plan/v3 媒体口。",
+        "summary": "Seedream 5.0 / 5.5 系列，走 /api/plan/v3 媒体口。",
         "min_tier": "small",
         "items": [
             {"id": "doubao-seedream-5-0-pro", "label": "Seedream 5.0 Pro", "min_tier": "small"},
             {"id": "doubao-seedream-5.0-flash", "label": "Seedream 5.0 Flash", "min_tier": "small"},
+            {"id": "doubao-seedream-5.5", "label": "Seedream 5.5", "min_tier": "small"},
         ],
     },
     {
         "id": "video",
         "label": "生视频",
-        "summary": ("官方套餐概览：Small / Medium 不含视频生成（轻量化体验）。doubao-seedance-2.0 / 2.0-fast / 2.0-mini / 2.5 需 Large 或 Max。"),
+        "summary": (
+            "官方套餐概览：Small / Medium 不含视频生成（轻量化体验）。"
+            "doubao-seedance-2.0 / 2.0-fast / 2.0-mini / 2.5 / 2.5-flash 需 Large 或 Max。"
+        ),
         "excluded_hint": {
             "small": "官方 Small 档不含视频生成。请升级 Large / Max 使用 Seedance 2.x。",
             "medium": "官方 Medium 档不含视频生成。请升级 Large / Max 使用 Seedance 2.x。",
@@ -255,6 +271,11 @@ AGENT_PLAN_CAPABILITIES: list[dict[str, Any]] = [
             {
                 "id": "doubao-seedance-2.5",
                 "label": "Seedance 2.5",
+                "min_tier": "large",
+            },
+            {
+                "id": "doubao-seedance-2.5-flash",
+                "label": "Seedance 2.5 Flash",
                 "min_tier": "large",
             },
             {

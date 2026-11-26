@@ -55,8 +55,26 @@ def register(subparsers: argparse._SubParsersAction) -> None:
 
     un = sub.add_parser("uninstall", help="Uninstall an organization instance")
     un.add_argument("org_instance_id")
-    un.add_argument("--keep-primitives", action="store_true", help="Keep agents/skills")
-    un.add_argument("--delete-workspace", action="store_true", help="Also delete workspace dir")
+    un.add_argument(
+        "--keep-primitives",
+        action="store_true",
+        help="Keep agents/skills/MCP (default: delete)",
+    )
+    un.add_argument(
+        "--keep-workspace",
+        action="store_true",
+        help="Keep org-packs / workspace disk tree (default: delete)",
+    )
+    un.add_argument(
+        "--keep-knowledge",
+        action="store_true",
+        help="Keep knowledge bases (default: delete)",
+    )
+    un.add_argument(
+        "--delete-workspace",
+        action="store_true",
+        help="Deprecated alias: force delete workspace (now the default)",
+    )
     add_output_flags(un)
     un.set_defaults(handler=_uninstall)
 
@@ -70,6 +88,36 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     exp.add_argument("--zip", action="store_true", help="Also write a zip next to the directory")
     add_output_flags(exp)
     exp.set_defaults(handler=_export)
+
+    drift = sub.add_parser(
+        "drift",
+        help="Compare pack directory vs live runtime (SOUL/agents/extensions/org instance)",
+    )
+    drift.add_argument("path", help="Pack directory (with evoflow.organization.json)")
+    add_output_flags(drift)
+    drift.set_defaults(handler=_drift)
+
+    sync = sub.add_parser(
+        "sync",
+        help="Reinstall pack into runtime with replace (pack is source of truth)",
+    )
+    sync.add_argument("path", help="Pack directory")
+    sync.add_argument(
+        "--conflict",
+        choices=("fail", "skip", "replace"),
+        default="replace",
+        help="Conflict policy (default replace)",
+    )
+    add_output_flags(sync)
+    sync.set_defaults(handler=_sync)
+
+    pub = sub.add_parser(
+        "publish-local",
+        help="Publish an existing pack directory/zip to the local resource-market host",
+    )
+    pub.add_argument("path", help="Pack directory or .zip")
+    add_output_flags(pub)
+    pub.set_defaults(handler=_publish_local)
 
     mkt = sub.add_parser("market", help="Market helpers")
     mkt_sub = mkt.add_subparsers(dest="org_market_cmd", required=True)
@@ -130,11 +178,16 @@ def _get(args: argparse.Namespace):
 
 def _uninstall(args: argparse.Namespace):
     try:
+        keep_ws = bool(getattr(args, "keep_workspace", False))
+        # Legacy --delete-workspace means "do not keep" (default already deletes).
+        if bool(getattr(args, "delete_workspace", False)):
+            keep_ws = False
         return uninstall_organization(
             args.org_instance_id,
             options={
                 "keep_primitives": bool(getattr(args, "keep_primitives", False)),
-                "keep_workspace": not bool(getattr(args, "delete_workspace", False)),
+                "keep_workspace": keep_ws,
+                "keep_knowledge": bool(getattr(args, "keep_knowledge", False)),
             },
         )
     except OrganizationInstallError as e:
@@ -160,21 +213,45 @@ def _export(args: argparse.Namespace):
         return {"ok": False, "error": str(e)}
 
 
+def _drift(args: argparse.Namespace):
+    from evoflow.organizations.drift import audit_pack_drift
+    from evoflow.organizations.manifest import PackManifestError
+
+    try:
+        return audit_pack_drift(str(args.path))
+    except PackManifestError as e:
+        return {"ok": False, "error": str(e)}
+
+
+def _sync(args: argparse.Namespace):
+    from evoflow.organizations.drift import sync_pack_to_runtime
+    from evoflow.organizations.manifest import PackManifestError
+
+    try:
+        return sync_pack_to_runtime(
+            str(args.path),
+            conflict=str(getattr(args, "conflict", "replace") or "replace"),
+        )
+    except (PackManifestError, OrganizationInstallError) as e:
+        return {"ok": False, "error": str(e)}
+
+
+def _publish_local(args: argparse.Namespace):
+    from evoflow.organizations.market_host import publish_pack
+
+    try:
+        return publish_pack(source_path=str(args.path))
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+
+
 def _market_catalog(args: argparse.Namespace):
-    import json
-    import urllib.request
+    from evoflow.organizations.market_sources import fetch_merged_catalog
 
-    from evoflow.organizations.fetch import market_catalog_url
-
-    url = market_catalog_url()
-    if not url:
-        return {"configured": False, "packs": [], "schema": 1}
-    with urllib.request.urlopen(url, timeout=15) as resp:  # noqa: S310
-        data = json.loads(resp.read().decode("utf-8", errors="replace"))
-    if isinstance(data, dict):
-        data["configured"] = True
-        data["source"] = url
-    return data
+    try:
+        return fetch_merged_catalog(force=True)
+    except Exception as e:
+        return {"ok": False, "error": str(e), "packs": []}
 
 
 def _market_install(args: argparse.Namespace):

@@ -136,6 +136,10 @@ const TRIGGER_WHO_ZH: Record<string, string> = {
   stale_turn_watchdog: '回合超时看门狗强制收尾',
   send_prep_abort_stale_stream: '新发送前清理旧 SSE wire（非用户点停）',
   refresh_backend_done: '刷新发现后端已结束，前端清 busy（非用户点停）',
+  client_attach: '网关冷 attach：后端批量停止 panel run（非用户点停）',
+  client_restart: '客户端换实例 attach：后端批量停止 panel run（非用户点停）',
+  client_attach_skip: '网关冷 attach：默认未批量停止 panel run',
+  client_restart_skip: '客户端换实例 attach：默认未批量停止 panel run',
 }
 
 function normalizeId(raw: string | null | undefined): string {
@@ -538,6 +542,12 @@ export function logStreamStop(input: StreamStopLogInput): StreamStopKind {
           : trigger === 'sse_aborted_after_ui_stop'
             ? 'ui_stop'
             : 'sse_aborted'
+    const errMsg =
+      typeof detail?.errMsg === 'string' && detail.errMsg.trim()
+        ? detail.errMsg.trim().slice(0, 200)
+        : typeof detail?.rawErr === 'string' && detail.rawErr.trim()
+          ? detail.rawErr.trim().slice(0, 200)
+          : undefined
     logChatTurnStreamEnd({
       sessionKey: sessionKey || undefined,
       runId: runId || undefined,
@@ -548,6 +558,7 @@ export function logStreamStop(input: StreamStopLogInput): StreamStopKind {
       detail: {
         kind,
         ...(sinceStop != null ? { sinceStopMs: sinceStop } : {}),
+        ...(errMsg ? { errMsg } : {}),
       },
     })
   }

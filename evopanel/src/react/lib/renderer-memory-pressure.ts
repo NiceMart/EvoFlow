@@ -10,9 +10,13 @@
 
 export type RendererMemoryLevel = 'normal' | 'high' | 'critical'
 
-/** 约 512MB used → high；约 768MB → critical（WebView2 常见在 1–1.5GB 被杀）。 */
-const HIGH_HEAP_MB = 512
-const CRITICAL_HEAP_MB = 768
+/**
+ * 必须远早于 WebView2 杀进程阈值动手。
+ * 实测 2026-11-17：critical@768 时 heap 已 2.3–3.1GB 仍「每次只挤 2 条」，最终 Out of Memory。
+ * high@384 / critical@512：给收缩留出几十秒窗口，而不是等到 sad tab。
+ */
+const HIGH_HEAP_MB = 384
+const CRITICAL_HEAP_MB = 512
 
 type HeapSnap = { usedJSHeapSize: number; totalJSHeapSize?: number }
 
@@ -41,28 +45,65 @@ export function resolveRendererMemoryLevel(heapMb?: number | null): RendererMemo
   return 'normal'
 }
 
-/** 投影 rows.window 软顶：高压时更狠，保住多轮「还能聊」而不是整页 OOM。 */
-export function projectionSoftCapForMemoryLevel(level: RendererMemoryLevel): number {
-  if (level === 'critical') return 80
-  if (level === 'high') return 140
-  // 正常水位 400（2026-11-15 从 220 回撤）：220 会在长回合直播中把前面轮次裁出
-  // 窗口（「历史记录看不到了」实锤）。行内重载荷已在服务端截断，400 行 ≈ 数 MB。
-  return 400
+/**
+ * 投影 rows.window「软顶」行数。
+ *
+ * 2026-11-22 对齐 ZCode：store 持全窗，**不再按内存水位裁行**（现场 90↔339 滚动条抽风
+ * 的根因是 soft-cap + releaseBalloon）。内存安全改靠旧工具卡 lighten + pin/keep-warm 驱逐。
+ * 返回值仅作理论上限，日常会话到不了。
+ */
+export function projectionSoftCapForMemoryLevel(_level: RendererMemoryLevel): number {
+  return 100_000
 }
 
-/** 后台 pin 会话数上限。 */
+/** 后台 pin 会话数上限。normal 收紧到 4；high=2；critical=1。 */
 export function pinMaxForMemoryLevel(level: RendererMemoryLevel): number {
   if (level === 'critical') return 1
   if (level === 'high') return 2
-  return 4
+  return 6
+}
+
+/** 内存巡检间隔：危急时 2s 一轮，别等 15s 才挤一次。 */
+export function memoryWatchIntervalMs(level: RendererMemoryLevel): number {
+  if (level === 'critical') return 2_000
+  if (level === 'high') return 5_000
+  return 15_000
+}
+
+/** 旧工具卡保留完整载荷的尾窗行数。 */
+export function heavyHorizonForMemoryLevel(level: RendererMemoryLevel): number {
+  if (level === 'critical') return 20
+  if (level === 'high') return 36
+  return 60
 }
 
 let lastLoggedLevel: RendererMemoryLevel | null = null
 let lastLoggedAt = 0
+/** 上一次采样的 heap MB，供 critical 渐进驱逐判断「是否仍在涨」。 */
+let lastHeapMbSample: number | null = null
+
+/**
+ * critical 水位是否还应继续挤 keep-warm：
+ * - 读不到 heap → 保守继续挤
+ * - heap 比上次采样仍升（或持平偏高）→ 继续
+ * - heap 已回落 → 停手，避免无意义全灭导致切回冷开
+ */
+export function shouldContinueCriticalEviction(heapMb?: number | null): boolean {
+  const mb = heapMb == null ? readRendererHeapMb() : heapMb
+  if (mb == null || !Number.isFinite(mb)) return true
+  const prev = lastHeapMbSample
+  lastHeapMbSample = mb
+  if (prev == null) return true
+  // 允许 8MB 抖动；明显回落则停。
+  return mb >= prev - 8
+}
 
 /** 水位变化或每 30s 打一行，落 frontend 日志便于对账 OOM。 */
 export function noteRendererMemoryPressure(detail?: Record<string, unknown>): RendererMemoryLevel {
   const heapMb = readRendererHeapMb()
+  if (heapMb != null && Number.isFinite(heapMb)) {
+    lastHeapMbSample = heapMb
+  }
   const level = resolveRendererMemoryLevel(heapMb)
   const now = Date.now()
   const changed = level !== lastLoggedLevel
@@ -77,8 +118,9 @@ export function noteRendererMemoryPressure(detail?: Record<string, unknown>): Re
     ...(detail || {}),
   }
   const line = `[mem-pressure] level=${level} heapMb=${payload.heapMb ?? '?'}`
-  if (level === 'critical') console.error(line, payload)
-  else if (level === 'high') console.warn(line, payload)
+  // critical is expected under long chats (we shrink keep-warm); don't flood
+  // frontend-*.log as ERROR — reserve error for real JS / stream failures.
+  if (level === 'critical' || level === 'high') console.warn(line, payload)
   else console.info(line, payload)
   try {
     if (typeof window === 'undefined') return level
@@ -90,7 +132,7 @@ export function noteRendererMemoryPressure(detail?: Record<string, unknown>): Re
     void import('@tauri-apps/api/core')
       .then((m) =>
         m.invoke('append_frontend_log', {
-          level: level === 'critical' ? 'error' : level === 'high' ? 'warn' : 'info',
+          level: level === 'normal' ? 'info' : 'warn',
           message: `${line} ${JSON.stringify(payload)}`.slice(0, 11_500),
         }),
       )

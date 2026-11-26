@@ -44,6 +44,7 @@ import type {
 import type { ConversationTransport } from "@zcode/ui/v4/transport.js";
 import { evoflowFetch, evoflowFetchStream } from "../../lib/ws-client.js";
 import { logStreamCompareV4Recv } from "../lib/stream-compare-file-log.js";
+import { pushViewportStreamV4Tap } from "./v4-viewport-stream-tap.js";
 import { logV4Life } from "../lib/v4-lifecycle-log.js";
 import { markOpenStage } from "@zcode/ui/lib/openTrace.js";
 import { parseV4WireSseBlocks } from "./v4-wire-sse-parse.js";
@@ -164,6 +165,38 @@ export class EvoFlowV4Transport implements ConversationTransport {
 
   constructor() {
     this.connectionId = `evoflow-${Math.random().toString(36).slice(2, 10)}-${Date.now().toString(36)}`;
+  }
+
+  /** 页面级 frames SSE 当前是否在读流（诊断浮层用；非「本轮 AG-UI 在推字」）。 */
+  isFramesSseConnected(): boolean {
+    return this.sseLoopStarted && !!this.sseReader && !this.disposed;
+  }
+
+  /**
+   * 根因对账用：本页 transport 订阅健康度。
+   * `subscriptionId` 有值时额外回报该 sub 是否已 activate / 暂存帧数。
+   */
+  getPathDiag(subscriptionId?: string | null): {
+    connectionId: string;
+    framesUp: boolean;
+    activeCount: number;
+    closedCount: number;
+    subActive: boolean | null;
+    stagedCount: number | null;
+    subClosed: boolean | null;
+  } {
+    const sid = String(subscriptionId || "").trim();
+    return {
+      connectionId: this.connectionId,
+      framesUp: this.isFramesSseConnected(),
+      activeCount: this.activeSubscriptions.size,
+      closedCount: this.closedSubscriptions.size,
+      subActive: sid ? this.activeSubscriptions.has(sid) : null,
+      stagedCount: sid
+        ? (this.stagedBySubscription.get(sid)?.length ?? 0)
+        : null,
+      subClosed: sid ? this.closedSubscriptions.has(sid) : null,
+    };
   }
 
   private noteSseAssembleProgress(restBytes: number): void {
@@ -348,6 +381,7 @@ export class EvoFlowV4Transport implements ConversationTransport {
   async rowsRange(
     params: V4ConversationRowsRangeParams,
   ): Promise<V4ConversationRowsRangeResult> {
+    // postJson → evoflowFetch 已打点；这里保持 gateway HTTP 路径。
     return await postJson<V4ConversationRowsRangeResult>("/api/v4/conversation/rows_range", {
       sessionId: params.sessionId,
       beforeRowId: params.beforeRowId ?? null,
@@ -637,7 +671,7 @@ export class EvoFlowV4Transport implements ConversationTransport {
         deliveryKind,
         { via: "early_stage", stagedIndex: staged.length, wireBytes },
       );
-      this.logCompareFrame(candidate.topic, candidate.frame, deliveryKind);
+      this.logCompareFrame(candidate.topic, candidate.frame, deliveryKind, wireBytes);
       staged.push({ frame: candidate.frame, deliveryKind });
       return;
     }
@@ -648,7 +682,7 @@ export class EvoFlowV4Transport implements ConversationTransport {
       deliveryKind,
       { via: "live", wireBytes },
     );
-    this.logCompareFrame(candidate.topic, candidate.frame, deliveryKind);
+    this.logCompareFrame(candidate.topic, candidate.frame, deliveryKind, wireBytes);
     this.dispatchFrame(candidate.frame, deliveryKind);
   }
 
@@ -748,11 +782,22 @@ export class EvoFlowV4Transport implements ConversationTransport {
     topic: string,
     frame: ConversationTopicFrame,
     deliveryKind: TopicFrameDeliveryKind,
+    wireBytes?: number,
   ): void {
     try {
       logStreamCompareV4Recv({ topic, deliveryKind, frame });
     } catch {
       /* best-effort：对比日志失败不得影响投影 */
+    }
+    try {
+      pushViewportStreamV4Tap({
+        topic,
+        deliveryKind,
+        frame,
+        wireBytes,
+      });
+    } catch {
+      /* overlay tap only */
     }
   }
 }

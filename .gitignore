@@ -100,6 +100,7 @@ backend/scripts/_e2e_out/
 
 # Local git hooks (keep only on this machine, do not push)
 .githooks/
+hooks/
 
 # pnpm
 .pnpm-store
@@ -346,6 +347,10 @@ backend/packaging/official-plugins-bundle.zip
 # kb-mcp node_modules is ignored via backend/packaging/kb-mcp/.gitignore (removed)
 # Legacy Playwright bundle (no longer used by gateway builds)
 backend/packaging/windows/.playwright-browsers/
+# Offline BGE weights: keep safetensors+tokenizer in git for CI (no HF download).
+# Ignore the duplicate pytorch bin (~95MB) — safetensors is enough for ST.
+backend/packaging/windows/local-embed-models/**/pytorch_model.bin
+backend/packaging/windows/local-embed-models/**/.gitattributes
 
 # Local stream/E2E acceptance machine output (JSON + generated reports)
 backend/scripts/_e2e_output/
@@ -624,3 +629,12 @@ skills/public/platform-runtime/node_modules/
 # deck-render（expert-video）依赖清单：npm ci 重建依据，必须入库（覆盖全局 package*.json 忽略）
 !skills/public/expert-video/tools/deck-render/package.json
 !skills/public/expert-video/tools/deck-render/package-lock.json
+
+# 本地 Agent 日记 / craft 草稿（不进公开仓、不出现在待提交）
+/memory/
+/craft/
+/backend/memory/
+/assets/employees/**/memory/journal/
+
+# Local voice TTS fix scratch logs (never ship)
+.tmp_voice_tts_fix/

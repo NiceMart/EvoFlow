@@ -42,6 +42,13 @@ export type OpenCollabSubtaskStageOpts = {
   sessionKey?: string | null
   /** 默认 wide：与子代理 transcript 同口径 */
   layout?: 'half' | 'wide' | 'narrow' | 'workspace-write'
+  /**
+   * 是否抢焦点并展开右栏。默认 true（本函数是「打开」）。
+   * 后台推送/只写签不抢焦点时显式传 `false`。
+   * store.show 的 `shouldActivate = forceExpand || !pinAlive`：用户已钉在
+   * 工作流签上时，若不 forceExpand，节点进度签只建不切——表现为「开了 tab 但看不见」。
+   */
+  forceExpand?: boolean
 }
 
 export function collabSubtaskStageTabId(subtaskId: string, sessionKey?: string | null): string {
@@ -67,6 +74,7 @@ export function openCollabSubtaskInRightStage(
     title,
     layout: opts?.layout || 'wide',
     sessionKey: sk,
+    forceExpand: opts?.forceExpand !== false,
     data: {
       subtaskId: sid,
       mainTaskId: String(payload.mainTaskId || '').trim(),

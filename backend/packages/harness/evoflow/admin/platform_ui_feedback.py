@@ -210,7 +210,7 @@ def _build_title(action: str, domain: str, verb: str, label: str, args: dict[str
         "employees.messages": f"员工「{name}」近况消息",
         "employees.bind_channel_begin": f"已为「{name}」生成绑定二维码",
         "employees.bind_channel_apply": f"已绑定本岗 AI 员工「{name}」",
-        "agents.create": f"已创建智能体「{name}」",
+        "agents.create": f"已创建智能体员工「{name}」",
         "agents.update": f"已更新智能体「{name}」配置",
         "agents.delete": f"已删除智能体「{name}」",
         "knowledge.create": f"已创建知识库「{name}」",
@@ -330,10 +330,34 @@ def _build_subtitle(domain: str, action: str, result: dict[str, Any]) -> str:
     hint = _first_str(result.get("hint"))
     if hint and len(hint) <= 120:
         return hint
-    if action.startswith("items."):
-        return "已记入任务中心 · 我的事项"
-    if action.startswith("tasks."):
-        return "已记入任务中心 · 协作任务"
+    if action.startswith("items.") or action.startswith("tasks."):
+        # 【self-evolution-bot · 2026-11-19 · 第60轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：按动作名判「有没有真的写入」，不再按域前缀无条件说「已记入」。
+        # 为什么：原来 `action.startswith("tasks.")` / `("items.")` 一律返回
+        # 「已记入任务中心」，于是一次 `tasks.list`（total 291，纯读取）、
+        # `tasks.get`、`tasks.execution_trail`、`items.list`、`items.get` 都在面板上
+        # 显示「已记入任务中心 · 协作任务」——**没发生任何写操作却说记入了**。
+        # 现网实测（第60轮逐个真调）这 5 个只读动作全中招。这是假的状态变更提示，
+        # 用户会以为刚建了单。改为：只有真正落库的动作才说「已记入」。
+        leaf = action.split(".", 1)[-1]
+        wrote = leaf in {
+            "create",
+            "update",
+            "progress",
+            "set_state",
+            "dispatch",
+            "delete",
+            "cleanup_noise",
+            "reclaim_zombies",
+        }
+        entity_zh = "协作任务" if action.startswith("tasks.") else "我的事项"
+        if wrote:
+            return f"已记入任务中心 · {entity_zh}"
+        total = result.get("total")
+        count = result.get("count")
+        if total is not None:
+            return f"{entity_zh}共 {total} 条" + (f"，本页 {count} 条" if count is not None else "")
+        return f"可在任务中心查看 · {entity_zh}"
     if action == "employees.bind_channel_begin":
         ch = _first_str(result.get("channel")).lower()
         label = {"feishu": "飞书", "wecom": "企微"}.get(ch, "IM")
@@ -343,8 +367,6 @@ def _build_subtitle(domain: str, action: str, result: dict[str, Any]) -> str:
     if action == "employees.bind_channel_apply":
         return "本岗 AI 员工已绑定渠道"
     if action in {"employees.create", "employees.hire", "agents.create"}:
-        if action == "agents.create":
-            return "可在智能体页查看绑定"
         return "可对话、派发或扫码绑定渠道"
     if action.startswith("employees."):
         return "可在智能体员工页查看"
@@ -554,6 +576,7 @@ def _employee_process_cta(
     task_id: str,
     agent_code: str,
     round_id: str = "",
+    round_stamp: str = "",
     role_name: str = "",
     session_key: str = "",
     label: str = "查看进度",
@@ -565,6 +588,13 @@ def _employee_process_cta(
     data: dict[str, Any] = {"taskId": tid, "agentCode": code, "busy": True}
     if round_id:
         data["roundId"] = round_id
+    # 【self-evolution-bot · 2026-11-20 · 第95轮 · 模型:deepseek-v4.1-flash-1017】
+    # 改了什么：把「本次派发时刻」单独下发给右栏（roundStamp），与 roundId 并存。
+    # 为什么：roundId 在派单路径恒为空（见上层注释），前端「换轮不继承旧手挑会话」
+    # 的判据需要一个**每轮必变**的值；roundStamp 只服务这个判据，不参与会话键拼接。
+    stamp = str(round_stamp or "").strip()
+    if stamp:
+        data["roundStamp"] = stamp
     sk = _employee_owned_session_key(session_key, code)
     if sk:
         data["sessionKey"] = sk
@@ -637,6 +667,19 @@ def _progress_open_stage_action(
         task.get("source_ref"),
         args.get("round_id"),
     )
+    # 【self-evolution-bot · 2026-11-20 · 第95轮 · 模型:deepseek-v4.1-flash-1017】
+    # 改了什么：新增独立的 `round_stamp`（= 本次派发时刻），不改 round_id 语义。
+    # 为什么：`employees.dispatch` 的 in-process 分支回的是**调用方传入的** round_id
+    # （`round_id_s or None`），真实轮次 preview_round 在后台任务里生成、不回传；
+    # Platform 工具调 dispatch 时又不带 round_id ⇒ 前端拿到的 roundId 恒为空，
+    # 「换轮不继承旧会话」的判据永远不触发（死代码），症状就是派了新任务、右栏
+    # 仍死盯用户上次手挑的历史对话。round_id 不能挪用：前端拿它去匹配 `:duty:`
+    # 会话键，塞时间戳会污染匹配。故单开一个只为「这一轮有没有变」服务的字段。
+    round_stamp = _first_str(
+        result.get("dispatched_at"),
+        result.get("dispatchedAt"),
+        task.get("last_dispatch_at"),
+    )
     role_name = _first_str(
         result.get("role_name"),
         result.get("roleName"),
@@ -657,13 +700,17 @@ def _progress_open_stage_action(
     }:
         if not assigned:
             return None
-        # wake/dispatch/resume/chat_send：立刻 autoOpen；create/hire 仅在已带 task 时同样
-        auto = action in {
-            "employees.wake",
-            "employees.dispatch",
-            "employees.resume",
-            "employees.chat_send",
-        } or bool(tid)
+        # 【self-evolution-bot · 2026-11-20 · 第88轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：把写死的 4 个动作名换成真源 should_auto_open(action)；
+        # create/hire 仍保留「已带 tid 才挂进度」的约束。
+        # 为什么：原来这里自己写了一份白名单，与 stage/right_panel_kinds.py 的
+        # AUTO_OPEN_ACTIONS 并存；本函数后面 employees 详情分支又把 employees.get /
+        # employees.brief（READ_ONLY_ACTIONS 成员）auto_open=True，同一文件两套判据打架。
+        from evoflow.stage.right_panel_kinds import should_auto_open
+
+        auto = should_auto_open(action)
+        if action in {"employees.create", "employees.hire"} and not tid:
+            auto = False
         if not auto:
             return None
         # result 优先；args.session_key 常是主聊注入，_employee_process_cta 会再过滤
@@ -672,6 +719,7 @@ def _progress_open_stage_action(
             task_id=tid if tid and not str(tid).startswith("live:") else _first_str(result.get("task_id"), args.get("task_id")),
             agent_code=assigned,
             round_id=round_id,
+            round_stamp=round_stamp,
             role_name=role_name,
             session_key=sk,
             label="打开对话" if action == "employees.chat_send" else "查看进度",
@@ -685,18 +733,29 @@ def _progress_open_stage_action(
                 task_id=tid,
                 agent_code=assigned,
                 round_id=round_id,
+                round_stamp=round_stamp,
                 role_name=role_name,
                 auto_open=True,
             )
         return None
 
     if domain == "tasks" and tid:
+        # 【self-evolution-bot · 2026-11-20 · 第88轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：这里原来对「任何带 tid 的 tasks.* 动作」都返回 autoOpen=True 的进度 CTA
+        # ——包括 tasks.get / tasks.execution_trail 这类纯只读查询。
+        # 为什么：用户点「看看这个任务怎么样了」不该被撑开一整块工作流图；只有真在办事
+        # （派发/建/改状态）才自动展开，其余仍出 CTA 但由用户点开。判据只问真源。
+        from evoflow.stage.right_panel_kinds import should_auto_open as _sao
+
+        if not _sao(action):
+            return None
         # 岗位/值班派发 → 员工过程；其余协作任务 → 工作流图（与 workflow.run 一样立刻 autoOpen）
         if source == "role" and assigned:
             return _employee_process_cta(
                 task_id=tid,
                 agent_code=assigned,
                 round_id=round_id,
+                round_stamp=round_stamp,
                 role_name=role_name,
                 auto_open=True,
             )
@@ -727,9 +786,14 @@ def _progress_open_stage_action(
                 _as_dict(result.get("run")).get("run_id"),
                 _as_dict(result.get("run")).get("id"),
             )
+            # 【self-evolution-bot · 2026-11-20 · 第88轮 · 模型:deepseek-v4.1-flash-1017】
+            # 改了什么：autoOpen 由写死的 True 改为真源 should_auto_open(action)。
+            # 为什么：这个 if 列表里含 workflow.run_status（read，属 READ_ONLY_ACTIONS），
+            # 写死 True 等于「只查一下运行状态」也强行撑开右栏 —— 正是用户说的
+            # 「莫名其妙打开」。run/resume/recover 在白名单里，autoOk 仍为真，行为不变。
             out: dict[str, Any] = {
                 "label": "打开工作流",
-                "autoOpen": True,
+                "autoOpen": _read_action_auto_open(action),
                 "openStage": {"kind": "collab-workflow", "data": {"mainTaskId": tid}},
             }
             # 右栏挂载失败时回落深链（勿用 /apps 列表）
@@ -829,7 +893,8 @@ def _build_actions(
                 mount_id="items.board",
                 title="待办",
                 route="/tasks?tab=items",
-                auto_open=not has_progress_stage,
+                # 纯列表查询：只出可点通知卡，不自动展开（第87轮）
+                auto_open=_read_action_auto_open(action),
             )
         )
     elif domain == "items" and entity_id:
@@ -842,13 +907,13 @@ def _build_actions(
                 title=entity_label or "待办",
                 focus_id=entity_id,
                 route=f"/tasks?tab=items&focus={entity_id}",
-                auto_open=(not has_progress_stage)
-                and action
-                in {
-                    "items.create",
-                    "items.update",
-                    "items.get",
-                },
+                # 【self-evolution-bot · 2026-11-20 · 第87轮 · 模型:deepseek-v4.1-flash-1017】
+                # 改了什么：删掉死条件 `and action in {"items.create","items.update"}`，
+                # 原注释「只有 create/update 才允许自动展开」与真源矛盾。
+                # 为什么：should_auto_open 对 items.* 四个动作全返 False（AUTO_OPEN_ACTIONS
+                # 里根本没有 items.create/update），那段 and 永远不成立＝死代码；
+                # 留着只会让下一个读代码的人以为待办创建会自动弹栏。
+                auto_open=(not has_progress_stage) and _read_action_auto_open(action),
             )
         )
     elif domain == "employees" and action in {
@@ -864,7 +929,8 @@ def _build_actions(
                 path="/proactive",
                 mount_id="employees.board",
                 title="员工",
-                auto_open=not has_progress_stage,
+                # 全是只读查询：不自动展开（第87轮）
+                auto_open=_read_action_auto_open(action),
             )
         )
     elif domain == "tasks" and action in {"tasks.list"}:
@@ -874,17 +940,16 @@ def _build_actions(
                 path="/tasks",
                 mount_id="tasks.board",
                 title="任务",
-                auto_open=not has_progress_stage,
+                # 纯列表查询：不自动展开（第87轮）
+                auto_open=_read_action_auto_open(action),
             )
         )
     elif domain == "tasks" and entity_id:
-        # 无进度 CTA 时写成功可自动挂任务详情；有进度则只挂可点 shell-page
-        auto = (not has_progress_stage) and action in {
-            "tasks.create",
-            "tasks.update",
-            "tasks.set_state",
-            "tasks.get",
-        }
+        # 【self-evolution-bot · 2026-11-20 · 第88轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：删掉写死的 {"tasks.create","tasks.update","tasks.set_state","tasks.get"}。
+        # 为什么：tasks.get 是 READ_ONLY_ACTIONS 成员（只读），写在这等于自己绕过统一判据；
+        # 用户「只查一下任务」也被强行撑开右栏。现在只问真源 should_auto_open。
+        auto = (not has_progress_stage) and _read_action_auto_open(action)
         actions.append(
             _shell_page_cta(
                 label="查看任务",
@@ -895,14 +960,13 @@ def _build_actions(
             )
         )
     elif domain == "employees" and entity_id:
-        # create / hire / update / get / brief：无执行进度时自动挂员工详情
-        auto = (not has_progress_stage) and action in {
-            "employees.create",
-            "employees.hire",
-            "employees.update",
-            "employees.get",
-            "employees.brief",
-        }
+        # 【self-evolution-bot · 2026-11-20 · 第88轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：删掉写死的 {"employees.create","employees.hire","employees.update",
+        # "employees.get","employees.brief"}，改问真源 should_auto_open(action)。
+        # 为什么：employees.get / employees.brief 都在 READ_ONLY_ACTIONS 里，写死的集合
+        # 让「看一眼谁在干嘛」也自动撑开右栏 —— 用户说的「莫名其妙打开」就有这两条。
+        # 只有 create/hire/update 之类真改状态的动作才该抢视线。
+        auto = (not has_progress_stage) and _read_action_auto_open(action)
         actions.append(
             _shell_page_cta(
                 label="查看员工",
@@ -981,6 +1045,15 @@ def _build_actions(
 
 
 # 只读但应自动打开壳页面（右栏 shell-page）的 action：详情 / 列表 / 近况 / 名册
+#
+# 【self-evolution-bot · 2026-11-20 · 第87轮 · 模型:deepseek-v4.1-flash-1017】
+# 改了什么：只读动作不再自动展开右栏——下面这张表仍保留为「可出通知卡（可点开）」
+# 的白名单，但 auto_open 一律置 False。
+# 为什么：用户 2026-11-20 明确要求「有通知就够了，右侧不要突然展开」。原来
+# employees.list / tasks.list / items.list 这类纯查询一被调用就把右栏顶开，
+# 这是「莫名其妙打开东西」的头号来源。自动展开只保留给真在办事的动作
+# （employees.wake/dispatch/resume/chat_send/create/hire、items.dispatch、
+# workflow.run/resume/recover），判据统一走 stage.right_panel_kinds.should_auto_open。
 _SHELL_PAGE_READ_ACTIONS = frozenset({
     "employees.get",
     "employees.brief",
@@ -994,6 +1067,13 @@ _SHELL_PAGE_READ_ACTIONS = frozenset({
     "items.get",
     "items.list",
 })
+
+
+def _read_action_auto_open(action: str) -> bool:
+    """只读动作的 autoOpen 取值：恒为 False（统一闸门，勿在调用点各写一遍）。"""
+    from evoflow.stage.right_panel_kinds import should_auto_open
+
+    return should_auto_open(action)
 
 # 只读但要出反馈卡细节（不开壳页）的 action
 _STATUS_CARD_READ_ACTIONS = frozenset({

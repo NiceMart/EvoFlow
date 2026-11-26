@@ -5,39 +5,76 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>EvoFlow Computer Use</title>
   <!--
-    Self-contained (ZCode windowsCuaOperationIndicatorContent).
-    Opaque host window: solid page bg so WebView2 always paints (transparent often blanks).
+    Computer Use 顶部圆形胶囊 HUD。
+    透明宿主窗：只露出圆形胶囊 + 蓝光，不要白色长方形底框。
+    胶囊面：步骤标题 + 「第 N 步」+ 已操作秒数 + 「解除控制」。
   -->
   <style>
-    :root { color-scheme: light dark; }
+    :root { color-scheme: light dark; --glow: #3b82f6; }
     * { box-sizing: border-box; }
     html, body {
       width: 100%; height: 100%; margin: 0; overflow: hidden;
-      background: #f3f4f6 !important; pointer-events: none; user-select: none;
+      background: transparent !important; pointer-events: none; user-select: none;
     }
     body {
       display: flex; align-items: center; justify-content: center;
-      padding: 6px 8px 12px;
+      padding: 6px 8px;
       font-family: "Segoe UI Variable", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
     }
     .indicator {
-      display: flex; align-items: center; justify-content: center; gap: 10px;
-      width: 100%; height: 38px; padding: 0 18px;
-      color: #202124; background: #ffffff;
-      border: 1px solid rgba(15, 23, 42, 0.14); border-radius: 12px;
-      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08), 0 6px 12px -6px rgba(15, 23, 42, 0.18);
+      display: flex; align-items: center; justify-content: flex-start; gap: 8px;
+      height: 40px; max-width: 100%;
+      padding: 0 6px 0 14px;
+      color: #1e3a8a;
+      background: rgba(239, 246, 255, 0.96);
+      border: 0;
+      border-radius: 999px;
+      box-shadow:
+        0 0 14px 2px rgba(59, 130, 246, 0.55),
+        0 6px 12px -6px rgba(15, 23, 42, 0.18);
       font-size: 13px; font-weight: 600; line-height: 1; white-space: nowrap;
       opacity: 1; transform: translateY(0);
       transition: opacity 120ms ease, transform 120ms ease;
-      animation: enter 140ms ease-out both;
+      animation: halo 2.2s ease-in-out infinite;
     }
-    .dots { display: flex; align-items: center; gap: 3px; }
+    html[data-state="active"].flash .indicator { animation: enter 140ms ease-out both, halo 2.2s ease-in-out infinite; }
+    .label { display: flex; align-items: baseline; gap: 8px; min-width: 0; flex: 1 1 auto; }
+    .step {
+      font-weight: 600; color: #1e3a8a;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      max-width: 180px; flex: 0 1 auto;
+    }
+    .step:empty { display: none; }
+    .count {
+      font-weight: 700; font-size: 12px; color: #1d4ed8;
+      background: rgba(59, 130, 246, 0.12);
+      border-radius: 999px; padding: 3px 8px;
+      flex: 0 0 auto; white-space: nowrap;
+    }
+    .count:empty { display: none; }
+    .elapsed {
+      font-weight: 600; font-size: 12px; color: #1d4ed8; opacity: .95;
+      font-variant-numeric: tabular-nums;
+      flex: 0 0 auto; white-space: nowrap;
+    }
+    .elapsed:empty { display: none; }
+    .dots { display: flex; align-items: center; gap: 3px; flex: 0 0 auto; }
     .dot {
-      width: 4px; height: 4px; border-radius: 50%; background: #64748b;
+      width: 4px; height: 4px; border-radius: 50%; background: #3b82f6;
       animation: pulse 1.2s ease-in-out infinite;
     }
     .dot:nth-child(2) { animation-delay: 120ms; }
     .dot:nth-child(3) { animation-delay: 240ms; }
+    .stop {
+      flex: 0 0 auto; margin-left: 2px; pointer-events: auto; cursor: pointer;
+      font: inherit; font-size: 11px; font-weight: 600;
+      color: #b91c1c; background: rgba(185, 28, 28, 0.08);
+      border: 1px solid rgba(185, 28, 28, 0.28); border-radius: 999px;
+      padding: 5px 10px; line-height: 1; white-space: nowrap;
+    }
+    .stop:hover { background: rgba(185, 28, 28, 0.16); }
+    .stop:active { transform: translateY(1px); }
+    .stop[data-busy="1"] { opacity: .55; cursor: default; }
     html[data-state="leaving"] .indicator { opacity: 0; transform: translateY(-6px); }
     @keyframes enter {
       from { opacity: 0; transform: translateY(-6px); }
@@ -47,14 +84,18 @@
       0%, 70%, 100% { opacity: .35; transform: scale(.8); }
       35% { opacity: 1; transform: scale(1); }
     }
+    @keyframes halo {
+      0%, 100% { box-shadow: 0 0 10px 1px rgba(59,130,246,.42), 0 6px 12px -6px rgba(15,23,42,.18); }
+      50% { box-shadow: 0 0 20px 4px rgba(59,130,246,.72), 0 6px 12px -6px rgba(15,23,42,.18); }
+    }
     @media (prefers-color-scheme: dark) {
-      html, body { background: #1f2329 !important; }
       .indicator {
-        color: #f8fafc; background: #2b3038;
-        border-color: rgba(255, 255, 255, 0.14);
-        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.18), 0 6px 12px -6px rgba(0, 0, 0, 0.28);
+        color: #dbeafe; background: rgba(30, 41, 59, 0.96);
       }
-      .dot { background: #a8b3c4; }
+      .step, .count, .elapsed { color: #93c5fd; }
+      .count { background: rgba(96, 165, 250, 0.16); }
+      .dot { background: #93c5fd; }
+      .stop { color: #fca5a5; background: rgba(248, 113, 113, 0.12); border-color: rgba(248, 113, 113, 0.32); }
     }
     @media (prefers-reduced-motion: reduce) {
       .indicator, .dot { animation: none; transition: opacity 1ms linear; transform: none; }
@@ -65,18 +106,126 @@
 <body>
   <div class="indicator" role="status" aria-live="polite">
     <span class="dots" aria-hidden="true"><span class="dot"></span><span class="dot"></span><span class="dot"></span></span>
-    <span id="cua-glow-label">EvoFlow 正在操作电脑</span>
+    <span class="label">
+      <span id="cua-glow-step" class="step"></span>
+      <span id="cua-glow-count" class="count"></span>
+      <span id="cua-glow-elapsed" class="elapsed"></span>
+    </span>
+    <button id="cua-glow-stop" class="stop" type="button" title="Esc">解除控制</button>
   </div>
   <script>
     (function () {
       var isZh = typeof navigator !== 'undefined' && /^zh\b/i.test(String(navigator.language || (navigator.languages && navigator.languages[0]) || ''))
-      var label = document.getElementById('cua-glow-label')
-      if (label) label.textContent = isZh ? 'EvoFlow 正在操作电脑' : 'EvoFlow is controlling your computer'
+      var stepEl = document.getElementById('cua-glow-step')
+      var countEl = document.getElementById('cua-glow-count')
+      var elapsedEl = document.getElementById('cua-glow-elapsed')
+      var stopBtn = document.getElementById('cua-glow-stop')
+      if (stopBtn) stopBtn.textContent = isZh ? '解除 · Esc' : 'Stop · Esc'
       document.documentElement.lang = isZh ? 'zh-CN' : 'en'
       document.documentElement.dataset.state = 'active'
+
+      /*
+        秒表双通道：
+        ① 页面 setInterval(250ms) 本地外推 —— WebView2 未聚焦时 1s interval 常被掐死；
+        ② 主面板 500ms 轮询也会推 elapsed_ms —— 即使 interval 冻住，显示仍会跟手。
+        防回跳：已在跑时若新 base 比本地落后 >1.5s，丢掉这次 base。
+      */
+      var elapsedBaseMs = 0
+      var elapsedAnchor = 0
+      var elapsedRunning = false
+      var elapsedTimer = null
+
+      function formatElapsed(ms) {
+        var total = Math.max(0, Math.floor(ms / 1000))
+        var h = Math.floor(total / 3600)
+        var m = Math.floor((total % 3600) / 60)
+        var s = total % 60
+        var pad = function (n) { return n < 10 ? '0' + n : String(n) }
+        if (h > 0) return h + ':' + pad(m) + ':' + pad(s)
+        if (m > 0) return m + ':' + pad(s)
+        return s + 's'
+      }
+
+      function currentElapsedMs() {
+        var ms = elapsedBaseMs
+        if (elapsedRunning && elapsedAnchor) ms += Date.now() - elapsedAnchor
+        return ms
+      }
+
+      function renderElapsed() {
+        if (!elapsedEl) return
+        var ms = currentElapsedMs()
+        elapsedEl.textContent = (ms > 0 || elapsedRunning) ? formatElapsed(ms) : ''
+      }
+
+      function setElapsed(ms, running) {
+        var base = Number(ms) || 0
+        if (base < 0) base = 0
+        var wantRun = running === true
+        if (wantRun && elapsedRunning) {
+          // 同轮防回跳：已在跑时服务端偶发 stale/0，不能把秒数打回去。
+          // 跨轮归零靠熄灭路径（setLeaving / running=false）先停表，再起时信服务端。
+          var local = currentElapsedMs()
+          if (base + 1500 < local) base = Math.floor(local)
+        }
+        // 停表后再起（wantRun && !elapsedRunning）：一律信服务端基数，通常是 0。
+        elapsedBaseMs = base
+        elapsedRunning = wantRun
+        elapsedAnchor = elapsedRunning ? Date.now() : 0
+        renderElapsed()
+        // 250ms：未聚焦 WebView2 常把 1s timer 节流到几乎不动；更密的 tick + 轮询双保险。
+        if (elapsedRunning && !elapsedTimer) {
+          elapsedTimer = setInterval(renderElapsed, 250)
+        } else if (!elapsedRunning && elapsedTimer) {
+          clearInterval(elapsedTimer)
+          elapsedTimer = null
+        }
+      }
+
+      function formatCount(n) {
+        if (!(n >= 1)) return ''
+        return isZh ? ('第 ' + n + ' 步') : ('step ' + n)
+      }
+
       window.__cuaGlowOverlay = {
-        setActive: function () { document.documentElement.dataset.state = 'active' },
-        setLeaving: function () { document.documentElement.dataset.state = 'leaving' },
+        setActive: function () {
+          document.documentElement.dataset.state = 'active'
+          document.documentElement.classList.add('flash')
+          setTimeout(function () {
+            document.documentElement.classList.remove('flash')
+          }, 260)
+        },
+        setLeaving: function () {
+          document.documentElement.dataset.state = 'leaving'
+          // 熄灭时清掉页面秒表，避免窗口复用时下一轮接着上一轮的秒数。
+          setElapsed(0, false)
+          if (stepEl) stepEl.textContent = ''
+          if (countEl) countEl.textContent = ''
+        },
+        setStep: function (text, doneCount, elapsedMs, running) {
+          if (stepEl) stepEl.textContent = String(text || '')
+          if (countEl) {
+            var n = Number(doneCount) || 0
+            countEl.textContent = formatCount(n)
+          }
+          setElapsed(elapsedMs, running)
+        },
+        onStop: null,
+      }
+
+      if (stopBtn) {
+        stopBtn.addEventListener('click', function () {
+          if (stopBtn.dataset.busy === '1') return
+          stopBtn.dataset.busy = '1'
+          stopBtn.textContent = isZh ? '已解除' : 'Stopped'
+          stopBtn.title = ''
+          try {
+            if (typeof window.__cuaGlowOverlay.onStop === 'function') {
+              window.__cuaGlowOverlay.onStop()
+            }
+          } catch (e) {}
+          document.documentElement.dataset.state = 'leaving'
+        })
       }
     })()
   </script>

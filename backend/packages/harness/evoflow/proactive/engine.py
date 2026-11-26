@@ -11,6 +11,7 @@ Phase 2 adds two modes:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -223,7 +224,7 @@ class ProactiveEngine:
         result = await bridge.execute(initiative)
 
         # Bridge may have already marked FAILED; never overwrite that with COMPLETED.
-        current = ProactiveRepository.get_initiative(initiative.id)
+        current = await asyncio.to_thread(ProactiveRepository.get_initiative, initiative.id)
         if current and current.status == InitiativeStatus.FAILED:
             return result
 
@@ -232,7 +233,8 @@ class ProactiveEngine:
             return result
 
         failed = _is_execution_failure(result)
-        ProactiveRepository.update_initiative_status(
+        await asyncio.to_thread(
+            ProactiveRepository.update_initiative_status,
             initiative.id,
             InitiativeStatus.FAILED if failed else InitiativeStatus.COMPLETED,
             execution_result=result,
@@ -264,7 +266,8 @@ class ProactiveEngine:
             memory = ProactiveMemoryRepository.get(role.agent_code)
 
         # 1. Board Tasks (SSOT) + initiative side notes
-        recent_initiatives = ProactiveRepository.list_initiatives(
+        recent_initiatives = await asyncio.to_thread(
+            ProactiveRepository.list_initiatives,
             role_agent_code=role.agent_code,
             limit=20,
         )
@@ -357,14 +360,12 @@ class ProactiveEngine:
         )
 
         # 5. Collect any legacy/round journals for this round (usually empty on Task-only path)
-        round_inits = [
-            i
-            for i in ProactiveRepository.list_initiatives(
-                role_agent_code=role.agent_code,
-                limit=40,
-            )
-            if str(i.round_id or "") == round_id
-        ]
+        _all_round_inits = await asyncio.to_thread(
+            ProactiveRepository.list_initiatives,
+            role_agent_code=role.agent_code,
+            limit=40,
+        )
+        round_inits = [i for i in _all_round_inits if str(i.round_id or "") == round_id]
 
         if run_error:
             # Leave round_inits as-is (usually empty). No synth wrap_up journal.
@@ -498,7 +499,8 @@ class ProactiveEngine:
                             db=db,
                         )
 
-                run_db_transaction(_batch_persist)
+                # 写事务 offload：竞争期 loop 上 0.5s 快败会静默丢值班记忆/cost log。
+                await asyncio.to_thread(run_db_transaction, _batch_persist)
         except Exception:
             logger.debug(
                 "proactive.think.agent_loop: batch persist (memory+cost) failed role=%s",
@@ -519,88 +521,8 @@ class ProactiveEngine:
                 except Exception:
                     logger.debug("proactive: fallback cost log failed", exc_info=True)
 
-        # Per-individual memory switch: role off → no wrap-up reflection writes.
-        wrap_up_on = True
-        try:
-            from evoflow.agents.memory.runtime_overrides import role_memory_enabled_from_config
-
-            wrap_up_on = role_memory_enabled_from_config(getattr(role, "config", None))
-        except Exception:
-            wrap_up_on = True
-
-        # Person Kernel: LLM wrap-up from Task evidence (reference-adapted prompts)
-        try:
-            from evoflow.person_wrap_up_reflect import (
-                collect_duty_wrap_up_statements,
-                run_person_wrap_up_llm_async,
-            )
-            from evoflow.proactive.work_items import list_role_tasks_for_round
-
-            round_tasks = list_role_tasks_for_round(role, round_id)
-            tool_msg_count = 0
-            try:
-                from evoflow.persistence.chat_message_repositories import (
-                    list_messages_for_display_all,
-                )
-
-                msgs = list_messages_for_display_all(
-                    session_key,
-                    max_rows=80,
-                    round_id=round_id,
-                )
-                rows = (msgs or {}).get("messages") or []
-                if isinstance(rows, list):
-                    for m in rows:
-                        if not isinstance(m, dict):
-                            continue
-                        role_name = str(m.get("role") or m.get("type") or "").lower()
-                        if role_name == "tool" or m.get("tool_calls"):
-                            tool_msg_count += 1
-            except Exception:
-                tool_msg_count = 0
-
-            evidence = collect_duty_wrap_up_statements(
-                tasks=round_tasks,
-                round_initiatives=round_inits,
-                environment_context=environment_context,
-                run_error=run_error,
-                tool_msg_count=tool_msg_count,
-            )
-            if evidence and not wrap_up_on:
-                logger.info(
-                    "proactive.think.agent_loop: person wrap_up skipped role=%s (memory off)",
-                    role.agent_code,
-                )
-            elif evidence:
-                model_name = str(getattr(role.config, "model_name", None) or "").strip() or None
-                pk = await run_person_wrap_up_llm_async(
-                    role.agent_code,
-                    statements=list(evidence.get("statements") or []),
-                    round_id=round_id,
-                    role_name=str(role.role_name or ""),
-                    environment_context=str(evidence.get("environment_context") or environment_context or ""),
-                    run_error=evidence.get("run_error") or run_error,
-                    model_name=model_name,
-                    source="duty_llm",
-                )
-                if pk.get("ok") and not pk.get("skipped"):
-                    logger.info(
-                        "proactive.think.agent_loop: person llm wrap_up role=%s round=%s",
-                        role.agent_code,
-                        round_id,
-                    )
-                elif pk.get("error"):
-                    logger.warning(
-                        "proactive.think.agent_loop: person llm wrap_up failed role=%s err=%s",
-                        role.agent_code,
-                        pk.get("error"),
-                    )
-        except Exception:
-            logger.debug(
-                "proactive.think.agent_loop: person wrap_up skipped role=%s",
-                role.agent_code,
-                exc_info=True,
-            )
+        # 收工复盘不再由系统强制跑第二轮 LLM 写 Person Kernel / 资产中心。
+        # 员工若要沉淀经验/反思，值班过程中自己调 assets 工具即可。
 
         if not round_inits and not pending_tasks:
             logger.info(
@@ -695,7 +617,9 @@ class ProactiveEngine:
             except Exception:
                 task_title = ""
         # Bind thread → duty/task conversation session (workspace multi-session)
-        prepare_proactive_chat_session(
+        # load_session_map 全表扫+写事务，offload（loop 直调在写持锁时冻 0.5s）。
+        await asyncio.to_thread(
+            prepare_proactive_chat_session,
             agent_code=role.agent_code,
             role_name=role.role_name,
             thread_id=thread_id,
@@ -901,7 +825,8 @@ class ProactiveEngine:
                 )
                 return format_run_error_detail(err_code, detail), None
         finally:
-            finalize_proactive_chat_session(
+            await asyncio.to_thread(
+                finalize_proactive_chat_session,
                 session_key=session_key,
                 thread_id=thread_id,
                 reason=finalize_reason,
@@ -1040,7 +965,8 @@ class ProactiveEngine:
             memory = ProactiveMemoryRepository.get(role.agent_code)
 
         # Build work log + board Tasks for context (even in prompt-only mode)
-        recent_initiatives = ProactiveRepository.list_initiatives(
+        recent_initiatives = await asyncio.to_thread(
+            ProactiveRepository.list_initiatives,
             role_agent_code=role.agent_code,
             limit=20,
         )

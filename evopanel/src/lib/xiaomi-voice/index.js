@@ -7,6 +7,7 @@ export {
   getXiaomiTtsSpeaker,
   resolveXiaomiTtsSpeaker,
   setXiaomiTtsSpeaker,
+  preferDashscopeWhenVolcMissing,
   XIAOMI_DEFAULT_TTS_SPEAKER,
 } from './config.js'
 
@@ -55,6 +56,7 @@ export {
   stashXiaomiFrameAssistantPending,
   resetXiaomiFrameAssistantFeed,
   interruptXiaomiFrame,
+  clearXiaomiVoiceCommittedTurns,
 } from './pipeline-client.js'
 
 export {

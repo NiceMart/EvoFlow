@@ -80,11 +80,13 @@
   --ui-font-size: 14px;
 }
 
-/* EvoFlow V4 面板字号：小于 ZCode 默认（14px），对齐侧栏文字密度。
+/* EvoFlow V4 面板字号：对齐 ZCode 默认（14px）。曾压到 12px 追侧栏密度，
+ * 2026-11-21 用户实测「正文视觉差点意思」——助手正文是主阅读内容，
+ * 12px 是辅助 UI 规格；恢复 14px 后 text-ui-* 刻度整体上移、层级不变。
  * 调整大小只改 --ui-font-size；下方 --text-ui-* 必须在本作用域重声明，
  * 否则会继承 :root 里已解析的 14px（@theme 的 var() 在 :root 算完再继承）。 */
 .zcode-bridge-root {
-  --ui-font-size: 12px;
+  --ui-font-size: 14px;
   --text-ui-xl: calc(var(--ui-font-size) + 4px);
   --text-ui-lg: calc(var(--ui-font-size) + 2px);
   --text-ui-base: var(--ui-font-size);
@@ -95,19 +97,46 @@
 }
 
 /*
- * V4 ConversationTurnNavigator 源码用 Tailwind 容器查询：
- *   invisible … @min-[864px]/conversation:visible …
- * 但 evopanel 构建未产出这套 utility，主对话左侧快捷进度条会永远 invisible。
- * 小V 窄栏走 hideTurnNavigator（不挂载）；主对话在此强制露出。
+ * V4 KeepAlive 多 host：隐藏层必须「看不见但保留几何」。
+ * - display:none → virtualizer ResizeObserver 行高变 0，再显示时全部 turn 叠在顶部。
+ * - 父级 visibility:hidden 可被子节点 visibility:visible 穿透（见下方 navigator 规则）
+ *   → 多会话绝对叠层同时画出「密密麻麻」。
+ * 因此对 host 及后代强制 hidden，可见 host 抬 z-index。
  */
-.zcode-bridge-root:not([data-v4-embedded="true"]) [data-v4-turn-navigator="true"] {
+[data-v4-chat-host][data-v4-chat-host-visible="0"] {
+  visibility: hidden !important;
+  pointer-events: none !important;
+  z-index: 0 !important;
+}
+[data-v4-chat-host][data-v4-chat-host-visible="0"] * {
+  visibility: hidden !important;
+}
+[data-v4-chat-host][data-v4-chat-host-visible="1"] {
+  z-index: 1;
+}
+
+/*
+ * V4 ConversationTurnNavigator：源码曾用 @min-[864px]/conversation 显隐，
+ * 但 evopanel 构建未产出该 utility。主对话左侧快捷进度条由 JS 在目录补齐后挂载，
+ * 此处再对可见 host 强制可见（兜底旧 invisible 类名）。小V 窄栏走 hideTurnNavigator。
+ * 注意：仅对「可见 host」内的 navigator 生效，避免穿透 KeepAlive 隐藏层。
+ */
+.zcode-bridge-root:not([data-v4-embedded="true"])
+  [data-v4-chat-host-visible="1"]
+  [data-v4-turn-navigator="true"],
+.zcode-bridge-root:not([data-v4-embedded="true"]):not(:has([data-v4-chat-host]))
+  [data-v4-turn-navigator="true"] {
   visibility: visible;
   opacity: 1;
   transform: translateX(0);
 }
 
-/* 嵌入态若未 hide、仍挂了 navigator，同样露出（兜底）。 */
-.zcode-bridge-root[data-v4-embedded="true"] [data-v4-turn-navigator="true"] {
+/* 嵌入态若未 hide、仍挂了 navigator，同样露出（兜底；仅可见 host）。 */
+.zcode-bridge-root[data-v4-embedded="true"]
+  [data-v4-chat-host-visible="1"]
+  [data-v4-turn-navigator="true"],
+.zcode-bridge-root[data-v4-embedded="true"]:not(:has([data-v4-chat-host]))
+  [data-v4-turn-navigator="true"] {
   visibility: visible;
   opacity: 1;
   transform: translateX(0);

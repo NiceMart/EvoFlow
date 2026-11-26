@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
 from collections import Counter
 from typing import Any
@@ -12,6 +11,7 @@ from typing import Any
 import httpx
 
 from evoflow.admin.errors import ConflictError, NotFoundError, ValidationError
+from evoflow.organizations.manifest import strip_unexpanded_placeholders
 from evoflow.proactive.models import (
     Initiative,
     InitiativeRiskLevel,
@@ -135,6 +135,8 @@ _HIRE_KEYS = frozenset(
         "max_turns",
         "timeout_seconds",
         "skills",
+        "tools",
+        "mcp_servers",
         "work_schedule_enabled",
         "work_start_hour",
         "work_end_hour",
@@ -430,7 +432,7 @@ def _role_detail(role: ProactiveRole) -> dict[str, Any]:
         "tags": agent_tags,
         "config": {
             "responsibilities": list(cfg.responsibilities or []),
-            "workspace_path": cfg.workspace_path or "",
+            "workspace_path": strip_unexpanded_placeholders(cfg.workspace_path or ""),
             "knowledge_vault_ids": list(getattr(cfg, "knowledge_vault_ids", None) or []),
             "kb_injection": dict(getattr(cfg, "kb_injection", None) or {}),
             "kpis": list(cfg.kpis or []),
@@ -447,6 +449,7 @@ def _role_detail(role: ProactiveRole) -> dict[str, Any]:
             "max_turns": cfg.max_turns,
             "timeout_seconds": cfg.timeout_seconds,
             "tools": agent_tools,
+            "mcp_servers": list(getattr(cfg, "mcp_servers", None) or []),
             "skills": skills,
             "work_schedule_enabled": cfg.work_schedule_enabled,
             "work_start_hour": cfg.work_start_hour,
@@ -738,6 +741,8 @@ def create_employee(data: dict[str, Any]) -> dict[str, Any]:
             if key in data:
                 agent_payload[key] = data.get(key)
         # Employee path: forbid tools:null unless confirm_inherit_all=true.
+        # Skip create_agent's auto-hire — we hire below with full role payload.
+        agent_payload["as_employee"] = False
         agent_row = create_agent(agent_payload, forbid_inherit_all=True)
         created_agent = True
         agent_code = str(agent_row.get("agent_code") or agent_code).strip()
@@ -953,8 +958,14 @@ def _hire_existing_agent(
     ).strip()
     from evoflow.proactive.prompt import validate_agent_knowledge_ids
 
+    # knowledge_vault_ids: omit → inherit Agent bindings; explicit [] clears.
     try:
-        vault_ids = validate_agent_knowledge_ids(list(data.get("knowledge_vault_ids") or []))
+        if "knowledge_vault_ids" in data:
+            vault_ids = validate_agent_knowledge_ids(list(data.get("knowledge_vault_ids") or []))
+        else:
+            vault_ids = validate_agent_knowledge_ids(
+                list(agent_row.get("knowledge_vault_ids") or [])
+            )
     except ValueError as e:
         raise ValidationError(str(e)) from e
 
@@ -978,6 +989,39 @@ def _hire_existing_agent(
     # Inherit from Agent unless hire payload explicitly set capability fields.
     inherit = not (explicit_skills or bool(str(data.get("soul_md") or "").strip()))
 
+    # Duties also live on agent system_prompt (## 岗位职责). Merge into Agent,
+    # but keep the list on role.config so org-pack declarations survive in config_json.
+    legacy_resp = _coerce_responsibilities(data.get("responsibilities"))
+    if legacy_resp:
+        try:
+            from evoflow.admin import agents as agents_admin
+            from evoflow.proactive.employee_prompting.job import replace_duty_in_system_prompt
+
+            existing_sp = str(agent_row.get("system_prompt") or "").strip()
+            merged_sp = replace_duty_in_system_prompt(existing_sp, legacy_resp)
+            if merged_sp != existing_sp:
+                agents_admin.update_agent(agent_code, {"system_prompt": merged_sp or None})
+                agent_row = {**agent_row, "system_prompt": merged_sp}
+        except Exception:
+            logger.debug(
+                "hire: merge responsibilities into system_prompt skipped code=%s",
+                agent_code,
+                exc_info=True,
+            )
+
+    # Capability allowlists: prefer hire payload, else inherit Agent.
+    hire_mcp = data.get("mcp_servers") if "mcp_servers" in data else None
+    if hire_mcp is None:
+        hire_mcp = list(agent_row.get("mcp_servers") or [])
+    else:
+        hire_mcp = [str(x).strip() for x in (hire_mcp or []) if str(x).strip()]
+
+    hire_tools = data.get("tools") if "tools" in data else None
+    if hire_tools is None:
+        hire_tools = list(agent_tools) if agent_tools is not None else None
+    elif hire_tools is not None:
+        hire_tools = [str(x).strip() for x in (hire_tools or []) if str(x).strip()]
+
     # 0 = no wall-clock cap (engine treats falsy as unlimited). Never use ``or 300``:
     # that forced a 5min kill and also turned an explicit 0 into 300.
     _raw_timeout = data.get("timeout_seconds")
@@ -986,9 +1030,10 @@ def _hire_existing_agent(
     )
 
     config = ProactiveRoleConfig(
-        responsibilities=_coerce_responsibilities(data.get("responsibilities")),
+        responsibilities=list(legacy_resp),
         workspace_path=_validate_workspace_path(data.get("workspace_path")),
         knowledge_vault_ids=vault_ids,
+        mcp_servers=list(hire_mcp or []),
         kpis=list(data.get("kpis") or []),
         autonomy_level=_parse_autonomy(data.get("autonomy_level")),
         max_initiatives_per_cycle=int(data.get("max_initiatives_per_cycle") or 3),
@@ -1020,7 +1065,7 @@ def _hire_existing_agent(
         extra_context={
             "agent_description": str(agent_row.get("description") or ""),
             "agent_tags": list(agent_row.get("tags") or []),
-            "agent_tools": agent_tools,
+            "agent_tools": hire_tools if hire_tools is not None else agent_tools,
             **({"override_capabilities": True} if not inherit else {}),
         },
     )
@@ -1076,6 +1121,29 @@ def _hire_existing_agent(
                     DepartmentRepository.set_members(str(dept["id"]), codes)
         except Exception:
             logger.debug("create_employee: dept sync skipped", exc_info=True)
+
+    # Mirror capability + turn limit onto Agent (runtime MCP/tools + agents.max_turns).
+    agent_patch: dict[str, Any] = {}
+    if "mcp_servers" in data:
+        agent_patch["mcp_servers"] = list(hire_mcp or [])
+    if "tools" in data and hire_tools is not None:
+        agent_patch["tools"] = list(hire_tools)
+    if data.get("max_turns") is not None:
+        try:
+            agent_patch["max_turns"] = int(data.get("max_turns"))
+        except (TypeError, ValueError):
+            pass
+    if agent_patch:
+        try:
+            from evoflow.admin import agents as agents_admin
+
+            agents_admin.update_agent(agent_code, agent_patch)
+        except Exception:
+            logger.debug(
+                "hire: mirror mcp/tools/max_turns to agent skipped code=%s",
+                agent_code,
+                exc_info=True,
+            )
 
     # Mirror kb_injection into agent's extra_json (per-employee toggle).
     if data.get("kb_injection") is not None or config.kb_injection:
@@ -1211,8 +1279,9 @@ def update_role(agent_code: str, data: dict[str, Any]) -> dict[str, Any]:
                 agents_admin.update_agent(code, {"system_prompt": merged or None})
         except Exception:
             logger.debug("employees.update: system_prompt merge skipped code=%s", code, exc_info=True)
-        # Always clear role responsibilities after handling (duties live on agent).
-        cfg.responsibilities = []
+        # Keep duties on role.config as well (org-pack / UI round-trip).
+        if incoming_resp is not None:
+            cfg.responsibilities = list(incoming_resp)
     if data.get("workspace_path") is not None:
         cfg.workspace_path = _validate_workspace_path(data.get("workspace_path"))
     if data.get("knowledge_vault_ids") is not None:
@@ -1611,7 +1680,7 @@ def _role_summary(role: ProactiveRole, *, busy_codes: set[str]) -> dict[str, Any
         "busy": code in busy_codes,
         "last_heartbeat_at": role.last_heartbeat_at,
         "next_heartbeat_at": role.next_heartbeat_at,
-        "workspace_path": role.config.workspace_path or "",
+        "workspace_path": strip_unexpanded_placeholders(role.config.workspace_path or ""),
         "org_key": role_org_key(role),
         "responsibilities": list(role.config.responsibilities or [])[:8],
         "kpis": list(role.config.kpis or [])[:6],
@@ -2223,6 +2292,9 @@ def dispatch(
     resume_round: bool = False,
     fresh_round: bool = False,
     skip_done_guard: bool = False,
+    # 【self-evolution-bot · 2026-11-17 · 第28轮】透传「投回哪一屏对话」。
+    # 空 = 原行为（task/duty 自动分桶），对现有调用方零影响。
+    session_key: str = "",
 ) -> dict[str, Any]:
     """Fire-and-forget dispatch via Gateway HTTP (requires running Gateway)."""
     code = str(agent_code or "").strip()
@@ -2277,6 +2349,10 @@ def dispatch(
         payload["fresh_round"] = True
     if skip_done_guard:
         payload["skip_done_guard"] = True
+    # 【self-evolution-bot · 2026-11-17 · 第28轮】钉回指定真人会话键（空则不发该字段）
+    sk_s = str(session_key or "").strip()
+    if sk_s:
+        payload["session_key"] = sk_s
 
     # Prefer in-process ProactiveRunner when we are already inside Gateway's
     # event loop. Sync httpx → same-process /dispatch deadlocks the loop
@@ -2307,6 +2383,8 @@ def dispatch(
                     resume_round=bool(resume_round),
                     fresh_round=bool(fresh_round),
                     skip_done_guard=skip_done_guard,
+                    # 【第28轮】in-process 分支也要带上，否则 Gateway 内调用会丢会话键
+                    pinned_session_key=sk_s,
                 )
 
             fut = loop.create_task(_inproc())
@@ -2376,6 +2454,16 @@ def wake(
     resume_round: bool = False,
     fresh_round: bool = False,
     skip_done_guard: bool = False,
+    # 【self-evolution-bot · 2026-11-17 · 第28轮】把本轮唤醒投回调用方指定的那一屏对话。
+    #   为什么：原来 wake 只能在 task/duty 两个桶里落会话，用户「续不上我这个对话」
+    #   就是这个。空值 = 原行为，对现有 wake 调用方零影响。
+    session_key: str = "",
+    # 【self-evolution-bot · 2026-11-20 · 第100轮 · 模型:deepseek-v4.1-flash-1017】
+    # 改了什么：新增 pin_is_fresh —— 调用方声明「这个键是我**当下刚算出来**的」，跳过 retarget 协商。
+    # 为什么（现网取证 20:07）：chat_send 按最新会话算出 sk 交给 wake，wake 又拿它跟
+    #   latest_human_session_key 比；新 mint 的 chat 会话里还没有真人消息 → pinned_ms=0 →
+    #   gap 判据不成立 → 被 retarget 回**旧屏**，刚算出来的键白算。默认 False = 原有协商语义不变。
+    pin_is_fresh: bool = False,
 ) -> dict[str, Any]:
     """Wake a teammate (``@``) — resolve by agent_code or role_name, then dispatch.
 
@@ -2520,6 +2608,35 @@ def wake(
     # Do not stuff woken_by=/task_id= into description — those pollute board「要做什么」.
     # Human notes (if any) pass through; wake metadata lives in goal / result fields.
 
+    # 【self-evolution-bot · 2026-11-20 · 第97轮 · 模型:deepseek-v4.1-flash-1017】
+    # 改了什么：投递前用「谁最近真的说过话」校正钉住的会话键，再往下传。
+    # 为什么（现网取证）：2026-11-20 17:45:11 自验证脚本把 sessionKey 写进 state.json
+    # （当时最新屏 …16-15-39.290Z，最后真人发言 17:43:29）；17:45:27 用户在**另一屏**
+    # （…16-17-14-53.207Z）发话；17:47:08 看门狗照旧键 wake，消息投进了旧屏。
+    # 用户盯着的那一屏到 17:56 才等到下一条消息 —— 表现就是「重启完卡在那里叫不醒」。
+    # 判据：会话键只能在**投递时**按真人发言时间重算，注册时快照一定会过期。
+    wake_session_key, wake_session_reason = session_key, "unpinned"
+    if pin_is_fresh and str(session_key or "").strip():
+        # 调用方刚算出来的键，直接采信，不再协商（否则新 mint 的屏必被换回旧屏）
+        wake_session_key, wake_session_reason = str(session_key).strip(), "fresh"
+    else:
+        try:
+            from evoflow.proactive.chat_session import prefer_newest_human_session
+
+            wake_session_key, wake_session_reason = prefer_newest_human_session(
+                target_role.agent_code,
+                session_key,
+            )
+            if wake_session_reason == "retargeted":
+                logger.info(
+                    "employees.wake: retarget session (user moved to newer screen) agent=%s pinned=%s -> %s",
+                    target_role.agent_code,
+                    str(session_key or ""),
+                    wake_session_key,
+                )
+        except Exception:
+            logger.debug("employees.wake: session retarget failed (keep caller pin)", exc_info=True)
+
     result = dispatch(
         target_role.agent_code,
         goal_s,
@@ -2532,9 +2649,13 @@ def wake(
         resume_round=bool(resume_round),
         fresh_round=bool(fresh_round),
         skip_done_guard=skip_done_guard,
+        # 【self-evolution-bot · 2026-11-17 · 第28轮】把「回哪一屏」透传到底
+        # 【self-evolution-bot · 2026-11-20 · 第97轮】改为传校正后的键（未过期的那一屏）
+        session_key=wake_session_key,
     )
     if isinstance(result, dict):
         result.setdefault("woken", True)
+        result.setdefault("session_retarget", wake_session_reason)
         result.setdefault("target_role_name", target_role.role_name)
         if from_role:
             result.setdefault("from_agent_code", from_role.agent_code)
@@ -2574,6 +2695,7 @@ def chat_send(
     session_key: str = "",
     task_id: str = "",
     source: str = "xiaomi",
+    deliver: str = "auto",
 ) -> dict[str, Any]:
     """Send a free-chat turn and **server-side wake** the employee.
 
@@ -2586,6 +2708,19 @@ def chat_send(
     message as goal so a real duty round starts. ``queued`` is true only when
     wake accepted (not skipped). Prefer ``dispatch`` / ``wake`` for explicit
     work items; use chat_send for short follow-ups.
+
+    【self-evolution-bot · 2026-11-21 · 第108/109轮 · 模型:deepseek-v4.1-flash-1017】
+    ``deliver`` 决定这一句话由谁真正发出去：
+    - ``"auto"``（默认）：**面板在就跑面板，面板不在才后台 wake**。
+      桌面开着 → 经 CDP 直接驱动右栏面板 ``handleSend`` → ``ChatApp.chatSend``
+      → live SSE 逐字流，和用户手打完全同一条通路；面板没开 / 手机 / 主聊 →
+      回落后台 ``wake``，保证仍有来有回（那段没有流式，是物理事实）。
+    - ``"panel"``：强制面板通路，面板驱不到也不 wake（要严格保证单一 owner 时用）。
+    - ``"wake"``：强制后台轮次，永不动面板（批量派活 / 不需要人看屏幕时用）。
+    为什么（用户 2026-11-21 点破）：「我在右侧面板手打能看到实时结果，你后台触发
+    页面上啥也看不到。」第100轮为修「同一句话发两遍」把前端改成「服务端 wake 成功
+    就不本地发」，结果面板里永远没有流式；第108轮只回标记指望前端补发，只要调用
+    不经过 agui 工具结果同步就没人消费。第109轮改为**服务端亲自驱面板**，一次做完。
     """
     from evoflow.proactive.chat_session import (
         list_employee_conversation_sessions,
@@ -2611,6 +2746,9 @@ def chat_send(
     tid = str(task_id or "").strip()
     raw_sk = str(session_key or "").strip()
     ignored_caller_session = False
+    # 【self-evolution-bot · 2026-11-22 · 第125轮 · 模型:deepseek-v4.1-flash】
+    # 本次自动选会话时，被「目标正在跑」规则避开的那个 busy 会话键（没避开就是空）。
+    busy_avoided_sk = ""
     sk = raw_sk
     if sk and not _employee_owns_session_key(sk, code):
         # Do not raise: platform always setdefaults the ambient chat key.
@@ -2624,56 +2762,191 @@ def chat_send(
     elif tid:
         sk = proactive_task_session_key(code, tid)
     else:
-        # Prefer a recent chat / running session; else mint a fresh chat episode.
+        # 自动选会话：挑一条**空闲**的 chat 继聊；目标正在跑就另开一条，绝不插进去。
+        # 【self-evolution-bot · 2026-11-22 · 第125轮 · 模型:deepseek-v4.1-flash】
+        # 改了什么：旧逻辑 `hit = running or chat_hit` **优先挑 run_status=running 的会话**，
+        #   于是「派活给正在干活的员工」必然把新消息插进对方那个正在跑的回合。
+        # 为什么（用户 2026-11-22 当场点破，数据同日取证）：
+        #   · 我派自己一句「调一次 search_code_index」，回执 session_key 是
+        #     `proactive:self-evolution-bot:chat:2026-11-19T16-15-39.290Z` —— 正是我
+        #     自己当前这条对话（sessions.status 同 key、thread 8e4715ba、run_status=running）；
+        #   · `evoflow_chat_messages` 序号自证：seq14790 我调 chat_send → seq14792 那句被派
+        #     的话作为 **user** 落进同一 thread → seq14793 同一串里我的 search_code_index；
+        #   · `evoflow_chat_live_runs` 该会话只有 **一行 running / 一个 partial_text 字段**
+        #     → 两个回合共用一条流，后来的覆盖先来的，用户看到就是「话被截断」。
+        #   「同一员工同一时刻只有一个回合」是设计，所以正确做法不是共享流，而是**另开一条**。
+        # 判据：目标是 idle → 继聊它；目标 running/busy → 必须 mint 新 chat 会话，
+        #   并把被避开的那个键回给调用方（busy_avoided_session_key），不许静默。
+        # 边界：调用方**显式**传了 session_key（且属于该员工）时照旧尊重 —— 那是人的明示意图
+        #   （例如继续某条指定对话），不在这里替人做主。
         convs = list_employee_conversation_sessions(code, limit=40)
-        running = next(
-            (
-                c
-                for c in convs
-                if str(c.get("run_status") or "").lower()
-                in {"running", "busy", "active", "in_progress"}
-                and _employee_owns_session_key(str(c.get("session_key") or ""), code)
-            ),
-            None,
-        )
-        chat_hit = next(
+        busy_keys = {
+            str(c.get("session_key") or "").strip()
+            for c in convs
+            if str(c.get("run_status") or "").lower()
+            in {"running", "busy", "active", "in_progress"}
+            and _employee_owns_session_key(str(c.get("session_key") or ""), code)
+        }
+        idle_chat = next(
             (
                 c
                 for c in convs
                 if str(c.get("kind") or "") == "chat"
                 and _employee_owns_session_key(str(c.get("session_key") or ""), code)
+                and str(c.get("session_key") or "").strip() not in busy_keys
             ),
             None,
         )
-        hit = running or chat_hit
-        if hit and hit.get("session_key"):
-            sk = str(hit["session_key"]).strip()
-            if not tid and str(hit.get("kind") or "") == "task":
-                tid = str(hit.get("task_id") or "").strip()
+        if idle_chat and idle_chat.get("session_key"):
+            sk = str(idle_chat["session_key"]).strip()
         else:
+            # 没有空闲 chat 可继聊（对方正在跑 / 一条都没有）→ 新开一条独立会话。
             sk = proactive_chat_session_key(code, utc_now_iso_z())
+        # 【self-evolution-bot · 2026-11-22 · 第125轮 · 模型:deepseek-v4.1-flash】
+        # 两种情况都要回执「避开了哪条 busy 会话」：
+        #   ① 改投另一条空闲 chat；② 新开一条。只要最终没落进 running 那条，都必须说清 ——
+        #   否则调用方会以为话进了对方正在跑的对话（第112轮「回执虚报 sk」同型）。
+        # 判据（本轮自撞）：初版只在「新开」分支写这个字段，于是「改投 idle」时回执沉默，
+        #   新补的 busy+idle 并存用例当场 KeyError —— 沉默本身就是缺陷，不是测试写错。
+        if busy_keys and sk not in busy_keys:
+            busy_avoided_sk = next(iter(sorted(busy_keys)), "")
 
+    # 【self-evolution-bot · 2026-11-20 · 第100轮 · 模型:deepseek-v4.1-flash-1017】
+    # 改了什么：source 不再直接当员工身份用——先试解析成 active role，解析不出来一律按平台身份 xiaomi。
+    # 为什么（现网取证 2026-11-20 20:07:30）：platform employees.chat_send 传 source="role"
+    #   （dispatch 的默认来源标签）时，旧写法把 "role" 当员工名交给 wake →
+    #   resolve_role_ref("role") 抛 NotFoundError → 服务端 wake 直接失败，但 chat_send 仍
+    #   返回 client_effect=employee_chat_send，面板照样在本地把消息发出去 —— 面板里有来有回，
+    #   服务端一个字没跑，是典型「假成功」。
+    # 判据：source 是「谁发起的」标签，不是身份；只有能解析成真实 role 的才当 from_agent。
     src = str(source or "xiaomi").strip() or "xiaomi"
-    from_agent = "xiaomi" if src.casefold() in {"xiaomi", "user", "panel", "desktop"} else src
+    from_agent = "xiaomi"
+    if src.casefold() not in {"xiaomi", "user", "panel", "desktop", "role", "manual", "system"}:
+        try:
+            resolve_role_ref(src)
+            from_agent = src
+        except Exception:
+            logger.debug("chat_send: source %r is not a role, treating as platform", src)
 
     wake_result: dict[str, Any] | None = None
     wake_error = ""
-    try:
-        wake_result = wake(
-            code,
-            goal=text[:800],
-            from_agent=from_agent,
-            task_id=tid,
-            description=text[:2000],
-            source="xiaomi" if from_agent == "xiaomi" else src,
-            resume_round=bool(tid),
+    raw_deliver = str(deliver or "auto").strip().lower()
+    if raw_deliver not in {"auto", "wake", "panel"}:
+        # 【self-evolution-bot · 2026-11-21 · 第108轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：deliver 只接受 wake / panel，其它值直接报错。
+        # 为什么：本轮实测踩到——运行中的旧包不认识 deliver 参数，静默丢弃后照样 wake，
+        #   调用方以为「已切到面板流式」，实际还是后台跑、页面啥也看不到。
+        #   拼错一个字母就静默退化，比报错难查十倍。
+        # 【self-evolution-bot · 2026-11-21 · 第109轮 · 模型:deepseek-v4.1-flash-1017】
+        # 取值扩到 auto / wake / panel：auto = 面板在就驱面板、面板不在回落 wake。
+        raise ValidationError(
+            f"deliver must be 'auto' | 'wake' | 'panel', got {deliver!r}"
         )
-    except Exception as exc:
-        wake_error = str(exc).strip() or type(exc).__name__
-        logger.warning("chat_send: wake failed agent=%s err=%s", code, wake_error)
+    want_panel = raw_deliver in {"auto", "panel"}
+    panel_dispatch = ""
+    panel_dispatch_detail: dict[str, Any] = {}
+    if want_panel:
+        # 【self-evolution-bot · 2026-11-21 · 第109轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：deliver="panel" 时，**服务端自己不 wake，改由 CDP 直接驱动桌面面板
+        #   的 handleSend**（`/main-cdp/action employeeChatSend`）——即面板里手打消息
+        #   那条通路 → ChatApp.chatSend → live SSE 逐字流。
+        # 为什么（用户 2026-11-21 点破）：「我在右侧面板手打能看到实时结果，你后台触发
+        #   页面上啥也看不到。」第108轮只回了个 panel_delivery 标记等前端补发，
+        #   一旦这次调用没走 agui 工具结果同步（Xiaomi 主聊 / 手机 / 别的 agent 调），
+        #   标记就没人消费 —— 面板照样没流。发送动作必须由发起方一次做完。
+        # 判据（可反证）：把 CDP 调用拆掉，panel_dispatch 恒为空 → 前端回落 pendingSend，
+        #   表现退回第108轮「只开面板不发」。
+        logger.info("chat_send: deliver=%s, try drive panel via CDP (agent=%s)", raw_deliver, code)
+        try:
+            from evoflow.tools.builtins.panel_engine import panel_request
+
+            env = panel_request(
+                "POST",
+                "action",
+                body={
+                    "action": "employeeChatSend",
+                    "params": {
+                        "agentCode": code,
+                        "sessionKey": sk,
+                        "text": text,
+                        "taskId": tid,
+                        "roleName": str(role.role_name or "").strip(),
+                    },
+                },
+            )
+            if isinstance(env, dict) and env.get("ok"):
+                result = env.get("result") if isinstance(env.get("result"), dict) else {}
+                detail = (
+                    result.get("detail")
+                    if isinstance(result.get("detail"), dict)
+                    else result
+                )
+                mode = str((detail or {}).get("mode") or "").strip()
+                # live = 面板已在自己 chatSend（真流式）；pending-open = 面板刚被拉开排队首发。
+                # 两种都代表「面板侧会发」，前端不得再发一遍。
+                # 【self-evolution-bot · 2026-11-22 · 第126轮 · 模型:deepseek-v4.1-flash】
+                # 改了什么：mode 白名单加 `pending-open-switch`。
+                # 为什么：面板挂的是别的会话、需要切换时也属于「面板侧会发」，
+                #   漏掉它会让 panel_dispatch 变空 → 前端再 pendingSend → 同一句话发两遍。
+                panel_dispatch = (
+                    mode if mode in {"pane-live", "pending-open", "pending-open-switch"} else ""
+                )
+                panel_dispatch_detail = dict(detail or {})
+                logger.info(
+                    "chat_send: panel dispatch mode=%s agent=%s sk=%s",
+                    panel_dispatch or "-",
+                    code,
+                    (detail or {}).get("sessionKey") or sk,
+                )
+            else:
+                panel_dispatch_detail = {
+                    "ok": False,
+                    "error": (env or {}).get("error") if isinstance(env, dict) else "panel_request_failed",
+                }
+                logger.info(
+                    "chat_send: panel CDP unavailable (%s); frontend will pendingSend",
+                    panel_dispatch_detail.get("error"),
+                )
+        except Exception as exc:  # noqa: BLE001
+            panel_dispatch_detail = {"ok": False, "error": str(exc)}
+            logger.warning("chat_send: panel dispatch failed agent=%s err=%s", code, exc)
+
+    # auto：面板驱到了就到此为止（真流式）；驱不到（面板没开 / CDP 不在 / 手机端）
+    # 才回落后台 wake —— 那段没有流是物理事实，但用户至少有来有回，不是静默无反应。
+    # pane-busy = 面板在但正在跑别的一轮，handleSend 会静默丢消息 → 不许当送达。
+    need_wake = raw_deliver == "wake" or (raw_deliver == "auto" and not panel_dispatch)
+    if not need_wake:
+        wake_result = {
+            "skipped": True,
+            "reason": "panel_dispatched" if panel_dispatch else "panel_delivery_requested",
+        }
+    if need_wake:
+        try:
+            wake_result = wake(
+                code,
+                goal=text[:800],
+                from_agent=from_agent,
+                task_id=tid,
+                description=text[:2000],
+                source="xiaomi" if from_agent == "xiaomi" else src,
+                resume_round=bool(tid),
+                # 【self-evolution-bot · 2026-11-20 · 第100轮 · 模型:deepseek-v4.1-flash-1017】
+                # 改了什么：把上面辛苦算出来的 sk 交给 wake（旧代码算完就丢了，wake 恒空钉）。
+                # 为什么：面板按 sk 打开（proactive:reviewer:chat:dept-…），服务端却因空钉落
+                #   proactive:reviewer:task:2611…，同一句话两个桶、两张脸。20:07 实证：面板桶
+                #   20:07:32/34 有来有回，服务端桶 20:07:31→47 另跑一轮还白建一张任务单。
+                # pin_is_fresh：这个键是**当下刚算出来的**，不是注册时的旧快照，不许再被
+                #   prefer_newest_human_session 协商换掉（否则新 mint 的屏必然被换成旧屏）。
+                session_key=sk,
+                pin_is_fresh=True,
+            )
+        except Exception as exc:
+            wake_error = str(exc).strip() or type(exc).__name__
+            logger.warning("chat_send: wake failed agent=%s err=%s", code, wake_error)
 
     skipped = bool(isinstance(wake_result, dict) and wake_result.get("skipped"))
     woke = bool(wake_result is not None and not skipped and not wake_error)
+    panel_handled = bool(panel_dispatch)
     out: dict[str, Any] = {
         "ok": woke or skipped,
         "agent_code": code,
@@ -2687,7 +2960,85 @@ def chat_send(
         "queued": woke,
         "busy": woke,
         "wake": wake_result,
+        # 【self-evolution-bot · 2026-11-21 · 第108轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：明确告诉前端「这一句话该由面板本地发」。
+        # 为什么：前端 employee-chat-send-sync.js 现在只看 queued 决定要不要 pendingSend；
+        #   加了这条标记后，「谁真正发送」由调用方一次性说清，不靠前端反推。
+        # 【self-evolution-bot · 2026-11-21 · 第109轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：panel_delivery 从「调用方想要面板」改成「面板这一腿真的接住了 /
+        #   或强制 panel 模式下必须由前端补发」。
+        # 为什么：auto 模式下若面板驱不到、已回落 wake（queued=true），此时再说
+        #   panel_delivery=true，前端会照 pendingSend 再发一遍 —— 同一句话两遍，
+        #   正是第100轮踩过的坑。判据必须是实况，不是意图。
+        "panel_delivery": bool(panel_dispatch) or raw_deliver == "panel",
+        # 【self-evolution-bot · 2026-11-21 · 第109轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：回 `panel_dispatch` —— 本轮是否**已由服务端经 CDP 驱动面板发送**。
+        #   取值 `pane-live`（面板已在自己 chatSend → live SSE）
+        #     / `pending-open`（面板刚被拉开，首发排队中）/ 空（CDP 不可用，前端须自己发）。
+        # 为什么：第108轮只回标记不驱动，调用方若不是走 agui 工具结果同步的前端，
+        #   标记永远没人消费 → 面板里还是啥也看不到。谁发必须一次说清，不能靠消费方猜。
+        # 判据：panel_dispatch 非空 → 前端不得再 pendingSend（否则同一句话发两遍）；
+        #   为空 → 前端必须 pendingSend（保住有来有回）。
+        "panel_dispatch": panel_dispatch,
     }
+    # 【self-evolution-bot · 2026-11-22 · 第125轮 · 模型:deepseek-v4.1-flash】
+    # 改了什么：自动选会话时若因「目标正在跑」而另开了新会话，把被避开的键显式回给调用方。
+    # 为什么：静默换桶会让调用方以为「消息进了那条正在跑的对话」，实际进了新的一条 ——
+    #   与第112轮「回执虚报 sk」同一类缺陷（判据：回执里的 sk 必须能读到本次 user 消息）。
+    # 判据：busy_avoided_session_key 非空 → 本次是新开的会话，调用方要按新 key 去读。
+    if busy_avoided_sk:
+        out["busy_avoided_session_key"] = busy_avoided_sk
+        out["busy_avoided_reason"] = "target_session_running_new_conversation_minted"
+    if panel_dispatch_detail:
+        out["panel_dispatch_detail"] = panel_dispatch_detail
+    if panel_handled:
+        out["ok"] = True
+        out["busy"] = True
+        out["streaming"] = panel_dispatch == "pane-live"
+    # 【self-evolution-bot · 2026-11-21 · 第112轮 · 模型:deepseek-v4.1-flash-1017】
+    # 改了什么：回执 session_key 优先取面板真实发送者的 sk（panel_dispatch_detail.sessionKey），
+    #   与预计算 sk 不一致时显式暴露 requested_session_key + hint，不许静默虚报。
+    # 为什么（真机 21:20）：服务端 list_employee_conversation_sessions 挑出
+    #   chat:dept-4de7e33a602b，面板签是 ui.show 开的、自己 mint 了
+    #   chat:2026-11-21T13-20-20.208Z；桥按 code 兜底命中 → 消息进后者，回执却回前者。
+    # 判据：employees.messages(回执.session_key) 必须能读到本次 user 消息；
+    #   sessionKeyMatched=false 时 hint 必有，不得静默。
+    if isinstance(panel_dispatch_detail, dict):
+        actual_sk = str(panel_dispatch_detail.get("sessionKey") or "").strip()
+        matched_raw = panel_dispatch_detail.get("sessionKeyMatched")
+        matched_by = panel_dispatch_detail.get("sessionKeyMatchedBy")
+        requested_sk = str(sk or "").strip()
+        if actual_sk and _employee_owns_session_key(actual_sk, code):
+            out["session_key"] = actual_sk
+            mismatched = matched_raw is False or (
+                bool(requested_sk) and requested_sk != actual_sk
+            )
+            if mismatched:
+                out["requested_session_key"] = requested_sk or None
+                out["session_key_matched"] = False
+                if matched_by is not None:
+                    out["session_key_matched_by"] = matched_by
+                # 【self-evolution-bot · 2026-11-22 · 第126轮 · 模型:deepseek-v4.1-flash】
+                # 改了什么：pending-open-switch 分支不许说「消息已写入面板当前会话」——
+                #   那条消息此刻只是排队，面板要切到新会话才会发。
+                # 为什么：本轮实证 19:46:57 旧文案就是这么说的，而真实情况是
+                #   code-fallback 把话塞进了正在跑的旧会话。文案必须描述实际路径。
+                if panel_dispatch == "pending-open-switch":
+                    out["hint"] = (
+                        f"面板当前挂的是别的会话，已改为在新会话 {actual_sk or requested_sk} "
+                        f"重新打开后再发；本条消息此刻**尚未发送**。"
+                        f"请用回执 session_key 查 messages，若为空说明面板未接住。"
+                    )
+                else:
+                    out["hint"] = (
+                        f"消息已写入面板当前会话 {actual_sk}；"
+                        f"你请求的是 {requested_sk or '（空）'}，二者不同。"
+                        "请用回执里的 session_key 查 messages，不要用请求时预计算的键。"
+                    )
+            elif matched_raw is True:
+                out["session_key_matched"] = True
+                if matched_by is not None:
+                    out["session_key_matched_by"] = matched_by
     if skipped:
         out["skipped"] = True
         out["skip_reason"] = str((wake_result or {}).get("reason") or (wake_result or {}).get("message") or "")
@@ -2793,6 +3144,31 @@ def list_chat_messages(
         return ""
 
     # Keep last N user/assistant only; slim for tool consumption
+    def _row_ts(row: dict[str, Any]) -> str | None:
+        """Prefer explicit ISO strings; else format ``created_at_ms``.
+
+        【self-evolution-bot · 2026-11-19 · 第60轮 · 模型:deepseek-v4.1-flash-1017】
+        改了什么：取值链补 ``timestamp``（display 行的原生 ISO 键）。
+        为什么：``rows`` 来自 ``list_messages_for_display_all`` → ``_row_to_display_dict``，
+        那一层的 ISO 时间键就叫 ``timestamp``，既不叫 ``created_at`` 也不叫 ``createdAt``
+        ⇒ 现网实测每条 ``created_at: null``，「最近几条对话」看不出先后。
+        现在 display 行也补了原始 ``created_at_ms``，两条路都留。
+        """
+        for key in ("created_at", "createdAt", "created_at_iso", "timestamp"):
+            v = str(row.get(key) or "").strip()
+            if v:
+                return v
+        ms = row.get("created_at_ms")
+        if ms is None:
+            return None
+        try:
+            from datetime import datetime, timedelta, timezone
+
+            ts = datetime.fromtimestamp(float(ms) / 1000.0, tz=timezone(timedelta(hours=8)))
+            return ts.strftime("%Y-%m-%dT%H:%M:%S+08:00")
+        except (TypeError, ValueError, OSError):
+            return None
+
     slim: list[dict[str, Any]] = []
     for row in rows:
         if not isinstance(row, dict):
@@ -2807,7 +3183,7 @@ def list_chat_messages(
             {
                 "role": "user" if role_name in {"user", "human"} else "assistant",
                 "content": content[:4000],
-                "created_at": str(row.get("created_at") or row.get("createdAt") or "").strip() or None,
+                "created_at": _row_ts(row),
             }
         )
     slim = slim[-lim:]

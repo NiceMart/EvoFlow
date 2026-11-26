@@ -28,10 +28,17 @@ def _unknown(action: str) -> dict:
     [
         ("assets.search", "assets"),
         ("employees.status", "employees"),
-        ("agents.catalog", "agents"),
-        ("settings.catalog", "settings"),
+        # 【self-evolution-bot · 2026-11-20 · 第70轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：agents.catalog / settings.catalog / employees.help 换成同域不存在的
+        #   agents.search / settings.rename / employees.transfer。
+        # 为什么：第79轮（f21fc02c）新增「<域>.catalog / <域>.help 归一化为顶层 catalog/help」，
+        #   这三个拼法**不再是 unknown action**，本用例 `_unknown()` 的前置断言 ok is False
+        #   必然失败（实测 ok=True / domain=None）。参数表跟着契约一起漂移，否则红的是测试自己。
+        #   原意图不变：仍是「同域动作拼错 → 建议必须落在被调域」。
+        ("agents.search", "agents"),
+        ("settings.rename", "settings"),
         ("tasks.comment", "tasks"),
-        ("employees.help", "employees"),
+        ("employees.transfer", "employees"),
     ],
 )
 def test_suggestions_belong_to_called_domain(action: str, domain: str) -> None:
@@ -90,3 +97,37 @@ def test_help_fallback_still_works_for_bare_garbage() -> None:
     out = build_help("zzzzz")
     assert out.get("ok") is False
     assert out.get("suggestions_scoped") is False
+# 【self-evolution-bot · 2026-11-18 · 第57轮 · 模型:deepseek-v4.1-flash-1017】
+# 只传域名也是 unknown action，但**域是存在的**，不能谎称「无相近动作」。
+#
+# 现网原件（2026-11-17T21:42，本岗）：action="agents" →
+#   {"ok":false,"error":"unknown action: agents","suggestions":[],"suggestion_basis":"无相近动作",
+#    "domains":["knowledge", ..., "agents", "employees", ...]}
+# —— 同一个 payload 里 domains 列着 agents，suggestions 却空、basis 说「无相近动作」，
+# 注册表里其实有 5 个 agents.* 动作。根因是 raw_dom 只在 act 含 "." 时才非空。
+#
+# 反向断言同样重要：act 根本不是域名时（zzz_not_a_domain），仍必须 saying nothing
+# —— 别为了修这一条把任何字符串都当成域。
+
+
+@pytest.mark.parametrize("domain", ["agents", "assets", "items", "tasks", "employees"])
+def test_domain_only_action_lists_that_domains_actions(domain: str) -> None:
+    """只给域名时，建议必须是该域的真实动作，且不得自称「无相近动作」。"""
+    out = _unknown(domain)
+    suggestions = out.get("suggestions") or []
+    assert suggestions, f"{domain} 是合法域，suggestions 不该为空"
+    wrong = [s for s in suggestions if s.split(".", 1)[0] != domain]
+    assert not wrong, f"{domain} 的建议混入了其他域：{wrong}"
+    assert out.get("domain_exists") is True
+    basis = str(out.get("suggestion_basis") or "")
+    assert "无相近动作" not in basis, f"域存在于 domains 列表里，不能谎称无相近动作：{basis}"
+    # 文案不能露出空 leaf（曾经写成「域存在，但没有 ''」）
+    assert "''" not in basis, f"只给域名时不应出现空叶子动作占位：{basis}"
+
+
+@pytest.mark.parametrize("not_a_domain", ["zzz_not_a_domain", "agentsx", "nonsense"])
+def test_non_domain_string_is_not_treated_as_domain(not_a_domain: str) -> None:
+    """反证：不是域的字符串不得被当域处理（不制造假建议）。"""
+    out = _unknown(not_a_domain)
+    assert not (out.get("suggestions") or []), f"{not_a_domain} 不是域，不该给出建议"
+    assert out.get("domain_exists") is None, "域不存在时不应标 domain_exists=True"

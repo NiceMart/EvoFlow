@@ -5,7 +5,7 @@ import logging
 import re
 from typing import Annotated
 
-from langchain.tools import InjectedToolCallId, ToolRuntime, tool
+from langchain_core.tools import InjectedToolCallId, tool
 from langgraph.typing import ContextT
 
 from evoflow.config.agent_resource_validation import (
@@ -15,6 +15,7 @@ from evoflow.config.agent_resource_validation import (
     partition_tool_names,
 )
 from evoflow.config.agents_config import load_agent_config, save_agent_config
+from evoflow.core.tool_runtime_type import ToolRuntime
 from evoflow.persistence import config_repositories as cfg_repo
 
 logger = logging.getLogger(__name__)
@@ -221,6 +222,38 @@ async def create_agent_tool(
             "mcp_servers": created_mcp,
         }
 
+        # Custom agents are employees (BOT); subagents stay capability-only for subtasks.
+        role_created = False
+        hire_error = None
+        if str(agent_type or "").strip().lower() != "subagent":
+            try:
+                from evoflow.admin.employees import hire as hire_employee
+                from evoflow.admin.errors import ConflictError as _HireConflict
+
+                hire_employee(
+                    {
+                        "agent_code": agent_code,
+                        "role_name": str(agent_name or agent_code).strip() or agent_code,
+                    }
+                )
+                role_created = True
+            except _HireConflict:
+                role_created = True
+            except Exception as exc:
+                hire_error = str(exc)
+                logger.warning("create_agent_tool auto-hire failed code=%s: %s", agent_code, exc)
+
+        if role_created:
+            use_hint = (
+                f"已发布为员工岗位，可在 BOT / 智能体员工页对话、派发；"
+                f"子任务仍可用 assigned_agent='{agent_code}'。"
+            )
+        else:
+            use_hint = (
+                f"You can now use it by specifying assigned_agent='{agent_code}' when creating subtasks."
+                + (f" Auto-hire failed: {hire_error}" if hire_error else "")
+            )
+
         return json.dumps(
             {
                 "success": True,
@@ -233,10 +266,12 @@ async def create_agent_tool(
                 "tools": created_tools,
                 "skills": created_skills,
                 "mcp_servers": created_mcp,
+                "as_employee": role_created,
+                "role_created": role_created,
                 "message": (
                     f"Agent '{agent_code}' created successfully "
                     f"(tags={created_tags}; tools={tools_desc}; skills={skills_desc}; mcp={mcp_desc}). "
-                    f"You can now use it by specifying assigned_agent='{agent_code}' when creating subtasks."
+                    f"{use_hint}"
                 ),
             },
             ensure_ascii=False,

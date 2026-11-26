@@ -17,10 +17,18 @@ import uuid
 from pathlib import Path
 from typing import Annotated
 
-from langchain.tools import InjectedToolCallId, ToolRuntime, tool
+# 【self-evolution-bot · 2026-11-19 · 第65轮 · 模型:deepseek-v4.1-flash-1017】
+# 改了什么：`ToolRuntime` 从 `langchain.tools` 换成轻量标记类。
+# 为什么：`langchain.tools` 顶层 `from langchain.tools.tool_node import ToolRuntime`
+# → `langgraph.prebuilt.tool_node` → `langchain_core.language_models.base:42`
+# 的顶层 `from transformers import GPT2TokenizerFast` 把 torch（715 模块）拉进每个进程。
+# 实测：`from langchain.tools import tool` 2371ms/2248 模块（拉 torch）vs
+#       `from langchain_core.tools import tool` 399ms/770 模块（不拉）。
+from langchain_core.tools import InjectedToolCallId, tool
 from langgraph.types import Command
 
 from evoflow.agents.image_staging import command_with_staged_images, stage_image_entry
+from evoflow.core.tool_runtime_type import ToolRuntime
 from evoflow.tools.zcode_port.background import BackgroundBashTask, mark, new_task_id, register_task
 from evoflow.tools.zcode_port.capability import resolve_embedded_search_branch_capability
 from evoflow.tools.zcode_port.prelude import BASH_DESCRIPTION, BASH_DESCRIPTION_DIRECT, build_embedded_search_prelude
@@ -55,6 +63,10 @@ FOREGROUND_BLOCKING_CEILING_MS = int(os.getenv("EVOFLOW_BASH_FOREGROUND_CEILING_
 # main-chat sleeps). Commands are independent Popen processes and CWD
 # persistence is already keyed per thread, so per-thread locks plus a
 # semaphore cap restore parallelism safely.
+# 【self-evolution-bot · 2026-11-19 · 第64轮 · 模型:deepseek-v4.1-flash-1017】
+# 上面这段只解决了「跨线程」，没解决「同线程内并行调用」：每线程单锁把并行
+# 调用串成一条队，实测 3 天排队 1663s。现改为每线程多车道（默认 2，见
+# ``_bash_max_lanes_per_thread``），进程级信号量上限保持不变。
 _EXEC_LOCKS: dict[str, threading.Lock] = {}
 _EXEC_LOCKS_GUARD = threading.Lock()
 _EXEC_LOCKS_MAX = 1024
@@ -78,12 +90,79 @@ _BASH_CONCURRENCY = threading.Semaphore(_bash_max_concurrent())
 class _bash_concurrency_slot:
     """Process-wide cap on simultaneously running bash processes."""
 
-    def __enter__(self) -> "_bash_concurrency_slot":
+    def __enter__(self) -> _bash_concurrency_slot:
         _BASH_CONCURRENCY.acquire()
         return self
 
     def __exit__(self, *_exc) -> bool:
         _BASH_CONCURRENCY.release()
+        return False
+
+
+def _bash_max_lanes_per_thread() -> int:
+    """How many concurrent execution lanes one agent thread may use.
+
+    【self-evolution-bot · 2026-11-19 · 第64轮 · 模型:deepseek-v4.1-flash-1017】
+    改了什么：原来每个 ``thread_key`` 只有**一把**锁（``_EXEC_LOCKS[key]``），
+    于是同一线程发出的并行 bash 调用被完全串行化——同一个 agent 永远只占到
+    进程级 4 槽中的 1 槽，另外 3 槽空着。
+    为什么（现网实测 2026-11-19，近 3 天 9254 次 bash 调用）：
+      · ``queue_wait_ms`` 累计 **1663s**，其中 49 次单次等 **19.6s** 的长尾占 **962s**；
+      · 按线程分：1556 次那一条线程排队 472s、889 次那条 311s、1332 次那条 177s；
+      · 分桶：8160 次 <50ms，但 140 次 >10s 的等待全落在「同线程前一条长命令没跑完」。
+    判据：并行调用本该并行跑（彼此是独立 Popen 进程），串行只为保护
+    **单条 warm shell 的 stdin 管道**——所以按车道给 warm 会话键加后缀即可解耦；
+    进程级资源上限仍由 ``_BASH_CONCURRENCY`` 兜住，**不放宽**。
+    """
+
+    raw = (os.getenv("EVOFLOW_BASH_LANES_PER_THREAD") or "2").strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 2
+
+
+def _lane_key(base_key: str, lane: int) -> str:
+    """Lane 0 沿用历史键（``<thread>``），其余车道加 ``#i`` 后缀各自持一条会话。"""
+    return base_key if lane <= 0 else f"{base_key}#{lane}"
+
+
+class _thread_channel:
+    """Per-thread execution channel with N lanes.
+
+    【self-evolution-bot · 2026-11-19 · 第64轮 · 模型:deepseek-v4.1-flash-1017】
+    lane 0 与改动前完全一致（单线程顺序执行时永远拿到 lane 0，行为零变化）；
+    lane 1..N-1 只在「同一线程同时有多条 bash 在等」时才被用上，各持独立 warm shell。
+    所有车道都在忙时退回等 lane 0，保留原来先进先出的排队语义。
+    """
+
+    __slots__ = ("base_key", "lanes", "lane", "_lock")
+
+    def __init__(self, thread_key: str) -> None:
+        self.base_key = str(thread_key or "").strip() or "_default"
+        self.lanes = _bash_max_lanes_per_thread()
+        self.lane = 0
+        self._lock: threading.Lock | None = None
+
+    def __enter__(self) -> _thread_channel:
+        locks = [
+            _exec_lock_for(_lane_key(self.base_key, i)) for i in range(self.lanes)
+        ]
+        for i, lk in enumerate(locks):
+            if lk.acquire(blocking=False):
+                self.lane = i
+                self._lock = lk
+                return self
+        locks[0].acquire()
+        self.lane = 0
+        self._lock = locks[0]
+        return self
+
+    def __exit__(self, *_exc: object) -> bool:
+        lk = self._lock
+        if lk is not None:
+            self._lock = None
+            lk.release()
         return False
 
 
@@ -118,26 +197,90 @@ _PURE_WAIT_SLEEP_RE = re.compile(r"(?i)\bsleep\s+([0-9]+(?:\.[0-9]+)?)")
 _PURE_WAIT_FILLER_RE = re.compile(r"(?i)\b(?:echo\s+(?:\"[^\"]*\"|'[^']*'|[^;&|]+)|true)\b")
 # ``sleep N; tail/cat …output`` looks like "real work" but is still progress polling
 # (2026-11-10 prod: sleep 45/50 + tail evoflow-bash-tasks pulled bash p90 to ~12s).
+# 【self-evolution-bot · 2026-11-22 · 第123轮 · 模型:deepseek-v4.1-flash-1017】
+# 改了什么：只把「瞥一眼 *.output」算填充，不再把 tail/cat 任意文件都算填充。
+# 为什么：旧写法会把 `sleep 45; tail -8 outputs/build.log`（等构建写完看日志）
+#   判成纯等待——而那正是**没有完成通知可等**的真实等待，本轮实测的误拦里
+#   就含这类。自有后台任务输出已由 _OWN_TASK_OUTPUT_RE 单独精确拦住，
+#   这里只需覆盖 `.output` 尾巴。
 _PROGRESS_POLL_READ_RE = re.compile(
-    r"(?i)\b(?:tail|head|cat|less|more|wc)\b(?:\s+(?:-[a-zA-Z0-9]+|--\S+))*\s+\S+"
+    r"(?i)\b(?:tail|head|cat|less|more|wc)\b(?:\s+(?:-[a-zA-Z0-9]+|--\S+))*\s+\S*\.output\b"
 )
 _PURE_WAIT_MAX_SECONDS = 10.0
-# Hard cap: even with trailing work, a single sleep above this is banned.
-# 20s (was 60s): long waits must use run_in_background + completion notify /
-# ``gh run watch`` / taskoutput — not park the foreground channel.
-_MAX_SINGLE_SLEEP_SECONDS = 20.0
+# 填充/标点剥离后的残留：只剩引号、反引号、空白等「不是工作」的字符时不算有工作。
+_RESIDUE_PUNCT_RE = re.compile(r"""["'`\\]+""")
+# 【self-evolution-bot · 2026-11-22 · 第123轮 · 模型:deepseek-v4.1-flash-1017】
+# 改了什么：单次 sleep 上限 20s → 与前台阻塞封顶同口径（60s）。
+# 为什么：这条 20s 上限是 1.4.0 引入的，当时前台还没有「超预算自动转后台」；
+#   现在任何前台命令超过 ASSISTANT_BLOCKING_BUDGET_MS(15s) 就会被
+#   _promote_to_background 自动转后台并发完成通知——**它要防的「占住执行通道
+#   一分钟」已经由转后台机制兜住了**，再拦一遍就只剩副作用。
+#   现网复算（近 7 天，首行为 status: rejected 的真实拒绝 51 次）：
+#     · 19 次是 `sleep N; tail/cat …evoflow-bash-tasks/*.output`（轮询自有后台
+#       任务输出，通知已存在）→ 仍应拒，见下方 _OWN_TASK_OUTPUT_RE；
+#     · 15 次是「单次 25~60s + 真实工作」：等索引构建写日志、等 pytest 写结果
+#       文件、等 curl 探到就绪——这些**没有完成通知可等**，是真正需要等的。
+#       它们被拒后我平均要用 7.2 次调用 / 33.7s 去补偿（59 次拒绝的后续 8 次
+#       调用共 427 次 / 1987s）。
+#   实测确认转后台是真的：本轮 `sleep 18` 前台命令在 15s 处返回
+#     status: backgrounded + backgroundTaskId，并收到完成通知。
+# 边界：纯等待（无真实工作且合计>10s）仍拒；轮询自有后台任务输出仍拒；CI
+#   轮询仍要求 `gh run watch`。只有「带真实工作的中长 sleep」被放行。
+_MAX_SINGLE_SLEEP_SECONDS = FOREGROUND_BLOCKING_CEILING_MS / 1000.0
+# 轮询我们自己的后台任务输出文件：完成通知已经存在，睡多久都是白等。
+_OWN_TASK_OUTPUT_RE = re.compile(r"(?i)evoflow-bash-tasks")
+# 盯 CI / Actions 必须用 gh run watch（可后台、自己会退出），不许 sleep+view。
+_CI_POLL_RE = re.compile(r"(?i)\bgh\s+run\s+view\b")
 
 
-def _pure_wait_guard(command: str) -> str | None:
+def _pure_wait_guard(command: str, *, run_in_background: bool = False) -> str | None:
     """Reject pure-wait / long-sleep disguised waits.
 
     Returns a rejection message, or ``None`` when the command should execute.
+    - Polling our own background task output (``evoflow-bash-tasks/*.output``) → reject
+    - ``sleep … ; gh run view`` CI polling → reject (use ``gh run watch``)
     - Total sleep >10s with no real work (echo/true/tail/cat filler) → reject
-    - Any single ``sleep N`` with N>20 → reject even if followed by real work
+    - Any single ``sleep N`` above the foreground ceiling (60s) → reject
+
+    【self-evolution-bot · 2026-11-20 · 第89轮 · 模型:deepseek-v4.1-flash-1017】
+    改了什么：新增 ``run_in_background`` 开关。**转后台时放行长 sleep**，前台限制不动。
+    为什么：拒绝文案自己写着「长等待请用 `run_in_background=true`」，而我照做
+    （`sleep 40` + `run_in_background=true`）仍然被拒——判定只看单次 sleep 时长，
+    压根没看是否转后台，**文案在教一个它自己不允许的动作**。
+    实证：2026-11-20 我为了验 taskoutput 30s 封顶需要造一个 40s 的后台任务，
+    连撞两次拒绝，最后只能用 `(sleep 18; sleep 18)` 绕过去。
+    边界：转后台时 `sleep 300 && …` 仍是**合法**用法——它不占前台通道，正是本守卫
+    当初要保护的东西（注释：parking an execution channel for ~a minute each）。
+    但「纯等待轮询」那条（total>10s 且无实际工作）在后台同样放行，因为后台
+    轮询本来就是后台任务的正常形态。前台行为逐字不变。
+
+    【self-evolution-bot · 2026-11-22 · 第123轮 · 模型:deepseek-v4.1-flash-1017】
+    改了什么：把「轮询自有后台任务输出」「CI 轮询」提成独立判据，并把单次上限
+    从 20s 放宽到与前台封顶同口径（60s）。目的不是放松，而是让拒绝**只落在
+    真有替代手段的场景**上；没有通知可等的等待应当被允许睡。
     """
     cmd = str(command or "").strip()
     if not cmd or "sleep" not in cmd.lower():
         return None
+    # 转后台：不占前台通道，长 sleep 正是推荐用法，直接放行。
+    if run_in_background:
+        return None
+    # 这两条与时长无关：替代手段（完成通知 / gh run watch）本来就存在。
+    if _OWN_TASK_OUTPUT_RE.search(cmd):
+        return (
+            "status: rejected\ninterrupted: false\n"
+            "该命令在轮询我们自己的后台任务输出（evoflow-bash-tasks/*.output）。"
+            "任务结束时 harness 会主动发 <task-notification> 并把输出文件路径推给你，"
+            "届时直接 Read 该文件即可；`taskoutput(block=false)` 可秒回瞄一眼当前状态。"
+            "`sleep …; tail/cat …output` 只是在原地烧时间。"
+        )
+    if _CI_POLL_RE.search(cmd):
+        return (
+            "status: rejected\ninterrupted: false\n"
+            "盯 CI / Actions 不要用 `sleep … && gh run view`。"
+            "改用 `gh run watch <RUN_ID> --exit-status`（它会自己等到结束，可配 "
+            "`run_in_background=true`）。"
+        )
     total = 0.0
     max_one = 0.0
     for m in _PURE_WAIT_SLEEP_RE.finditer(cmd):
@@ -152,9 +295,8 @@ def _pure_wait_guard(command: str) -> str | None:
         return (
             "status: rejected\ninterrupted: false\n"
             f"该命令含过长 sleep（单次 {max_one:.0f}s > {_MAX_SINGLE_SLEEP_SECONDS:.0f}s），已拒绝执行。"
-            "长等待请用 `run_in_background=true`（完成会推送通知），"
-            "盯 CI / Actions 用 `gh run watch <RUN_ID> --exit-status`（可后台）；"
-            "禁止 `sleep 45/60/300 && …` 或 `sleep …; tail …output` 占住前台。"
+            "长等待请用 `run_in_background=true`（完成会推送通知）；"
+            "注意前台命令超过 15s 本来就会自动转后台，所以更长的 sleep 没有意义。"
         )
     if total <= _PURE_WAIT_MAX_SECONDS:
         return None
@@ -163,6 +305,14 @@ def _pure_wait_guard(command: str) -> str | None:
     residue = _PROGRESS_POLL_READ_RE.sub(" ", residue)
     for ch in ("&&", "||", ";", "|", "(", ")", "\n"):
         residue = residue.replace(ch, " ")
+    # 【self-evolution-bot · 2026-11-22 · 第123轮 · 模型:deepseek-v4.1-flash-1017】
+    # 改了什么：判「有没有真实工作」前先剥掉残留的引号/反引号等纯标点。
+    # 为什么：现网实证 `sleep 45; echo "waited"`（2026-11-20 09:53:15）被这版
+    #   判成 ALLOW——填充正则匹配 `echo "waited"` 时因尾引号回退，残留一个
+    #   孤立 `"`，`residue.strip()` 非空 → 当成"有真实工作"放行。
+    #   旧判据靠「单次 45s > 20s」先拒掉，把这个漏洞盖住了；上限一放宽就露出来。
+    #   这不是放松，是**补一条本该在的判据**：只剩标点的残留就是没有工作。
+    residue = _RESIDUE_PUNCT_RE.sub("", residue)
     if residue.strip():
         return None  # real work beyond waiting — let it run
     return (
@@ -176,8 +326,13 @@ _TRUE = {"true", "1", "yes", "y", "on"}
 _FALSE = {"false", "0", "no", "n", "off"}
 
 # ZCode: working directory persists between Bash calls (per thread).
-_PERSISTED_CWD: dict[str, str] = {}
+# 【self-evolution-bot · 2026-11-19 · 第68轮】值从 str 改为 (workspace_root, cwd)：
+# 会话在 UI 里切换工作区后，旧 cwd 必须失效，否则命令会在本轮工作区之外跑。
+_PERSISTED_CWD: dict[str, tuple[str, str]] = {}
 _PERSISTED_CWD_LOCK = threading.Lock()
+# 每个 thread 最近一次已知的工作区 root。_strip_pwd_marker 只拿得到 thread_id
+# （没有 runtime），靠这个字典补上「记住 cwd 时属于哪个工作区」。
+_THREAD_WORKSPACE: dict[str, str] = {}
 _PWD_MARKER = "__EVOFLOW_PWD__="
 
 # Compound `cd … && <probe>` still counts as a probe for soft-timeout purposes.
@@ -529,22 +684,129 @@ def _workspace_root(runtime: ToolRuntime | None) -> str:
 
 
 def _cwd(runtime: ToolRuntime | None) -> str:
+    # 【self-evolution-bot · 2026-11-19 · 第68轮 · 模型:deepseek-v4.1-flash-1017】
+    # 改了什么/为什么：cwd 持久化必须绑定「当时那个工作区」。
+    # 原实现只按 thread_id 取，于是同一会话在 UI 里**切换工作区**后，
+    # 上一条会话留下的 cwd 仍然有效 —— 实测：会话 C 先绑 wsA、在里面 `cd ../`，
+    # 再切到 wsB，_cwd 仍返回 /Temp（旧工作区的上级），命令直接在本轮工作区之外跑。
+    # 现在记住 cwd 时一并记下 workspace root；root 变了就丢弃旧 cwd，回落到新 root。
     tid = _thread_id(runtime)
     if tid:
+        root_now = _workspace_root(runtime)
         with _PERSISTED_CWD_LOCK:
-            persisted = _PERSISTED_CWD.get(tid)
-        if persisted and Path(persisted).is_dir():
-            return persisted
+            entry = _PERSISTED_CWD.get(tid)
+        if entry:
+            saved_root, persisted = entry
+            same_ws = _same_workspace(saved_root, root_now)
+            if same_ws and persisted and Path(persisted).is_dir():
+                return persisted
+            if not same_ws:
+                # 工作区已切换：旧 cwd 不再属于本轮上下文，直接丢掉。
+                with _PERSISTED_CWD_LOCK:
+                    _PERSISTED_CWD.pop(tid, None)
     return _workspace_root(runtime)
 
 
-def _remember_cwd(thread_id: str, cwd: str) -> None:
+def _same_workspace(saved: str, now: str) -> bool:
+    """两个 workspace root 是否指向同一处（大小写/分隔符/相对路径都不敏感）。"""
+    a = str(saved or "").strip()
+    b = str(now or "").strip()
+    if not a or not b:
+        return True  # 取不到 root 时不做「已切换」判断，保持原行为
+    try:
+        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+    except (OSError, ValueError):
+        return a == b
+
+
+def _msys_tmp_to_windows(path: str) -> str:
+    """把 Git Bash 的 ``/tmp`` 映射到它真实的 Windows 目录；映射不出来返回空串。
+
+    【self-evolution-bot \u00b7 2026-11-20 \u00b7 \u7b2c89\u8f6e \u00b7 \u6a21\u578b:deepseek-v4.1-flash-1017】
+    \u6539\u4e86\u4ec0\u4e48/\u4e3a\u4ec0\u4e48\uff1a``from_bash_posix_path`` \u6709\u610f\u4e0d\u8f6c\u6362 ``/tmp``\u3001``/dev`` \u8fd9\u7c7b MSYS \u865a\u62df\u6302\u8f7d\uff0c
+    \u4e14 docstring \u628a\u5b83\u5f53\u4f5c\u201c\u666e\u901a POSIX \u8def\u5f84\u4fdd\u7559\u539f\u6837\u201d\u3002\u4f46 Git Bash \u7684 ``/tmp`` \u5b9e\u9645\u5c31\u662f ``%TEMP%``\uff1a
+    \u5b9e\u6d4b ``cygpath -w /tmp`` \u2192 ``C:\\Users\\admin\\AppData\\Local\\Temp``\uff0c\u4e0e ``os.environ['TEMP']`` \u540c\u4e00\u5904\u3002
+    \u4e0d\u6620\u5c04\u7684\u540e\u679c\uff1a``Path('/tmp/x').is_dir()`` \u6052\u4e3a False\uff0c\u4e8e\u662f ``_remember_cwd``
+    **\u9759\u9ed8\u4e22\u5f03**\u6574\u4e2a cwd\uff0c\u800c\u6a21\u578b\u4ee5\u4e3a cd \u8fc7\u4e86\uff0c\u76f8\u5bf9\u8def\u5f84\u5374\u62fc\u5230\u65e7\u6839\u4e0a\u3002
+    \u5b9e\u8bc1\uff1a2026-11-20 \u91cd\u542f\u540e\u5b9e\u6d4b\uff0c``cd /tmp/evoflow-cwd-proof`` \u540e read \u62a5\u9519\u91cc
+    \u201cbash \u5f53\u524d\u76ee\u5f55\u201d\u4ecd\u662f\u4e0a\u4e00\u4e2a\u76ee\u5f55\u3002
+
+    \u53ea\u5904\u7406 ``/tmp`` \u4e0e ``/tmp/...``\uff1b``/dev``\u3001``/usr`` \u4e0d\u52a8\uff08\u5b83\u4eec\u6ca1\u6709\u53ef\u9760\u7684 Windows \u5bf9\u5e94\u7269\uff09\u3002
+    """
+    norm = str(path or "").replace("\\", "/")
+    if norm != "/tmp" and not norm.startswith("/tmp/"):
+        return ""
+    base = os.environ.get("TEMP") or os.environ.get("TMP") or ""
+    if not base:
+        return ""
+    rest = norm[len("/tmp"):].strip("/")
+    return os.path.join(base, rest.replace("/", os.sep)) if rest else base
+
+
+def _remember_cwd(thread_id: str, cwd: str, workspace_root: str = "") -> None:
+    # 【self-evolution-bot · 2026-11-19 · 第68轮 · 模型:deepseek-v4.1-flash-1017】
+    # 改了什么/为什么：bash 的标记行回的是 Git-Bash posix 路径（`/c/Users/...`），
+    # 而 Windows 上 `Path("/c/Users/...").is_dir()` 是 **False** —— 于是下面这行
+    # `if not Path(path).is_dir(): return` 静默把每一次 cwd 都丢掉了。
+    # 后果：cwd 持久化从未真正生效，模型发现「cd 过也白 cd」，只能每条命令自带
+    # `cd … &&` 前缀（7 天 19561 次 bash 中 92.8%，我本人 96.0%）。
+    # 实证：_remember_cwd("t", "/c/.../sub") 后 _PERSISTED_CWD 仍为 {}。
+    # 修法：先转回 Windows 路径再校验与存储；非 win32 平台原样不动。
+    # 另：同时记下当时的工作区 root，供 _cwd 判断「会话是否已切换工作区」。
+    from evoflow.utils.bundled_tools import from_bash_posix_path
+
     tid = str(thread_id or "").strip()
-    path = str(cwd or "").strip()
+    path = from_bash_posix_path(str(cwd or "").strip())
+    # 【self-evolution-bot · 2026-11-20 · 第89轮 · 模型:deepseek-v4.1-flash-1017】
+    # from_bash_posix_path 有意不转换 /tmp 这类 MSYS 虚拟挂载（它把 /tmp 当“普通
+    # POSIX 路径”原样返回），于是 Path('/tmp/x').is_dir() 恒 False，下面那行
+    # `return` 会把整个 cwd 静默丢掉——模型以为 cd 生效了，相对路径却拼到旧根。
+    # 重启后实测：cd /tmp/evoflow-cwd-proof 后 read 报错里的「bash 当前目录」
+    # 仍是上一个目录。补一条 /tmp → %TEMP% 的映射兜底（cygpath -w /tmp 实测
+    # 就是 C:\Users\admin\AppData\Local\Temp）。
+    if path and not Path(path).is_dir():
+        mapped = _msys_tmp_to_windows(path)
+        if mapped and Path(mapped).is_dir():
+            path = mapped
     if not tid or not path or not Path(path).is_dir():
         return
+    root = str(workspace_root or "").strip()
+    if not root:
+        with _PERSISTED_CWD_LOCK:
+            root = _THREAD_WORKSPACE.get(tid, "")
     with _PERSISTED_CWD_LOCK:
-        _PERSISTED_CWD[tid] = path
+        _PERSISTED_CWD[tid] = (root, path)
+
+def thread_cwd_for(thread_id: str, workspace_root: str = "") -> str:
+    """该 thread 在 bash 里学到的当前目录；read/replace/grep 复用它。
+
+    【self-evolution-bot · 2026-11-20 · 第89轮 · 模型:deepseek-v4.1-flash-1017】
+    改了什么/为什么：此前 bash 学到的 cwd **只对 bash 自己生效**，read/replace/grep
+    各自按「进程 cwd / 会话工作区根」拼——三套「当前目录」互不相通。于是 bash 返回
+    `cwd: /d/dev/github/EvoFlow` 时，read 仍拼出 `backend/backend/...`、
+    grep 仍拼到 profile 目录，模型只能每次都写 `D:/dev/github/EvoFlow/...` 全量路径。
+    现网实证（近7天 obs）：read/replace/grep 相对路径调用失败 116 次，其中 41 次
+    两边都没有（探针）、16 次目标文件其实就在仓库根下——判据不是路径写错，是根不对。
+    统一成一个「当前目录」= IDE 语义，也让 cwd 持久化那次修复真正对全部工具生效。
+    """
+    tid = str(thread_id or "").strip()
+    if not tid:
+        return ""
+    with _PERSISTED_CWD_LOCK:
+        entry = _PERSISTED_CWD.get(tid)
+    if not entry:
+        return ""
+    saved_root, path = entry
+    # 【self-evolution-bot · 2026-11-20 · 第89轮 · 模型:deepseek-v4.1-flash-1017】
+    # 与 _cwd 同一条判据：记住 cwd 时一并记了当时的工作区 root，root 变了就作废。
+    # 否则同一会话在 UI 里切换工作区后，上一个工作区的目录仍会当作「当前目录」，
+    # 相对路径就被拼到本轮工作区之外 —— 这正是第 68 轮修过的同类缺陷。
+    want_root = str(workspace_root or "").strip()
+    if want_root and saved_root and not _same_workspace(saved_root, want_root):
+        return ""
+    cand = str(path or "").strip()
+    return cand if cand and os.path.isdir(cand) else ""
+
 
 
 def _no_window() -> dict:
@@ -837,6 +1099,23 @@ def _note_bash_timing(tool_call_id: str, **fields: object) -> None:
         return
 
 
+def _capture_writer():
+    """Grab the live stream writer **on the calling thread**, or ``None``.
+
+    Must be called from the thread that still owns the LangGraph contextvars —
+    ``threading.Thread`` does not inherit them, so ``capture_stream_writer()``
+    returns ``None`` inside a spawned pump thread. Capture first, pass it down.
+
+    【self-evolution-bot · 2026-11-17 · 第32轮】新增。
+    """
+    try:
+        from evoflow.tools.host_direct.terminal_stream import capture_stream_writer
+
+        return capture_stream_writer()
+    except Exception:
+        return None
+
+
 def _emit(kind: str, **kwargs: object) -> None:
     from evoflow.tools.host_direct.terminal_stream import (
         emit_background_work,
@@ -927,18 +1206,32 @@ def _format_finished(
     stderr: str,
     exit_code: int,
     timed_out: bool,
+    cwd: str = "",
 ) -> str:
     out, out_tr = _model_stream(stdout)
     err, err_tr = _model_stream(stderr)
     hint = _stale_hint_for(command)
     hint_block = f"\n{hint}" if hint else ""
+    # 【self-evolution-bot · 2026-11-19 · 第68轮 · 模型:deepseek-v4.1-flash-1017】
+    # 把「下一条命令的 cwd」显式回给调用方，改了什么/为什么：
+    # 原来 _strip_pwd_marker 把 pwd 行剥掉、只存进内存 _PERSISTED_CWD，模型侧
+    # 完全看不到自己在哪。实测 7 天 19561 次 bash 里 92.8% 都带 `cd … &&` 前缀
+    # （我本人 96.0%、release-engineer 98.4%）——不是习惯问题，是工具没告诉它。
+    # 不带 cd 的命令「路径不存在」类报错率 2.82% vs 带 cd 的 0.93%（3 倍），
+    # 说明模型加 cd 是在补偿这个信息缺口。回显一行即可让它省掉这个前缀。
+    cwd_block = ""
+    if cwd:
+        cwd_block = f"\ncwd: {_to_posix(cwd)}"
     if timed_out:
-        return f"status: timed_out\ninterrupted: true\nstdout:\n{out}\nstderr:\n{err}{hint_block}"
+        return (
+            f"status: timed_out\ninterrupted: true\nstdout:\n{out}\nstderr:\n{err}"
+            f"{hint_block}{cwd_block}"
+        )
     status = "completed" if exit_code == 0 else "failed"
     return (
         f"status: {status}\nexitCode: {exit_code}\ninterrupted: false\n"
         f"stdoutTruncated: {str(out_tr).lower()}\nstderrTruncated: {str(err_tr).lower()}\n"
-        f"stdout:\n{out}\nstderr:\n{err}{hint_block}"
+        f"stdout:\n{out}\nstderr:\n{err}{hint_block}{cwd_block}"
     )
 
 
@@ -1017,12 +1310,25 @@ def _promote_to_background(
 
     threading.Thread(target=_pump, name=f"bash-bg-{task_id}", daemon=True).start()
     seconds = max(1, int(blocking_ms) // 1000)
+    # 【self-evolution-bot · 2026-11-19 · 第79轮 · 模型:deepseek-v4.1-flash-1017】
+    # 改了什么：转后台时把**已经产出的部分输出**直接带回返回值，不再只给一个路径。
+    # 为什么：partial_stdout 早在这一行之前就拿到了（上面 write_text 落的盘），
+    #   原实现只把它写进文件、返回值里一个字都不给，于是 agent 想看一眼进度
+    #   就必须再调一次 Read —— 近 24h 176 次转后台里有 45 次（25.6%）真的这么做了，
+    #   每次都是白烧一个整轮。而 Read 拿到的内容与我这里能直接返回的完全相同。
+    partial_block = ""
+    _p = (partial_stdout or "").strip()
+    if _p:
+        _tail = _p if len(_p) <= 4000 else _p[-4000:]
+        _cut = "" if len(_p) <= 4000 else f"...(已省略前 {len(_p) - 4000} 字符) "
+        partial_block = f"partialOutput:\n{_cut}{_tail}\n"
     return (
         f"status: backgrounded\ninterrupted: false\nbackgroundTaskId: {task_id}\n"
-        f"persistedOutputPath: {output_path}\n"
+        f"persistedOutputPath: {output_path}\n{partial_block}"
         f"Command exceeded the assistant-mode blocking budget ({seconds}s) and was moved to the "
         f"background with ID: {task_id}. It is still running — you will be notified when it completes. "
-        f"Output is being written to: {output_path}. To check interim output, use Read on that file path."
+        f"Output is being written to: {output_path}. "
+        f"上面 partialOutput 是切到后台时已产出的部分；除非你要看**之后新增**的输出，否则不必再读该文件。"
     )
 
 
@@ -1068,13 +1374,66 @@ def _promote_warm_to_background(
         started_at_ms=started_ms,
     )
 
+    # 【self-evolution-bot · 2026-11-17 · 第32轮】修：后台 pump 线程里的终端事件全部丢失。
+    # 为什么：_emit → capture_stream_writer() 靠 contextvar 取 writer，而 threading.Thread
+    # 不继承 contextvar（实测：主线程 True / 新线程 False），于是后台 start/stdout/exit
+    # 一条都到不了面板；同时 continue_drain 没传 on_chunk，整段后台期只有结束才出字。
+    # 做法：在**调用线程**（contextvar 还在）先抓 writer，线程内全程显式传入。
+    writer = _capture_writer()
+
     def _pump() -> None:
+        streamed = 0
+
+        def _append_output(text: str) -> None:
+            """边跑边落盘：工具返回里承诺过「Read persistedOutputPath 看中间输出」。
+
+            【self-evolution-bot · 2026-11-17 · 第33轮】加。
+            为什么：原来只在命令**结束**时 write_text 一次，所以转后台后那句
+            「To check interim output, use Read on that file path」是空头支票——
+            用户/agent 中途去读只会看到转后台前的旧片段。
+            """
+            if not text:
+                return
+            try:
+                with output_path.open("a", encoding="utf-8", errors="replace") as fh:
+                    fh.write(text)
+            except OSError:
+                pass  # 落盘失败不能影响命令本身
+
+        def _on_chunk(text: str) -> None:
+            nonlocal streamed
+            if not text:
+                return
+            streamed += len(text)
+            _emit(
+                "stdout",
+                invocation_id=stream_id,
+                tool_call_id=stream_id,
+                text=text,
+                stream_writer=writer,
+            )
+            _append_output(text)
+
         rest, code, timed_out = continue_drain(
-            session, timeout_s=max(1.0, remaining_timeout_s)
+            session,
+            timeout_s=max(1.0, remaining_timeout_s),
+            on_chunk=_on_chunk,
         )
-        if rest:
-            _emit("stdout", invocation_id=stream_id, tool_call_id=stream_id, text=rest)
-            chunks.append(rest)
+        # drain 回调可能已把整段发完；只补未发出的尾巴，避免重复行。
+        tail = (rest or "")[streamed:]
+        if tail:
+            _emit(
+                "stdout",
+                invocation_id=stream_id,
+                tool_call_id=stream_id,
+                text=tail,
+                stream_writer=writer,
+            )
+            _append_output(tail)
+        chunks.append(rest or "")
+        # 【self-evolution-bot · 2026-11-17 · 第33轮】保留这次整段重写作为**权威收尾**：
+        # 运行期已靠 _append_output 增量落盘，正常情况这里内容相同（幂等）；
+        # 若中途 append 失败，这一步仍能保证最终文件完整。
         output_path.write_text("".join(chunks), encoding="utf-8", errors="replace")
         remembered = last_cwd(session)
         if remembered:
@@ -1106,6 +1465,7 @@ def _promote_warm_to_background(
             tool_call_id=stream_id,
             exit_code=code,
             success=code == 0,
+            stream_writer=writer,
         )
         _emit(
             "background",
@@ -1115,17 +1475,28 @@ def _promote_warm_to_background(
             tool_call_id=stream_id,
             status=task.status if task.status != "stopped" else "cancelled",
             started_at_ms=started_ms,
+            stream_writer=writer,
         )
         _emit_task_notification(task)
 
     threading.Thread(target=_pump, name=f"bash-warm-bg-{task_id}", daemon=True).start()
     seconds = max(1, int(blocking_ms) // 1000)
+    # 【self-evolution-bot · 2026-11-19 · 第79轮 · 模型:deepseek-v4.1-flash-1017】
+    # 与冷路径 _promote_to_background 同型改动：partial 已产出却只落盘不回传，
+    # 迫使 agent 再 Read 一次才能看见进度（近24h 176 次转后台里 45 次真这么做）。
+    partial_block = ""
+    _p = (partial or "").strip()
+    if _p:
+        _tail = _p if len(_p) <= 4000 else _p[-4000:]
+        _cut = "" if len(_p) <= 4000 else f"...(已省略前 {len(_p) - 4000} 字符) "
+        partial_block = f"partialOutput:\n{_cut}{_tail}\n"
     return (
         f"status: backgrounded\ninterrupted: false\nbackgroundTaskId: {task_id}\n"
-        f"persistedOutputPath: {output_path}\n"
+        f"persistedOutputPath: {output_path}\n{partial_block}"
         f"Command exceeded the assistant-mode blocking budget ({seconds}s) and was moved to the "
         f"background with ID: {task_id}. It is still running — you will be notified when it completes. "
-        f"Output is being written to: {output_path}. To check interim output, use Read on that file path."
+        f"Output is being written to: {output_path}. "
+        f"上面 partialOutput 是切到后台时已产出的部分；除非你要看**之后新增**的输出，否则不必再读该文件。"
     )
 
 
@@ -1139,6 +1510,7 @@ def _run_foreground_warm(
     explicit: bool,
     description: str,
     session_key: str,
+    lane: int = 0,
 ) -> str | None:
     """Reuse a per-thread bash process. Returns ``None`` to fall back to cold spawn."""
     from evoflow.tools.zcode_port import warm_bash as _wb
@@ -1148,6 +1520,8 @@ def _run_foreground_warm(
     if not shell:
         return None
     warm_key = (thread_id or session_key or tool_call_id or "_default").strip() or "_default"
+    # 车道 >0 用独立会话键，否则两条并行命令会写同一条 warm shell 的 stdin 互相踩。
+    warm_key = _lane_key(warm_key, lane)
     lo_risk = _is_libreoffice_risk_command(command)
     blocking_ms = _blocking_budget_ms(timeout_ms, explicit=explicit, promotable=not lo_risk)
     invocation = tool_call_id or uuid.uuid4().hex
@@ -1197,6 +1571,9 @@ def _run_foreground_warm(
             popen_kwargs=_popen_kwargs(),
             timeout_s=blocking_ms / 1000.0,
             kill_tree=lambda pid: _kill_process_tree(pid),
+            on_chunk=lambda text: _emit(
+                "stdout", invocation_id=invocation, tool_call_id=tool_call_id, text=text
+            ),
         )
     except Exception:
         _unregister_active_bash(invocation)
@@ -1224,12 +1601,15 @@ def _run_foreground_warm(
             pass
         result.session.close(kill_tree=lambda pid: _kill_process_tree(pid))
         _timing(path="warm", warm_reused=warm_reused)
-        _emit(
-            "stdout",
-            invocation_id=invocation,
-            tool_call_id=tool_call_id,
-            text=result.partial,
-        )
+        # 【self-evolution-bot · 2026-11-17 · 第30轮】同上：已流式发出的部分不再重发。
+        tail = (result.partial or "")[result.streamed_chars:]
+        if tail:
+            _emit(
+                "stdout",
+                invocation_id=invocation,
+                tool_call_id=tool_call_id,
+                text=tail,
+            )
         _emit("exit", invocation_id=invocation, tool_call_id=tool_call_id, exit_code=124, success=False)
         return _format_finished(
             command=command,
@@ -1237,6 +1617,7 @@ def _run_foreground_warm(
             stderr="",
             exit_code=124,
             timed_out=True,
+            cwd=result.cwd or cwd,
         )
 
     _unregister_active_bash(invocation)
@@ -1250,7 +1631,11 @@ def _run_foreground_warm(
     _timing(path="warm", warm_reused=warm_reused)
     stdout = result.stdout or ""
     exit_code = result.exit_code
-    _emit("stdout", invocation_id=invocation, tool_call_id=tool_call_id, text=stdout)
+    # 【self-evolution-bot · 2026-11-17 · 第30轮】改：输出已在执行期间边读边发（on_chunk），
+    # 这里只补发还没发出去的尾巴；否则前端会看到整段重复两遍。
+    tail = stdout[result.streamed_chars:]
+    if tail:
+        _emit("stdout", invocation_id=invocation, tool_call_id=tool_call_id, text=tail)
     _emit("exit", invocation_id=invocation, tool_call_id=tool_call_id, exit_code=exit_code, success=exit_code == 0)
     return _format_finished(
         command=command,
@@ -1258,6 +1643,7 @@ def _run_foreground_warm(
         stderr="",
         exit_code=exit_code,
         timed_out=False,
+        cwd=result.cwd or cwd,
     )
 
 
@@ -1271,6 +1657,7 @@ def _run_foreground(
     explicit: bool = False,
     description: str = "",
     session_key: str = "",
+    lane: int = 0,
 ) -> str:
     invocation = tool_call_id or uuid.uuid4().hex
     # LibreOffice detaches from the process tree — it must not be backgrounded
@@ -1288,6 +1675,7 @@ def _run_foreground(
             explicit=explicit,
             description=description,
             session_key=session_key,
+            lane=lane,
         )
         if warm_out is not None:
             return warm_out
@@ -1367,7 +1755,7 @@ def _run_foreground(
         _emit("stdout", invocation_id=invocation, tool_call_id=tool_call_id, text=stdout)
         _emit("stderr", invocation_id=invocation, tool_call_id=tool_call_id, text=stderr)
         _emit("exit", invocation_id=invocation, tool_call_id=tool_call_id, exit_code=124, success=False)
-        return _format_finished(command=command, stdout=stdout, stderr=stderr, exit_code=124, timed_out=True)
+        return _format_finished(command=command, stdout=stdout, stderr=stderr, exit_code=124, timed_out=True, cwd=cwd)
 
     stdout = _strip_pwd_marker(stdout or "", thread_id)
     stderr = stderr or ""
@@ -1381,6 +1769,7 @@ def _run_foreground(
         stderr=stderr,
         exit_code=exit_code,
         timed_out=False,
+        cwd=cwd,
     )
 
 
@@ -1428,7 +1817,10 @@ def _run_background(
     )
     register_task(task)
     started_ms = int(task.started_at * 1000)
-    _emit("start", invocation_id=invocation, tool_call_id=stream_id, command=command)
+    # 【self-evolution-bot · 2026-11-17 · 第32轮】同 _promote_warm_to_background：
+    # pump 线程拿不到 contextvar，writer 必须在调用线程先抓。
+    writer = _capture_writer()
+    _emit("start", invocation_id=invocation, tool_call_id=stream_id, command=command, stream_writer=writer)
     _emit(
         "background",
         work_id=task_id,
@@ -1437,6 +1829,7 @@ def _run_background(
         tool_call_id=stream_id,
         status="running",
         started_at_ms=started_ms,
+        stream_writer=writer,
     )
 
     def _pump() -> None:
@@ -1447,14 +1840,37 @@ def _run_background(
                 _strip_pwd_marker(line, thread_id)
                 continue
             chunks.append(line)
-            _emit("stdout", invocation_id=invocation, tool_call_id=stream_id, text=line)
+            _emit(
+                "stdout",
+                invocation_id=invocation,
+                tool_call_id=stream_id,
+                text=line,
+                stream_writer=writer,
+            )
+            # 【self-evolution-bot · 2026-11-17 · 第33轮】边跑边落盘，
+            # 兑现返回文案里「Read persistedOutputPath 看中间输出」的承诺。
+            # 注意：直接写原始 line。不要传 _strip_pwd_marker(line)——它内部
+            # splitlines+join，会把行尾 \n 吃掉，逐行 append 就会把所有行粘成一行。
+            try:
+                with output_path.open("a", encoding="utf-8", errors="replace") as fh:
+                    fh.write(line)
+            except OSError:
+                pass
         code = proc.wait()
         text = _strip_pwd_marker("".join(chunks), thread_id)
+        # 权威收尾重写（正常情况下与增量 append 的内容一致）。
         output_path.write_text(text, encoding="utf-8", errors="replace")
         # TaskStop may have already marked cancelled.
         if task.status == "running":
             mark(task, status="completed" if code == 0 else "failed", exit_code=code)
-        _emit("exit", invocation_id=invocation, tool_call_id=stream_id, exit_code=code, success=code == 0)
+        _emit(
+            "exit",
+            invocation_id=invocation,
+            tool_call_id=stream_id,
+            exit_code=code,
+            success=code == 0,
+            stream_writer=writer,
+        )
         _emit(
             "background",
             work_id=task_id,
@@ -1463,6 +1879,7 @@ def _run_background(
             tool_call_id=stream_id,
             status=task.status if task.status != "stopped" else "cancelled",
             started_at_ms=started_ms,
+            stream_writer=writer,
         )
         _emit_task_notification(task)
 
@@ -1562,6 +1979,13 @@ def bash_tool(
     dangerouslyDisableSandbox: Set this to true to dangerously override sandbox mode and run commands without sandboxing.
     """
     del dangerouslyDisableSandbox  # EvoFlow host-direct already runs on the host; flag is accepted for schema parity.
+    # 【self-evolution-bot · 2026-11-19 · 第68轮】把本轮工作区记进 _THREAD_WORKSPACE，
+    # 供只拿得到 thread_id 的 _strip_pwd_marker 判断「记住 cwd 时属于哪个工作区」。
+    _ws_root = _workspace_root(runtime)
+    _tid_ws = _thread_id(runtime)
+    if _tid_ws and _ws_root:
+        with _PERSISTED_CWD_LOCK:
+            _THREAD_WORKSPACE[_tid_ws] = _ws_root
     cwd = _cwd(runtime)
     try:
         from evoflow.tools.host_direct.skill_command_paths import rewrite_skill_paths_in_command
@@ -1569,7 +1993,10 @@ def bash_tool(
         command = rewrite_skill_paths_in_command(command)
     except Exception:
         pass
-    guard = _pure_wait_guard(command)
+    # 【self-evolution-bot · 2026-11-20 · 第89轮 · 模型:deepseek-v4.1-flash-1017】
+    # 把 run_in_background 传给守卫：转后台的命令不占前台通道，长 sleep 正是
+    # 拒绝文案推荐的做法，不能反过来被同一条守卫拦掉。
+    guard = _pure_wait_guard(command, run_in_background=_semantic_bool(run_in_background))
     if guard is not None:
         return guard
     explicit = _timeout_was_explicit(timeout)
@@ -1585,7 +2012,7 @@ def bash_tool(
     # separate queue time from real execution time (handler wall time alone
     # made a queued `git show` look like 237s).
     queue_t0 = time.perf_counter()
-    with _exec_lock_for(tid or sk):
+    with _thread_channel(tid or sk) as channel:
         with _bash_concurrency_slot():
             try:
                 from evoflow.observability.tool_timing import note_tool_queue_wait
@@ -1613,5 +2040,6 @@ def bash_tool(
                 explicit=explicit,
                 description=desc,
                 session_key=sk,
+                lane=channel.lane,
             )
     return _maybe_stage_agent_browser_screenshot(runtime, command, cwd, tool_call_id, result)

@@ -150,6 +150,12 @@ export type OpenRightStageCodeViewerOpts = {
   threadId?: string | null
   /** 默认 half：侧栏可读，不把对话挤没。 */
   layout?: RightStageLayout
+  /**
+   * 【self-evolution-bot · 2026-11-23 · 第128轮 · 模型:deepseek-v4.1-flash】
+   * 「谁打开的」：只有**用户亲手点**的入口传 `'user'`；模型/自动链路一律不传，
+   * 由 store 兜底成 `session:<归属会话>`。缺省不猜 user，避免把自动开谎报成用户行为。
+   */
+  openedBy?: string
 }
 
 /** 音视频：与文件树 createCodeViewerSourceForWorkspaceFile 同构，走流式 serve-file。 */
@@ -233,6 +239,9 @@ export function showRightStageCodeViewer(
     title: source.title || basename(pathOrTitle) || '代码对比',
     layout: opts?.layout || 'half',
     sessionKey: String(opts?.sessionKey || '').trim() || undefined,
+    // 【self-evolution-bot · 2026-11-23 · 第128轮 · 模型:deepseek-v4.1-flash】
+    // 透传「谁打开的」：只有用户亲手点的入口会带 'user'，其余由 store 兜底成会话归属。
+    openedBy: opts?.openedBy,
     forceExpand: true,
     data: {
       // 原样透传，PreviewPane 需要完整联合成员字段（patch / media 等）
@@ -321,12 +330,50 @@ export type OpenRightStageFilePreviewOpts = {
   focusEndLine?: number
   focusAnnotation?: { title?: string; body?: string; priority?: number } | null
   layout?: RightStageLayout
+  /** 「谁打开的」：仅用户亲手点开的入口传 'user'；自动链路不传（store 兜底成会话归属）。 */
+  openedBy?: string
+}
+
+/**
+ * 打开后若路径 404（相对 cite 拼到错误会话根），异步 heal 到 sibling skill 树
+ * 并换正确 workspaceRoot 重开，避免「file not found: …/infinite-canvas/projects/…」死签。
+ */
+function scheduleHealAndReopenFilePreview(
+  openedPath: string,
+  opts?: OpenRightStageFilePreviewOpts,
+): void {
+  const initialRoot =
+    String(opts?.workspaceRoot || '').trim() || String(getChatWorkspaceRoot() || '').trim()
+  if (!openedPath || !initialRoot) return
+  void (async () => {
+    try {
+      const { healWorkspaceOpenPath, inferWorkspaceRootFromHealedPath } = await import(
+        './heal-workspace-open-path.js'
+      )
+      const healed = await healWorkspaceOpenPath(openedPath, {
+        workspaceRoot: initialRoot,
+        threadId: opts?.threadId,
+      })
+      const healedNorm = normalizePathId(healed || '')
+      if (!healedNorm || healedNorm === normalizePathId(openedPath)) return
+      const nextRoot =
+        inferWorkspaceRootFromHealedPath(healedNorm, initialRoot) || initialRoot
+      showRightStageFilePreview(healedNorm, {
+        ...opts,
+        name: String(opts?.name || '').trim() || basename(healedNorm),
+        workspaceRoot: nextRoot,
+        _skipHealReopen: true,
+      })
+    } catch {
+      /* keep first open */
+    }
+  })()
 }
 
 /** 工作区文件路径 → 右栏 file 标签（WorkspaceFilePreviewPanel）。音视频改走 media。 */
 export function showRightStageFilePreview(
   path: string,
-  opts?: OpenRightStageFilePreviewOpts,
+  opts?: OpenRightStageFilePreviewOpts & { _skipHealReopen?: boolean },
 ): string {
   // 修复被剥掉盘符的 Windows 绝对路径，并把半路径（projects\\…\\x.mp4）
   // 拼到会话 / 员工绑定的 workspace 根上，否则右栏读文件失败或对话里点不开。
@@ -343,11 +390,16 @@ export function showRightStageFilePreview(
     workspacePath: workspaceRoot,
   })
   if (mediaSource) {
-    return showRightStageCodeViewer(mediaSource, {
+    const key = showRightStageCodeViewer(mediaSource, {
       sessionKey: opts?.sessionKey,
       threadId: opts?.threadId,
       layout: opts?.layout,
+      openedBy: opts?.openedBy,
     })
+    if (!opts?._skipHealReopen) {
+      scheduleHealAndReopenFilePreview(id, opts)
+    }
+    return key
   }
   const key = `file:${id}`
   const sessionKey = String(opts?.sessionKey || '').trim() || undefined
@@ -366,6 +418,8 @@ export function showRightStageFilePreview(
     title: name,
     layout,
     sessionKey,
+    // 透传「谁打开的」：只有用户亲手点的入口带 'user'，其余由 store 兜底成会话归属。
+    openedBy: opts?.openedBy,
     forceExpand: true,
     data: {
       path: id,
@@ -400,6 +454,9 @@ export function showRightStageFilePreview(
       uiSessionKey: uiSk,
     })
   }
+  if (!opts?._skipHealReopen) {
+    scheduleHealAndReopenFilePreview(id, opts)
+  }
   return key
 }
 
@@ -409,18 +466,37 @@ export type OpenRightStageWorkspaceBrowseOpts = {
   focusPath?: string | null
   workspaceRoot?: string | null
   title?: string | null
+  /** 「谁打开的」：仅用户亲手点开的入口传 'user'；自动链路不传（store 兜底成会话归属）。 */
+  openedBy?: string
 }
 
 /** 右栏「工作区文件」树；可带 focusPath 展开到对话里点的那一层目录。 */
 export function showRightStageWorkspaceBrowse(
   opts?: OpenRightStageWorkspaceBrowseOpts,
 ): string {
-  const workspaceRoot =
+  let workspaceRoot =
     String(opts?.workspaceRoot || '').trim() || String(getChatWorkspaceRoot() || '').trim() || undefined
   const focusRaw = String(opts?.focusPath || '').trim()
   const focusPath = focusRaw
     ? normalizePathId(resolveWorkspaceRelativeHostPath(focusRaw, workspaceRoot || ''))
     : ''
+  // focus 落在会话根外（heal 到 sibling skill / 面包屑点绝对目录）时，抬根到
+  // ``…/<skill>``（projects/ 前一段），否则文件树仍挂在错误叶子根上展不开。
+  if (focusPath && isAbsoluteHostPath(focusPath)) {
+    const rootNorm = normalizePathId(workspaceRoot || '').replace(/\/+$/, '')
+    const underRoot =
+      !!rootNorm &&
+      (focusPath === rootNorm || focusPath.startsWith(`${rootNorm}/`))
+    if (!underRoot) {
+      const projectsIdx = focusPath.toLowerCase().lastIndexOf('/projects/')
+      if (projectsIdx > 0) {
+        workspaceRoot = focusPath.slice(0, projectsIdx)
+      } else {
+        const parent = focusPath.replace(/\/+$/, '').replace(/\/[^/]+$/, '')
+        if (parent && isAbsoluteHostPath(parent)) workspaceRoot = parent
+      }
+    }
+  }
   const id = focusPath ? `focus:${focusPath}` : 'root'
   const key = `workspace-browse:${id}`
   const title =
@@ -437,6 +513,9 @@ export function showRightStageWorkspaceBrowse(
     title,
     layout: 'workspace-browse',
     sessionKey: String(opts?.sessionKey || '').trim() || undefined,
+    // 【self-evolution-bot · 2026-11-23 · 第128轮 · 模型:deepseek-v4.1-flash】
+    // 透传「谁打开的」：只有用户亲手点的入口会带 'user'，其余由 store 兜底成会话归属。
+    openedBy: opts?.openedBy,
     forceExpand: true,
     data: {
       ...(workspaceRoot ? { workspaceRoot } : {}),
@@ -452,6 +531,8 @@ export type OpenRightStageAssetPreviewOpts = {
   entityId?: string | null
   name?: string | null
   layout?: RightStageLayout
+  /** 「谁打开的」：仅用户亲手点开的入口传 'user'；自动链路不传（store 兜底成会话归属）。 */
+  openedBy?: string
 }
 
 /**
@@ -484,6 +565,9 @@ export function showRightStageAssetPreview(
     id,
     title: name,
     layout,
+    // 【self-evolution-bot · 2026-11-23 · 第128轮 · 模型:deepseek-v4.1-flash】
+    // 透传「谁打开的」：只有用户亲手点的入口会带 'user'，其余由 store 兜底成会话归属。
+    openedBy: opts?.openedBy,
     forceExpand: true,
     sessionKey,
     data: {
@@ -584,7 +668,8 @@ export function showRightStageFromFileLink(
     })()
     return key
   }
-  const fileKey = showRightStageFilePreview(path, {
+  // showRightStageFilePreview 内已 schedule heal（含 sibling projects/ 纠偏）
+  return showRightStageFilePreview(path, {
     name: String(target.label || '').trim() || basename(path),
     sessionKey: opts?.sessionKey,
     threadId: opts?.threadId,
@@ -592,24 +677,4 @@ export function showRightStageFromFileLink(
     // 对话 Markdown 路径 pill 带上 workspace，预览读文件才能带 root=…
     workspaceRoot,
   })
-  void (async () => {
-    try {
-      const { healWorkspaceOpenPath } = await import('./heal-workspace-open-path.js')
-      const healed = await healWorkspaceOpenPath(path, {
-        workspaceRoot,
-        threadId: opts?.threadId,
-      })
-      if (!healed || normalizePathId(healed) === normalizePathId(path)) return
-      showRightStageFilePreview(healed, {
-        name: String(target.label || '').trim() || basename(healed),
-        sessionKey: opts?.sessionKey,
-        threadId: opts?.threadId,
-        layout: opts?.layout,
-        workspaceRoot,
-      })
-    } catch {
-      /* keep first open */
-    }
-  })()
-  return fileKey
 }

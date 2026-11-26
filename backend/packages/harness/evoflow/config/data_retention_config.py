@@ -11,22 +11,59 @@ class DataRetentionConfig(BaseModel):
     logs_days: int = Field(default=14, ge=1, le=365, description="Gateway daily log file retention (ZCode-aligned)")
     observability_days: int = Field(default=90, ge=1, le=3650, description="evoflow_obs_* row retention")
     gateway_requests_days: int = Field(
-        default=7,
+        default=3,
         ge=1,
         le=3650,
-        description=("Shorter retention for evoflow_obs_gateway_requests (high-volume HTTP access log). Falls back to observability_days when unset in legacy configs."),
+        description=(
+            "Shorter retention for evoflow_obs_gateway_requests (high-volume HTTP access log; "
+            "desktop can write 100k+/day). Falls back to observability_days when unset in legacy configs."
+        ),
     )
     observability_max_size_gb: float = Field(
         default=2.0,
         ge=0.25,
         le=100.0,
-        description=("When observability.db (+ WAL) exceeds this size, strip heavy JSON columns, delete oldest gateway/trace/model rows, then VACUUM until under the cap."),
+        description=(
+            "When observability.db (+ WAL) exceeds this size — or freelist bloat is large — "
+            "strip heavy JSON, delete oldest gateway/trace/model rows (respecting day floors), "
+            "then VACUUM INTO to reclaim disk."
+        ),
     )
     observability_model_json_limit_bytes: int = Field(
         default=32 * 1024,
         ge=1024,
         le=512 * 1024,
         description="Max stored bytes per model invocation request/response JSON",
+    )
+    usage_events_days: int = Field(
+        default=14,
+        ge=7,
+        le=3650,
+        description=(
+            "Delete evoflow_usage_events older than this many days "
+            "(meta_json can be multi-MB/row; desktop default profile grew to ~1GB+)."
+        ),
+    )
+    usage_meta_json_limit_bytes: int = Field(
+        default=16 * 1024,
+        ge=1024,
+        le=512 * 1024,
+        description="Truncate evoflow_usage_events.meta_json above this size (keeps ledger totals)",
+    )
+    v4_event_log_days: int = Field(
+        default=14,
+        ge=3,
+        le=365,
+        description="Delete evoflow_v4_event_log rows older than this (writer also prunes on interval)",
+    )
+    right_stage_trail_days: int = Field(
+        default=2,
+        ge=1,
+        le=30,
+        description=(
+            "Delete evoflow_right_stage_trail rows older than this many days "
+            "(default 2 = keep today+yesterday, purge day-before-yesterday)"
+        ),
     )
     task_stream_days: int = Field(
         default=90,

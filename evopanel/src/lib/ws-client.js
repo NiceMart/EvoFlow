@@ -56,6 +56,8 @@ import {
   openAiMetaToStreamTurnEvents,
 } from '../react/lib/openai-stream-turn.ts'
 import { logStreamCompareSseRecv, markStreamCompareSession, markStreamCompareRun } from '../react/lib/stream-compare-file-log.ts'
+import { pushViewportStreamAguiTap } from '../react/v4/v4-viewport-stream-tap.ts'
+import { pushViewportApiTap } from '../react/v4/v4-viewport-api-tap.ts'
 import { transportLog, transportRawLog, isTransportLogEnabled } from './transport-log-gate.js'
 import { streamPerfMark } from '../react/lib/stream-perf-trace.ts'
 
@@ -93,6 +95,16 @@ function dispatchAgUiWireFrame(self, key, runId, data, lane) {
     data,
     wire: 'agui',
   })
+  try {
+    pushViewportStreamAguiTap({
+      channel: 'agui',
+      sessionKey: key,
+      runId,
+      data,
+    })
+  } catch {
+    /* overlay tap only */
+  }
 
   if (t === 'TEXT_MESSAGE_CONTENT') {
     const delta = typeof data.delta === 'string' ? data.delta : ''
@@ -787,9 +799,57 @@ export async function evoflowInvokeGatewayJson(url, options = {}) {
 
 /** Tauri: JSON via gatewayProxy/pipe. Browser: relative fetch. */
 export async function evoflowFetch(url, options = {}) {
+  // 浏览器相对路径：原生 fetch 不经 fetchJson，这里单独打点页面相关接口。
   if (!isEvoflowTauri() || !String(url || '').startsWith('/')) {
-    return fetch(url, options)
+    const started = Date.now()
+    const method = String(options?.method || 'GET').toUpperCase()
+    try {
+      const resp = await fetch(url, options)
+      // clone 再读 body，避免消耗调用方后续 json()/text()
+      let responseBody = null
+      try {
+        const ct = String(resp.headers?.get?.('content-type') || '')
+        if (ct.includes('application/json') || ct.includes('+json')) {
+          responseBody = await resp.clone().json()
+        } else {
+          const t = await resp.clone().text()
+          responseBody = t.length > 4000 ? `${t.slice(0, 4000)}…` : t
+        }
+      } catch {
+        responseBody = null
+      }
+      try {
+        pushViewportApiTap({
+          method,
+          url: String(url || ''),
+          requestBody: options?.body,
+          status: resp.status,
+          ok: resp.ok,
+          durationMs: Date.now() - started,
+          response: responseBody,
+        })
+      } catch {
+        /* overlay only */
+      }
+      return resp
+    } catch (e) {
+      try {
+        pushViewportApiTap({
+          method,
+          url: String(url || ''),
+          requestBody: options?.body,
+          status: 0,
+          ok: false,
+          durationMs: Date.now() - started,
+          error: e,
+        })
+      } catch {
+        /* overlay only */
+      }
+      throw e
+    }
   }
+  // Tauri：走 fetchJson（内部已 pushViewportApiTap），避免双记。
   try {
     const data = await fetchJson(url, options)
     const text = data == null ? '' : typeof data === 'string' ? data : JSON.stringify(data)
@@ -853,6 +913,8 @@ function _markGlobalRunCancelUnsupported() {
 }
 
 const EVOFLOW_STREAM_EOF = '__DF_EOF__'
+/** Rust gateway_proxy_stream 在 body 前塞的 remint 头信封（见 gateway.rs STREAM_HDRS_PREFIX）。 */
+const EVOFLOW_STREAM_HDRS_PREFIX = '__DF_HDRS__'
 
 /**
  * Desktop chat stream via Rust ``gateway_proxy_stream`` (reqwest → Gateway SSE bytes).
@@ -862,6 +924,9 @@ const EVOFLOW_STREAM_EOF = '__DF_EOF__'
  * LangGraph restart 404 (``Thread or assistant not found``) must reject here so
  * ``chatSend``'s streamAttempt can force-recreate the thread — pushing the error into
  * ``ReadableStream`` mid-read used to bypass that recovery.
+ *
+ * Remint：成功响应上的 ``x-evoflow-*-thread-id`` 经 ``__DF_HDRS__`` 首包传到
+ * ``resp.headers``，供 chatSend 触发 V4 rebind（Channel 本身不带 HTTP 头）。
  */
 async function gatewayProxyFetchStream(url, options = {}) {
   const { invoke, Channel } = await import('@tauri-apps/api/core')
@@ -881,6 +946,8 @@ async function gatewayProxyFetchStream(url, options = {}) {
     resolveConnect = resolve
     rejectConnect = reject
   })
+  /** @type {Record<string, string>} */
+  const remintHeaderMap = {}
 
   const markConnectOk = () => {
     if (connectSettled) return
@@ -895,13 +962,19 @@ async function gatewayProxyFetchStream(url, options = {}) {
   const toStreamError = (err) =>
     err instanceof Error ? err : new Error(String(err || 'gateway_proxy_stream failed'))
 
-  // 预计算 EOF / PING 哨兵的字节序列，避免 onmessage 每次 TextDecoder 解码对比
+  // 预计算 EOF / PING / HDRS 哨兵的字节序列，避免 onmessage 每次 TextDecoder 解码对比
   const EOF_BYTES = new TextEncoder().encode(EVOFLOW_STREAM_EOF)
   const PING_BYTES = new TextEncoder().encode('__DF_PING__')
+  const HDRS_PREFIX_BYTES = new TextEncoder().encode(EVOFLOW_STREAM_HDRS_PREFIX)
   /** 快速匹配：bytes 长度等且逐字节等 */
   const bytesEqual = (a, b) => {
     if (a.length !== b.length) return false
     for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false
+    return true
+  }
+  const bytesStartsWith = (a, prefix) => {
+    if (a.length < prefix.length) return false
+    for (let i = 0; i < prefix.length; i++) if (a[i] !== prefix[i]) return false
     return true
   }
 
@@ -917,8 +990,6 @@ async function gatewayProxyFetchStream(url, options = {}) {
   onChunk.onmessage = (payload) => {
     streamPerfMark('ws:recv')
     if (finished || !controller) return
-    // First chunk or EOF ⇒ HTTP connect succeeded (Rust only sends after 2xx).
-    markConnectOk()
     // payload 现在是 Uint8Array (Rust Channel<Vec<u8>> 序列化为 array → JS 端是 number[] 或 Uint8Array)
     // 兼容 Tauri 2.x 的不同序列化方式：number[] / Uint8Array / ArrayBuffer
     let bytes
@@ -941,6 +1012,27 @@ async function gatewayProxyFetchStream(url, options = {}) {
     } else {
       return
     }
+    // Remint 头信封：不进 body，但算 connect 成功（Rust 仅在 2xx 后发）。
+    if (bytesStartsWith(bytes, HDRS_PREFIX_BYTES)) {
+      try {
+        const jsonText = new TextDecoder().decode(bytes.subarray(HDRS_PREFIX_BYTES.length))
+        const parsed = JSON.parse(jsonText)
+        const hdrs = parsed?.headers
+        if (hdrs && typeof hdrs === 'object') {
+          for (const [k, v] of Object.entries(hdrs)) {
+            const key = String(k || '').trim().toLowerCase()
+            const val = String(v || '').trim()
+            if (key && val) remintHeaderMap[key] = val
+          }
+        }
+      } catch {
+        /* ignore malformed meta */
+      }
+      markConnectOk()
+      return
+    }
+    // First body chunk or EOF ⇒ HTTP connect succeeded (Rust only sends after 2xx).
+    markConnectOk()
     if (bytesEqual(bytes, EOF_BYTES)) {
       finished = true
       try {
@@ -1051,6 +1143,8 @@ async function gatewayProxyFetchStream(url, options = {}) {
     ok: true,
     status: 200,
     body: readable,
+    // Headers-like：chatSend 用 .get('x-evoflow-new-thread-id') 做 V4 remint rebind
+    headers: new Headers(remintHeaderMap),
     structured: false,
   }
 }
@@ -2513,6 +2607,20 @@ async function createThreadRobust(sessionKey) {
 }
 
 async function fetchJson(url, options = {}) {
+  const started = Date.now()
+  const method = String(options.method || 'GET').toUpperCase()
+  let requestBody = null
+  if (options.body != null && options.body !== '') {
+    if (typeof options.body === 'string') {
+      try {
+        requestBody = JSON.parse(options.body)
+      } catch {
+        requestBody = options.body
+      }
+    } else {
+      requestBody = options.body
+    }
+  }
   // Desktop: never WebView-fetch Gateway directly — go gatewayProxy (pipe when warm).
   if (isEvoflowTauri() && url.startsWith('/')) {
     const { gatewayProxy } = await import('./tauri-api.js')
@@ -2528,56 +2636,118 @@ async function fetchJson(url, options = {}) {
         query[k] = v
       })
     }
-    const method = String(options.method || 'GET').toUpperCase()
-    let body = null
-    if (options.body != null && options.body !== '') {
-      if (typeof options.body === 'string') {
-        try {
-          body = JSON.parse(options.body)
-        } catch {
-          body = options.body
-        }
-      } else {
-        body = options.body
-      }
-    }
     try {
       /** @type {Record<string, unknown>} */
       const proxyOpts = {}
       if (options.preferGatewayHttp) proxyOpts.preferGatewayHttp = true
       if (options.silent) proxyOpts.silent = true
       if (options.timeoutMs != null) proxyOpts.timeoutMs = options.timeoutMs
-      return await gatewayProxy(
+      const data = await gatewayProxy(
         method,
         pathPart,
-        body,
+        requestBody,
         query,
         Object.keys(proxyOpts).length ? proxyOpts : null,
       )
+      try {
+        pushViewportApiTap({
+          method,
+          url: String(url || ''),
+          requestBody,
+          status: 200,
+          ok: true,
+          durationMs: Date.now() - started,
+          response: data,
+        })
+      } catch {
+        /* overlay only */
+      }
+      return data
     } catch (e) {
       const err = e instanceof Error ? e : new Error(String(e?.message || e))
       if (e?.status != null) err.status = e.status
       err.url = url
       err.body = e?.gatewayResult ?? e?.body
+      try {
+        pushViewportApiTap({
+          method,
+          url: String(url || ''),
+          requestBody,
+          status: Number(err.status) || 0,
+          ok: false,
+          durationMs: Date.now() - started,
+          response: err.body,
+          error: err,
+        })
+      } catch {
+        /* overlay only */
+      }
       throw err
     }
   }
   // Browser/Vite: must attach WebUI JWT too. Without it, localhost Gateway
   // treats the caller as local-admin and new sessions are stamped to admin
   // while /api/identity/me (via gatewayProxy) still shows user1.
-  const resp = await fetch(url, { ...options, headers: _authHeaders(options) })
-  const text = await resp.text().catch(() => '')
-  const data = text ? safeParseJSON(text, null) : null
-  if (!resp.ok) {
-    const msg = data?.detail || data?.error || data?.message || `HTTP ${resp.status}`
-    const err = new Error(msg)
-    // Attach useful diagnostics for callers (e.g. clear stale threadId on 404).
-    err.status = resp.status
-    err.url = url
-    err.body = data
-    throw err
+  try {
+    const resp = await fetch(url, { ...options, headers: _authHeaders(options) })
+    const text = await resp.text().catch(() => '')
+    const data = text ? safeParseJSON(text, null) : null
+    if (!resp.ok) {
+      const msg = data?.detail || data?.error || data?.message || `HTTP ${resp.status}`
+      const err = new Error(msg)
+      // Attach useful diagnostics for callers (e.g. clear stale threadId on 404).
+      err.status = resp.status
+      err.url = url
+      err.body = data
+      try {
+        pushViewportApiTap({
+          method,
+          url: String(url || ''),
+          requestBody,
+          status: resp.status,
+          ok: false,
+          durationMs: Date.now() - started,
+          response: data,
+          error: err,
+        })
+      } catch {
+        /* overlay only */
+      }
+      throw err
+    }
+    try {
+      pushViewportApiTap({
+        method,
+        url: String(url || ''),
+        requestBody,
+        status: resp.status,
+        ok: true,
+        durationMs: Date.now() - started,
+        response: data,
+      })
+    } catch {
+      /* overlay only */
+    }
+    return data
+  } catch (e) {
+    // 网络层失败（尚未有 HTTP status）也记一笔，便于对照「接口没回来」。
+    if (e?.status == null && e?.url == null) {
+      try {
+        pushViewportApiTap({
+          method,
+          url: String(url || ''),
+          requestBody,
+          status: 0,
+          ok: false,
+          durationMs: Date.now() - started,
+          error: e,
+        })
+      } catch {
+        /* overlay only */
+      }
+    }
+    throw e
   }
-  return data
 }
 
 function isLangGraphThreadOrAssistantMissing(err) {
@@ -5080,7 +5250,21 @@ function dispatchLangGraphCustomStreamChunk(self, key, runId, chunk) {
       applyRightStageAgUiCustom(
         t,
         t === 'right_stage'
-          ? { action: chunk.action, surface: chunk.surface }
+          ? {
+              action: chunk.action,
+              surface: chunk.surface,
+              // 【self-evolution-bot · 2026-11-21 · 第102轮 · 模型:deepseek-v4.1-flash-1017】
+              // 改了什么：实时 custom 流这一层补透传 key / target。
+              // 为什么（重启后真机实测）：后端 agui_stream_normalizer 已透传 key，
+              //   日志能看到 `[py] emit sent action=activate ... "key":"employeeProcess:..."`，
+              //   但前端 `[web-state]` 一行都不回，activeKey 仍停在 /tasks。
+              //   抓 bundle 发现 `applyRightStageAgUiCustom(t,{action,surface})` —— 这是同一类
+              //   「只搬 action+surface 就丢载荷」缺陷的**第三处**（后端 normalizer、
+              //   right-stage-agui.ts 各一处，此处是上游分发层）。activate/close/move
+              //   天然 surface=null，key 是唯一载荷，漏掉就等于静默丢弃。
+              ...(String(chunk.key || '').trim() ? { key: String(chunk.key).trim() } : {}),
+              ...(String(chunk.target || '').trim() ? { target: String(chunk.target).trim() } : {}),
+            }
           : {
               action: chunk.action,
               streamId: chunk.streamId || chunk.stream_id,
@@ -6909,36 +7093,51 @@ export class WsClient {
     const sessionModelName =
       (sessionContext.model_name || sessionContext.primary_model_name || '').toString().trim() || null
     // Mid-turn ↑ inject already wrote the user row; skip to avoid duplicate transcript.
-    // Non-blocking: do not await before POST runs/stream (TTFT). Hydration may merge the
-    // single in-flight HumanMessage if the row is not in DB yet — history always comes
-    // from evoflow_chat_messages, never from replaying the LangGraph checkpoint.
+    // 【self-evolution-bot · 2026-11-22 · 第118轮 · 模型:deepseek-v4.1-flash-1017】
+    // 改了什么：user 行落库由 `void append(...)`（不等）改为 `await withTimeout(..., 2500, null)`，
+    //   即**先落 user 行、再发 POST runs/stream**；超时/失败仍照旧吞掉继续发送。
+    // 为什么（本轮现网实证，13 对 seq 倒挂）：`_next_seq` 是 `SELECT MAX(seq)+1`
+    //   （chat_message_repositories.py:84，docstring 自认跨事务不安全），user 行由本函数
+    //   fire-and-forget 写入、assistant 行由后端轮末写入，两个独立事务。只要 user 行写入
+    //   晚于 assistant 行，它就拿更大的 seq —— 读取端 `ORDER BY seq`，刷新后**答案渲染在
+    //   提问之上**。实测样本（thread_id + seq）：image-designer seq23 assistant
+    //   07:56:37.770 / seq24 user 07:56:38.139（turn_started_at=07:56:34.287，即用户 07:56:34
+    //   就发了，行却晚 4 秒才落）；document-author seq22 assistant 07:54:42.075 / seq23 user
+    //   07:54:43.039（turn_started_at=07:54:40.158）；同一晚共 13 对命中该模式。
+    // 边界：正常本地写入 ~10–50ms，2500ms 上限只兜住网关抖动；超时即退回原「不等」语义，
+    //   顺序可能仍旧错乱但**不影响发送**——可用性优先。history 仍以 evoflow_chat_messages 为准。
     // Stable id shared by transcript append + LangGraph input (avoids LG-auto id mismatch).
     const userMsgId =
       String(opts?.messageId || '').trim() ||
       `user-${typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`}`
     if (!opts?.skipTranscriptAppend) {
-      void appendSessionTranscriptMessage(
-        key,
-        userBlocksToFlatTranscriptRow(blocks, userMsgId, {
-          runId,
-          modelName: sessionModelName,
-          contextFiles: Array.isArray(contextFiles)
-            ? contextFiles
-                .map((f) => ({
-                  path: String(f.path || '').trim(),
-                  name: String(f.name || '').trim() || String(f.path || '').trim(),
-                }))
-                .filter((f) => f.path)
-            : undefined,
+      // 见上：先落 user 行（有界等待 2.5s）再发流，压掉 seq 倒挂；失败/超时照旧继续发送。
+      await withTimeout(
+        appendSessionTranscriptMessage(
+          key,
+          userBlocksToFlatTranscriptRow(blocks, userMsgId, {
+            runId,
+            modelName: sessionModelName,
+            contextFiles: Array.isArray(contextFiles)
+              ? contextFiles
+                  .map((f) => ({
+                    path: String(f.path || '').trim(),
+                    name: String(f.name || '').trim() || String(f.path || '').trim(),
+                  }))
+                  .filter((f) => f.path)
+              : undefined,
+          }),
+          {
+            runId,
+            threadId,
+          },
+        ).catch((e) => {
+          // Gateway 冷启动 / DB 短暂锁：已重试；流式仍会继续，hydration merge / TranscriptMiddleware 会兜底
+          console.debug('[evoflow] append user transcript deferred', e)
         }),
-        {
-          runId,
-          threadId,
-        },
-      ).catch((e) => {
-        // Gateway 冷启动 / DB 短暂锁：已重试；流式仍会继续，hydration merge / TranscriptMiddleware 会兜底
-        console.debug('[evoflow] append user transcript deferred', e)
-      })
+        2500,
+        null,
+      )
     }
     const userMessage = {
       role: 'user',
@@ -7150,6 +7349,7 @@ export class WsClient {
                   sessionKey: key,
                   oldThreadId: oldTid,
                   threadId: newTid,
+                  via: 'resp.headers',
                 })
               }
             }

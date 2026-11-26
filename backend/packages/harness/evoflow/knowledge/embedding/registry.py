@@ -32,6 +32,7 @@ from evoflow.config.model_config import ModelConfig
 from evoflow.knowledge.embedding.base import (
     DEFAULT_EMBEDDING_DIM,
     DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_LOCAL_MODEL,
     MAX_BATCH_SIZE,
     EmbeddingDimensionError,
     EmbeddingError,
@@ -67,6 +68,46 @@ def get_embedding_config() -> ModelConfig:
     except Exception:
         models = []
 
+    # 【self-evolution-bot · 2026-11-16 · 第26轮】先看「设置里指定的默认向量模型」。
+    # 为什么：原来这里只按「名字里含 embedding」扫第一个命中项，用户把默认向量模型
+    # 改成别的（比如换本地 bge）之后，这个函数**完全不看那个设置**——
+    # 设了也白设，实际仍在用第一个含 embedding 的云端模型。
+    # 现在顺序是：显式默认设置 → 名字/厂商匹配 → 兜底。
+    # 延迟 import 避免 registry ←→ owned.settings 的循环依赖
+    # （owned.settings 只依赖 config_repositories，不依赖本模块）。
+    try:
+        from evoflow.knowledge.owned import settings as owned_settings
+
+        default_ref = owned_settings.get_default_embedding_model()
+    except Exception:
+        default_ref = ""
+    # Prefer shared owned-KB default resolver (seed bge-small-zh when bundled).
+    if not default_ref:
+        try:
+            from evoflow.knowledge.owned.embedding_bind import default_embedding_ref
+
+            default_ref = default_embedding_ref()
+        except Exception:
+            default_ref = ""
+    if default_ref:
+        for m in models:
+            name = str(getattr(m, "name", "") or "").strip()
+            model_id = str(getattr(m, "model", "") or "").strip()
+            display = str(getattr(m, "display_name", "") or "").strip()
+            if default_ref in (name, model_id, display):
+                logger.debug("Using default embedding model from settings: %s", name or model_id)
+                return m
+        # Settings/registry name may lag seed — synthesize local config for code index.
+        if default_ref in ("bge-small-zh", DEFAULT_LOCAL_MODEL) or "bge-small-zh" in default_ref.lower():
+            return ModelConfig(
+                name="bge-small-zh",
+                model=DEFAULT_LOCAL_MODEL,
+                vendor="local",
+                base_url="",
+                api_key="",
+                use="",
+            )
+
     for m in models:
         name_lower = (getattr(m, "name", "") or "").lower()
         model_lower = (getattr(m, "model", "") or "").lower()
@@ -77,6 +118,23 @@ def get_embedding_config() -> ModelConfig:
         if "embedding" in name_lower or "embedding" in model_lower or vendor_lower == "local":
             logger.debug("Using embedding model config: %s", m.name)
             return m
+
+    # Bundled offline default before cloud fallback.
+    try:
+        from evoflow.knowledge.embedding.bundled import bundled_local_model_available
+        from evoflow.knowledge.embedding.local_provider import local_embedding_deps_available
+
+        if bundled_local_model_available() and local_embedding_deps_available():
+            return ModelConfig(
+                name="bge-small-zh",
+                model=DEFAULT_LOCAL_MODEL,
+                vendor="local",
+                base_url="",
+                api_key="",
+                use="",
+            )
+    except Exception:
+        logger.debug("bundled local embedding default skipped", exc_info=True)
 
     logger.warning(
         "No embedding model found in config. Using default '%s' (dim=%d). Configure an embedding model in Settings → Models for best results.",
@@ -292,41 +350,12 @@ async def get_embeddings(
 # Known model → dimension map for fast (non-probing) resolution.
 # Add entries here when you introduce new local/embedding models so that
 # knowledge-base creation can pick the right dimension without a live call.
-_KNOWN_DIMS: dict[str, int] = {
-    # Cloud (OpenAI-compatible)
-    "text-embedding-3-small": 1536,
-    "text-embedding-3-large": 3072,
-    "text-embedding-ada-002": 1536,
-    # Local (sentence-transformers / BGE)
-    "baai/bge-small-zh-v1.5": 512,
-    "baai/bge-base-zh-v1.5": 768,
-    "baai/bge-large-zh-v1.5": 1024,
-    "baai/bge-m3": 1024,
-    "baai/bge-small-en-v1.5": 384,
-    "bge-small-zh-v1.5": 512,
-    "bge-base-zh-v1.5": 768,
-    "bge-large-zh-v1.5": 1024,
-    "bge-m3": 1024,
-    "bge-small-en-v1.5": 384,
-    "sentence-transformers/all-minilm-l6-v2": 384,
-    "sentence-transformers/paraphrase-multilingual-minilm-l12-v2": 384,
-    "intfloat/multilingual-e5-small": 384,
-    "thenlper/gte-small": 384,
-    "shibing624/text2vec-base-chinese": 768,
-    "nomic-ai/nomic-embed-text-v1.5": 768,
-}
-
-
-def known_embedding_dim(model_id: str) -> int | None:
-    """Return the vector dimension for a known model id, or ``None`` if unknown.
-
-    Lookups are case-insensitive so ``BAAI/bge-small-zh-v1.5`` and
-    ``baai/bge-small-zh-v1.5`` both match.
-    """
-    if not model_id:
-        return None
-    key = model_id.strip().lower()
-    return _KNOWN_DIMS.get(key)
+# 【self-evolution-bot · 2026-11-17 · 第33轮】维度表与查询函数已拆到轻量叶子模块
+# ``dims.py``：本模块在模块级 import base/local_provider，实测首次 import
+# 2426 个模块 / 4340ms（transformers+numpy+PIL），而 known_embedding_dim 只是查字典。
+# code_index 每次检索都会走到它，于是「打开索引库」被拖慢 3~4 秒。
+# 这里 re-export，既有 import 路径（registry.known_embedding_dim）保持不变。
+from evoflow.knowledge.embedding.dims import _KNOWN_DIMS, known_embedding_dim  # noqa: E402,F401
 
 
 async def detect_embedding_dim(

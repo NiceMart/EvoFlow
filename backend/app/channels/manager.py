@@ -2993,7 +2993,10 @@ class ChannelManager:
             pretty = _default_channel_session_title(msg, agent_name=agent_code)
             from evoflow.persistence import session_repositories as sess_repo
 
-            existing = (sess_repo.load_session_map().get(session_key) or {}) if session_key else {}
+            # 【self-evolution-bot · 2026-11-18 · 第52轮 · 模型:deepseek-v4.1-flash-1017】
+            # 只取 title 一个字段，原实现 load_session_map() 每次重建全部会话行
+            # （本机 547 会话实测冷 6976ms / 热 124ms，单行 0.017ms）。
+            existing = (sess_repo.get_session_map_entry(session_key) or {}) if session_key else {}
             old_title = str(existing.get("title") or "").strip()
             weak = (not old_title) or (
                 old_title.startswith(("飞书 · ", "微信 · ", "Slack · ", "Telegram · ")) and ("主对话" not in old_title and "小V" not in old_title and "（" not in old_title) and len([p for p in old_title.split("·")]) <= 3
@@ -3309,7 +3312,11 @@ class ChannelManager:
                     sk = str(session_key or "").strip()
                     if sk:
                         # Run in thread pool to avoid blocking the async loop
-                        import asyncio
+                        # 【self-evolution-bot · 2026-11-20 · 第98轮 · 模型:deepseek-v4.1-flash-1017】
+                        # 删掉这里函数内的 `import asyncio`：它让 asyncio 在本函数内变成局部名，
+                        # 使前面第 3232 行 `await asyncio.sleep(0.35)`（thread busy 重试）抛
+                        # UnboundLocalError —— 即 IM 链路「线程忙 → 取消陈旧 run → 退避重试」
+                        # 这条分支必然崩。ruff F823 已长期报此点，HEAD 上就有。
                         rows = await asyncio.get_event_loop().run_in_executor(
                             None,
                             lambda: _query_latest_ai_message_from_db(sk),

@@ -248,7 +248,19 @@ CREATE TABLE IF NOT EXISTS evoflow_apps (
     updated_at TEXT NOT NULL DEFAULT '',
     usage_count INTEGER NOT NULL DEFAULT 0,
     last_used_at TEXT
-, canvas_json TEXT NOT NULL DEFAULT '{}', answer_from_ref TEXT NOT NULL DEFAULT '', final_rollup TEXT NOT NULL DEFAULT 'auto', final_rollup_agent TEXT NOT NULL DEFAULT '', final_rollup_instruction TEXT NOT NULL DEFAULT '', project_path TEXT NOT NULL DEFAULT '', org_id TEXT, owner_scope_id TEXT, created_by TEXT);
+, canvas_json TEXT NOT NULL DEFAULT '{}', answer_from_ref TEXT NOT NULL DEFAULT '', final_rollup TEXT NOT NULL DEFAULT 'auto', final_rollup_agent TEXT NOT NULL DEFAULT '', final_rollup_instruction TEXT NOT NULL DEFAULT '', project_path TEXT NOT NULL DEFAULT '', org_id TEXT, owner_scope_id TEXT, created_by TEXT, folder_id TEXT NOT NULL DEFAULT '');
+
+CREATE TABLE IF NOT EXISTS evoflow_app_folders (
+    folder_id TEXT PRIMARY KEY,
+    parent_id TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL DEFAULT '',
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    org_id TEXT,
+    owner_scope_id TEXT,
+    created_by TEXT,
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
+);
 
 CREATE TABLE IF NOT EXISTS evoflow_artifacts (
     session_key TEXT NOT NULL,
@@ -512,6 +524,17 @@ CREATE TABLE IF NOT EXISTS "evoflow_chat_stream_mirror_meta" (
             frame_count      INTEGER NOT NULL DEFAULT 0,
             byte_count       INTEGER NOT NULL DEFAULT 0
         , last_persisted_seq INTEGER NOT NULL DEFAULT 0);
+
+CREATE TABLE IF NOT EXISTS "evoflow_v4_event_log" (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id  TEXT NOT NULL,
+            log_epoch   TEXT NOT NULL DEFAULT '1',
+            seq         INTEGER NOT NULL,
+            op          TEXT NOT NULL,
+            payload     TEXT NOT NULL,
+            created_at  TEXT NOT NULL,
+            UNIQUE(session_id, log_epoch, seq)
+        );
 
 CREATE TABLE IF NOT EXISTS evoflow_collab_peer_messages (
             message_id TEXT NOT NULL PRIMARY KEY,
@@ -1288,6 +1311,33 @@ CREATE TABLE IF NOT EXISTS evoflow_duty_runs (
     updated_at TEXT NOT NULL
 );
 
+-- 【self-evolution-bot · 2026-11-20 · 第88轮 · 模型:deepseek-v4.1-flash-1017】
+-- 部门群聊叫醒队列落库。改前队列只活在前端 `useRef`：刷新/断线/关页面即全部丢失，
+-- 用户看到的是「@ 了人却没回复」，且没有任何记录可查。
+-- 判据要点：`running` 不等于「还活着」——必须看 `heartbeat_at` 是否超时，
+-- 否则前端崩溃留下的 running 行会永久卡住该 agent 的队头。
+CREATE TABLE IF NOT EXISTS evoflow_dept_group_wake_jobs (
+    job_id TEXT PRIMARY KEY,
+    dept_id TEXT NOT NULL DEFAULT '',
+    agent_code TEXT NOT NULL,
+    role_name TEXT NOT NULL DEFAULT '',
+    goal TEXT NOT NULL DEFAULT '',
+    goal_norm TEXT NOT NULL DEFAULT '',
+    depth INTEGER NOT NULL DEFAULT 0,
+    chain_key TEXT NOT NULL DEFAULT '',
+    steward_mode INTEGER NOT NULL DEFAULT 0,
+    from_agent_name TEXT NOT NULL DEFAULT '',
+    source_msg_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'queued',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    owner TEXT NOT NULL DEFAULT '',
+    enqueued_at TEXT NOT NULL DEFAULT '',
+    started_at TEXT NOT NULL DEFAULT '',
+    heartbeat_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
+);
+
 CREATE TABLE IF NOT EXISTS evoflow_session_child_works (
     work_id TEXT PRIMARY KEY,
     session_key TEXT NOT NULL,
@@ -1765,6 +1815,14 @@ CREATE INDEX IF NOT EXISTS idx_evo_apps_status ON evoflow_apps(status);
 
 CREATE INDEX IF NOT EXISTS idx_evo_apps_usage ON evoflow_apps(usage_count DESC);
 
+CREATE INDEX IF NOT EXISTS idx_evo_apps_folder ON evoflow_apps(folder_id);
+
+CREATE INDEX IF NOT EXISTS idx_evo_app_folders_parent
+                    ON evoflow_app_folders(parent_id, sort_order, name);
+
+CREATE INDEX IF NOT EXISTS idx_evo_app_folders_owner
+                    ON evoflow_app_folders(owner_scope_id);
+
 CREATE INDEX IF NOT EXISTS idx_evo_artifacts_session_updated
             ON evoflow_artifacts(session_key, updated_at);
 
@@ -1839,6 +1897,12 @@ CREATE INDEX IF NOT EXISTS idx_evo_chat_shares_session
 
 CREATE INDEX IF NOT EXISTS idx_evo_chat_stream_mirror_run
             ON evoflow_chat_stream_mirror(session_key, run_id, seq);
+
+CREATE INDEX IF NOT EXISTS idx_v4_event_log_session
+            ON evoflow_v4_event_log(session_id, log_epoch, seq);
+
+CREATE INDEX IF NOT EXISTS idx_v4_event_log_created
+            ON evoflow_v4_event_log(created_at);
 
 CREATE INDEX IF NOT EXISTS idx_evo_collab_exec_hist_main
     ON evoflow_collab_task_execution_history(main_task_id, parent_task_id, subtask_id);
@@ -2153,6 +2217,7 @@ _LEGACY_COLUMN_BACKFILL: dict[str, tuple[tuple[str, str], ...]] = {
     ),
     "evoflow_apps": (
         ("project_path", "TEXT NOT NULL DEFAULT ''"),
+        ("folder_id", "TEXT NOT NULL DEFAULT ''"),
     ),
     "evoflow_app_runs": (
         ("queue_ms", "INTEGER"),
@@ -2250,6 +2315,7 @@ def _ensure_post_baseline_columns(conn: sqlite3.Connection) -> None:
     specs: dict[str, tuple[tuple[str, str], ...]] = {
         "evoflow_apps": (
             ("project_path", "TEXT NOT NULL DEFAULT ''"),
+            ("folder_id", "TEXT NOT NULL DEFAULT ''"),
         ),
         # Chat turn timing/state: only ``_backfill_legacy_columns`` added these,
         # so a public-1.x DB created before they landed in the baseline keeps
@@ -2278,6 +2344,28 @@ def _ensure_post_baseline_columns(conn: sqlite3.Connection) -> None:
             len(added),
             ", ".join(f"{t}.{c}" for t, c in added),
         )
+    _ensure_app_folder_indexes(conn)
+
+
+def _ensure_app_folder_indexes(conn: sqlite3.Connection) -> None:
+    """Idempotent indexes for workflow folders (safe on stamped + fresh DBs)."""
+    try:
+        if _table_exists(conn, "evoflow_apps") and "folder_id" in _existing_columns(conn, "evoflow_apps"):
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_evo_apps_folder ON evoflow_apps(folder_id)"
+            )
+        if _table_exists(conn, "evoflow_app_folders"):
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_evo_app_folders_parent "
+                "ON evoflow_app_folders(parent_id, sort_order, name)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_evo_app_folders_owner "
+                "ON evoflow_app_folders(owner_scope_id)"
+            )
+        conn.commit()
+    except sqlite3.DatabaseError:
+        logger.debug("schema: ensure app folder indexes failed", exc_info=True)
 
 
 # Tables whose CREATE statement must be replayed on an already-current DB.
@@ -2290,6 +2378,14 @@ _POST_BASELINE_TABLES: tuple[str, ...] = (
     "evoflow_departments",
     "evoflow_role_push_bindings",
     "evoflow_v4_session_goals",
+    # 【self-evolution-bot · 2026-11-20 · 第88轮 · 模型:deepseek-v4.1-flash-1017】
+    # 群叫醒队列落库；已 stamped 的库靠这条 backfill 建表。
+    "evoflow_dept_group_wake_jobs",
+    # 【lifecycle · 2026-11-21】v4 权威 delta 日志持久化（ZCode durable event 语义）：
+    # 发送/停止/流式每一帧 delta 落库，事后审计「这条流/轮发生了什么、断在哪」。
+    "evoflow_v4_event_log",
+    # Workflow list folders (nestable); stamped DBs need post-baseline create.
+    "evoflow_app_folders",
 )
 
 
@@ -2618,6 +2714,16 @@ def _ensure_duty_runs_table(conn: sqlite3.Connection) -> None:
     logger.info("schema: created evoflow_duty_runs (duty trail index)")
 
 
+def _ensure_right_stage_tables(conn: sqlite3.Connection) -> None:
+    """Idempotent: right-stage current + trail tables."""
+    try:
+        from evoflow.persistence.right_stage_tables import ensure_right_stage_tables
+
+        ensure_right_stage_tables(conn)
+    except Exception:
+        logger.debug("schema: ensure right_stage tables failed", exc_info=True)
+
+
 def _ensure_session_runtime_tables(conn: sqlite3.Connection) -> None:
     """Idempotent: session child-work registry + one-shot inject receipts."""
     created: list[str] = []
@@ -2754,6 +2860,7 @@ def ensure_app_schema(conn: sqlite3.Connection) -> None:
         _apply_baseline(conn)
         _ensure_asset_memory_runs_table(conn)
         _ensure_session_runtime_tables(conn)
+        _ensure_right_stage_tables(conn)
         _ensure_person_affect_hormones(conn)
         _ensure_timing_schema(conn)
         _ensure_media_assets_schema(conn)
@@ -2766,6 +2873,7 @@ def ensure_app_schema(conn: sqlite3.Connection) -> None:
             _ensure_duty_runs_table(conn)
             _ensure_asset_memory_runs_table(conn)
             _ensure_session_runtime_tables(conn)
+            _ensure_right_stage_tables(conn)
             _ensure_person_affect_hormones(conn)
             _ensure_post_baseline_tables(conn)
             _ensure_post_baseline_columns(conn)
@@ -2776,6 +2884,7 @@ def ensure_app_schema(conn: sqlite3.Connection) -> None:
         _ensure_duty_runs_table(conn)
         _ensure_asset_memory_runs_table(conn)
         _ensure_session_runtime_tables(conn)
+        _ensure_right_stage_tables(conn)
         _ensure_person_affect_hormones(conn)
         _ensure_post_baseline_tables(conn)
         _ensure_post_baseline_columns(conn)
@@ -2786,6 +2895,7 @@ def ensure_app_schema(conn: sqlite3.Connection) -> None:
     _ensure_duty_runs_table(conn)
     _ensure_asset_memory_runs_table(conn)
     _ensure_session_runtime_tables(conn)
+    _ensure_right_stage_tables(conn)
     _ensure_person_affect_hormones(conn)
     _ensure_automation_slot_claims(conn)
     # Columns shipped after the baseline epoch, so a DB already stamped with

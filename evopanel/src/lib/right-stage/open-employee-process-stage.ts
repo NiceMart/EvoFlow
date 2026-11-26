@@ -14,6 +14,12 @@ export type EmployeeProcessStagePayload = {
   roleName?: string
   title?: string
   roundId?: string
+  /**
+   * 【self-evolution-bot · 2026-11-20 · 第95轮 · 模型:deepseek-v4.1-flash-1017】
+   * 本次派发时刻（后端 dispatched_at）。roundId 在派单路径恒为空，故用这个
+   * 「每轮必变且不参与会话键拼接」的值判「是否换了新一轮」。
+   */
+  roundStamp?: string
   busy?: boolean
   /** 员工对话 session_key（chat_send / 续聊）；写入 tab.data 供面板直接发送 */
   employeeSessionKey?: string
@@ -147,8 +153,21 @@ export function openEmployeeProcessInRightStage(
     }
   }
 
+  // 【self-evolution-bot · 2026-11-20 · 第95轮 · 模型:deepseek-v4.1-flash-1017】
+  // 改了什么：换轮判据从「只看 roundId」扩成 roundId **或** roundStamp。
+  // 为什么：roundId 在派单路径恒为空（后端 in-process 分支只回调用方传入的
+  // round_id，真实 preview_round 在后台任务里不回传），只靠它判等于死代码——
+  // 派了新任务、右栏仍死盯用户上次手挑的历史对话（实测 task:2611201809_4db6
+  // running，面板显示上一轮『提交代码推送』）。roundStamp 取本轮 dispatched_at，
+  // 每轮必变，且不参与会话键拼接。同一轮重开（stamp 相同）仍继承，保住手选。
+  const prevRoundId = String(existing?.data?.roundId || '').trim()
+  const nextRoundId = String(payload.roundId || '').trim()
+  const prevStamp = String(existing?.data?.roundStamp || '').trim()
+  const nextStamp = String(payload.roundStamp || '').trim()
+  const roundChanged =
+    (Boolean(nextRoundId) && nextRoundId !== prevRoundId) || (Boolean(nextStamp) && nextStamp !== prevStamp)
   const employeeSessionKey =
-    String(payload.employeeSessionKey || existing?.data?.employeeSessionKey || '').trim() ||
+    String(payload.employeeSessionKey || (roundChanged ? '' : existing?.data?.employeeSessionKey) || '').trim() ||
     undefined
   const pendingSendMessage =
     String(payload.pendingSendMessage || '').trim() ||
@@ -168,6 +187,10 @@ export function openEmployeeProcessInRightStage(
       roleName: roleName || String(existing?.data?.roleName || '').trim(),
       title: keepTitle,
       roundId: String(payload.roundId || '').trim(),
+      // 【self-evolution-bot · 2026-11-20 · 第95轮 · 模型:deepseek-v4.1-flash-1017】
+      // 保留上一轮的 stamp 时不能覆盖成空：本轮 payload 没带 stamp（如用户手挑会话
+      // 重开同一签）就沿用旧值，否则下次比较会误判成「换轮」而清掉手选会话。
+      roundStamp: nextStamp || prevStamp || '',
       busy: payload.busy !== false,
       employeeSessionKey,
       pendingSendMessage,
@@ -194,11 +217,9 @@ export function openEmployeeProcessInRightStage(
 }
 
 /**
- * 部门群聊 @ 唤醒：在 chatSend 之前把右栏钉到员工 sticky 会话，
- * 否则群气泡在流、摘要只有「回复中」，右栏看不到实时过程记录。
- *
- * - depth 0（用户/@管家首轮）：forceExpand，立刻看见跟岗时间线
- * - 嵌套接力：只写/激活签，尊重用户收起锁（与 platform autoOpen 同语义）
+ * 部门群聊：预写员工跟岗签（不强制撑开右栏）。
+ * 群聊唤醒默认不自动展开侧栏；用户点「查看实时过程」走 {@link openEmployeeProcessInRightStage}
+ * 并传 `forceExpand: true`。
  */
 export function openDeptGroupWakeProcessInRightStage(input: {
   deptId: string
@@ -207,7 +228,7 @@ export function openDeptGroupWakeProcessInRightStage(input: {
   /** 主壳会话（dept:{id}:chat），钉标签归属 */
   shellSessionKey?: string | null
   employeeSessionKey?: string | null
-  /** 唤醒深度；0 = 用户本轮点名 */
+  /** 唤醒深度（保留入参兼容；不再据此 forceExpand） */
   depth?: number
 }): string {
   const code = String(input.agentCode || '').trim()
@@ -215,7 +236,6 @@ export function openDeptGroupWakeProcessInRightStage(input: {
   const roleName = String(input.roleName || '').trim() || code
   const ownerSk = String(input.shellSessionKey || '').trim()
   const employeeSk = String(input.employeeSessionKey || '').trim()
-  const depth = Math.max(0, Number(input.depth) || 0)
   return openEmployeeProcessInRightStage(
     {
       taskId: `live:${code}`,
@@ -228,7 +248,7 @@ export function openDeptGroupWakeProcessInRightStage(input: {
     {
       sessionKey: ownerSk || undefined,
       layout: 'wide',
-      forceExpand: depth === 0,
+      forceExpand: false,
     },
   )
 }

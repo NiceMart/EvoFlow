@@ -52,9 +52,72 @@ ensure_hf_hub_env()
 # A failed load is deliberately not cached so the next call retries.
 _model_cache: dict[str, object] = {}
 
-_MISSING_ST_HINT = "本地向量运行时未包含在当前安装包中（默认使用云端 embedding）。请在「设置 → 模型」选择云端向量模型；开发环境可 uv sync 后设 EVOFLOW_GATEWAY_INCLUDE_LOCAL_EMBEDDING=1 重新打包。"
+_MISSING_ST_HINT = (
+    "本地向量运行时未包含在当前安装包中（精简/lean 构建）。"
+    "请在「设置 → 模型」选择云端向量模型；正式安装包默认已捆绑 bge-small-zh。"
+)
 
-_LEAN_LOCAL_UNAVAILABLE_REASON = "本地向量模型不可用：当前桌面版未捆绑 sentence-transformers / torch。请改用云端向量模型（设置 → 模型）。"
+_LEAN_LOCAL_UNAVAILABLE_REASON = (
+    "本地向量模型不可用：当前为精简构建，未捆绑 sentence-transformers / torch。"
+    "请改用云端向量模型（设置 → 模型），或安装完整版桌面包。"
+)
+
+_WIN32_INPROCESS_BLOCK_MSG = (
+    "Windows Gateway 禁止进程内加载本地向量模型"
+    "（sentence_transformers→sklearn→scipy 冷导入会卡死界面约 1~2 分钟）。"
+    "请改用云端向量模型；若必须本地加载，设 EVOFLOW_EMBEDDING_WARMUP=1（仍有卡顿风险）。"
+)
+
+
+def _env_flag_on(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def inprocess_local_embed_allowed() -> bool:
+    """False on Windows Gateway unless explicitly enabled.
+
+    Importing ``sentence_transformers`` in the Gateway process holds the GIL for
+    tens of seconds; ``asyncio.wait_for`` cannot cancel that thread
+    （2026-11-19 15:03: ``/api/models/embedding-probe`` → event_loop_stall 132s）。
+
+    Code-index ``build_worker`` / local ``embed_worker`` subprocesses set
+    ``EVOFLOW_CODE_INDEX_BUILD_WORKER=1`` or ``EVOFLOW_LOCAL_EMBED_WORKER=1``
+    so local embed still works out-of-process. Opt-in for Gateway itself:
+    ``EVOFLOW_EMBEDDING_WARMUP=1``（仍有卡顿风险）.
+    """
+    if _env_flag_on("EVOFLOW_CODE_INDEX_BUILD_WORKER"):
+        return True
+    if _env_flag_on("EVOFLOW_LOCAL_EMBED_WORKER"):
+        return True
+    if _env_flag_on("EVOFLOW_EMBEDDING_WARMUP"):
+        return True
+    if sys.platform == "win32":
+        return False
+    return True
+
+
+def _st_pkg_dir_candidates() -> list[str]:
+    out: list[str] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        out.append(os.path.join(str(meipass), "sentence_transformers"))
+    venv_path = getattr(sys, "real_prefix", None) or (
+        sys.prefix if hasattr(sys, "base_prefix") and sys.base_prefix != sys.prefix else None
+    )
+    if venv_path:
+        out.append(os.path.join(str(venv_path), "Lib", "site-packages", "sentence_transformers"))
+        out.append(os.path.join(str(venv_path), "lib", "python3.12", "site-packages", "sentence_transformers"))
+    # Non-venv prefix (conda / system)
+    out.append(os.path.join(sys.prefix, "Lib", "site-packages", "sentence_transformers"))
+    return out
+
+
+def _st_pkg_looks_ok(st_pkg_dir: str) -> bool:
+    if not os.path.isdir(st_pkg_dir):
+        return False
+    if not os.path.isfile(os.path.join(st_pkg_dir, "__init__.py")):
+        return False
+    return os.path.isdir(os.path.join(st_pkg_dir, "util"))
 
 
 def probe_local_embedding_deps() -> str | None:
@@ -69,33 +132,18 @@ def probe_local_embedding_deps() -> str | None:
     exception text: frozen gateway bundles may have ``sentence_transformers``
     present but miss a transitive module (e.g. ``scipy._external...fft``),
     and the generic hint alone hides the real packaging gap.
+
+    Fat desktop builds (``EVOFLOW_GATEWAY_INCLUDE_LOCAL_EMBEDDING=1``) ship ST
+    inside the frozen tree — probe those paths instead of assuming lean.
     """
     # Check package availability WITHOUT importing — importing sentence_transformers
     # triggers scipy.linalg._fblas which hangs on Windows when the OpenMP/MKL DLL
     # is broken or missing.  Use file/directory existence as a proxy to avoid
     # any import machinery whatsoever.
-    import sys
-    if getattr(sys, "frozen", False):
-        # Frozen bundle: ST is absent by design on lean desktop.
-        return _MISSING_ST_HINT
-
-    venv_path = getattr(sys, "real_prefix", None) or (
-        sys.prefix if hasattr(sys, "base_prefix") and sys.base_prefix != sys.prefix else None
-    )
-    if not venv_path:
-        return _MISSING_ST_HINT
-
-    st_pkg_dir = os.path.join(venv_path, "Lib", "site-packages", "sentence_transformers")
-    if not os.path.isdir(st_pkg_dir):
-        return _MISSING_ST_HINT
-    init_file = os.path.join(st_pkg_dir, "__init__.py")
-    if not os.path.isfile(init_file):
-        return f"{_MISSING_ST_HINT} (no __init__.py)"
-    # Basic sanity: the main sub-package used for embedding must exist.
-    util_dir = os.path.join(st_pkg_dir, "util")
-    if not os.path.isdir(util_dir):
-        return f"{_MISSING_ST_HINT} (no util sub-package)"
-    return None
+    for st_pkg_dir in _st_pkg_dir_candidates():
+        if _st_pkg_looks_ok(st_pkg_dir):
+            return None
+    return _MISSING_ST_HINT
 
 
 
@@ -158,13 +206,25 @@ def reconcile_local_embedding_models_for_runtime() -> dict[str, int]:
 
 
 def _resolve_model_ref(model_id: str) -> str:
-    """Return a filesystem path when *model_id* points at a local directory."""
+    """Return a filesystem path when *model_id* points at a local directory.
+
+    Prefer the installer-bundled ``bge-small-zh`` folder when present so offline
+    installs never hit Hugging Face.
+    """
     raw = str(model_id or "").strip()
     if not raw:
         return raw
     path = Path(raw).expanduser()
     if path.is_dir():
         return str(path.resolve())
+    try:
+        from evoflow.knowledge.embedding.bundled import find_bundled_local_model_dir
+
+        bundled = find_bundled_local_model_dir(raw)
+        if bundled is not None:
+            return str(bundled)
+    except Exception:
+        logger.debug("bundled local model resolve skipped", exc_info=True)
     return raw
 
 
@@ -180,6 +240,53 @@ def _model_is_cached(model_id: str) -> bool:
                 return True
     except Exception:
         return False
+    return False
+
+
+# 【self-evolution-bot · 2026-11-18 · 第47轮 · 模型:deepseek-v4.1-flash-1017】
+# 缓存加载失败要**立即重试一次**，不能直接把失败抛上去。
+#
+# 现场（2026-11-18 17:50，网关 1.3.35，同一 venv、同一模型）：
+#   code_index: sync query embedding failed: EmbeddingError:
+#   Failed to load local embedding model 'BAAI/bge-small-zh-v1.5':
+#   Pooling.__init__() missing 1 required positional argument: 'embedding_dimension'
+# 而同一条命令单独跑、多线程跑、三进程并发跑全部成功（dim=512）。
+#
+# 根因不是签名不兼容，是**缓存目录被并发写**：
+#   sentence_transformers 5.6 的 `Pooling.config_keys` 已换成
+#   ['embedding_dimension','pooling_mode','include_prompt']，而 bge 缓存的
+#   `1_Pooling/config.json` 仍是旧格式（word_embedding_dimension /
+#   pooling_mode_cls_token ...）。首次加载时新版 `Pooling.load_config` 会
+#   `_convert_legacy_pooling_kwargs` 迁移并**回写该文件**；两个进程同时首次加载，
+#   一方读到的就是另一方写到一半的 json —— 字段缺失 → `cls(**config)` 缺参。
+#   实证：该文件 mtime 恰好落在两个任务并发首次加载的同一秒（17:50:44）。
+#
+# 为什么必须修：这次失败不是一次性的。`store._start_embed_warmup` 失败后会进
+# `_EMBED_WARM_RETRY_S=300` 秒冷却，期间每次检索都静默退回纯词法——
+# 用户看到的结果「还是对的」（字面匹配撑着），但语义召回整整 5 分钟不在线，
+# 且日志里只有一行 warning。半写状态是瞬时的，隔几百毫秒再读就是完整的。
+_LOAD_RETRY_ATTEMPTS = 2
+_LOAD_RETRY_DELAY_S = 0.6
+
+
+def _is_transient_load_error(exc: BaseException) -> bool:
+    """只对「读到的缓存不完整」这类瞬时错误重试，不做无差别重试。
+
+    判据取**异常文案里的结构缺陷**而不是异常类型：ST 把缓存解析失败统一包成
+    TypeError / KeyError / RuntimeError 等，类型无法区分「配置半写」与「模型真的坏」。
+    模型真坏时重试一次也只是多 0.6 秒，且失败仍照原样上报，不会掩盖问题。
+    """
+    text = f"{type(exc).__name__}: {exc}".lower()
+    for needle in (
+        "missing 1 required positional argument",
+        "unexpected keyword argument",
+        "keyerror",
+        "json",
+        "truncated",
+        "expecting value",
+    ):
+        if needle in text:
+            return True
     return False
 
 
@@ -199,7 +306,10 @@ def _build_sentence_transformer(model_id: str, device: str):
             model_id,
             endpoint,
         )
-        return SentenceTransformer(model_id, device=device, local_files_only=True)
+        return _load_with_retry(
+            lambda: SentenceTransformer(model_id, device=device, local_files_only=True),
+            model_id,
+        )
 
     logger.info(
         "Loading local embedding model '%s' on %s (first use downloads via %s)...",
@@ -207,7 +317,34 @@ def _build_sentence_transformer(model_id: str, device: str):
         device,
         endpoint,
     )
-    return SentenceTransformer(model_id, device=device)
+    return _load_with_retry(
+        lambda: SentenceTransformer(model_id, device=device),
+        model_id,
+    )
+
+
+def _load_with_retry(build, model_id: str):
+    """调一次 ``build()``；仅当失败像「缓存半写」时，短暂等待后再试一次。"""
+    import time as _time
+
+    last: BaseException | None = None
+    for attempt in range(_LOAD_RETRY_ATTEMPTS):
+        try:
+            return build()
+        except Exception as exc:
+            last = exc
+            if attempt + 1 >= _LOAD_RETRY_ATTEMPTS or not _is_transient_load_error(exc):
+                raise
+            logger.info(
+                "Local embedding model '%s' load hit a transient cache error "
+                "(%s: %s); retrying in %.1fs",
+                model_id,
+                type(exc).__name__,
+                exc,
+                _LOAD_RETRY_DELAY_S,
+            )
+            _time.sleep(_LOAD_RETRY_DELAY_S)
+    raise last if last else RuntimeError("unreachable")
 
 
 def _get_device(model_config: ModelConfig) -> str:
@@ -220,6 +357,8 @@ async def _load_model(model_id: str, device: str) -> object:
     """Load (or return cached) SentenceTransformer model — lazy + singleton."""
     if model_id in _model_cache:
         return _model_cache[model_id]
+    if not inprocess_local_embed_allowed():
+        raise EmbeddingError(_WIN32_INPROCESS_BLOCK_MSG)
 
     def _build() -> object:
         try:
@@ -251,6 +390,8 @@ def _load_model_sync(model_id: str, device: str) -> object:
     """
     if model_id in _model_cache:
         return _model_cache[model_id]
+    if not inprocess_local_embed_allowed():
+        raise EmbeddingError(_WIN32_INPROCESS_BLOCK_MSG)
 
     try:
         from sentence_transformers import SentenceTransformer  # noqa: F401
@@ -294,6 +435,25 @@ class LocalEmbeddingProvider(EmbeddingProvider):
 
         model_id = self.model_name
         device = _get_device(self.model_config)
+
+        # Windows Gateway: never import ST in-process — use JSONL sidecar.
+        if not inprocess_local_embed_allowed():
+            try:
+                from evoflow.knowledge.embedding.embed_client import embed_texts_via_worker
+
+                vectors = await asyncio.to_thread(
+                    embed_texts_via_worker,
+                    texts,
+                    model_id=model_id,
+                    device=device,
+                )
+            except Exception as exc:
+                raise EmbeddingError(
+                    f"Local embedding via worker failed for '{model_id}': {exc}"
+                ) from exc
+            _note_local_usage(model_id, texts)
+            return vectors
+
         model = await _load_model(model_id, device)
 
         def _encode() -> list[list[float]]:
@@ -321,7 +481,11 @@ class LocalEmbeddingProvider(EmbeddingProvider):
                 asyncio.to_thread(_encode),
                 timeout=encode_timeout_s,
             )
-        except asyncio.TimeoutError as exc:
+        # 【self-evolution-bot · 2026-11-18 · 第50轮 · 模型:deepseek-v4.1-flash-1017】
+        # `asyncio.TimeoutError` 自 3.11 起就是内建 `TimeoutError` 的别名，
+        # ruff UP041 要求用内建名。改的只是名字，捕获的异常类型逐字节等价；
+        # 之所以顺手改：本轮要提交本文件的缓存半写重试，门禁会因这条既有告警变红。
+        except TimeoutError as exc:
             raise EmbeddingError(
                 f"Local embedding inference timed out after {encode_timeout_s:.0f}s "
                 f"for '{model_id}' on batch of {len(texts)} texts; consider a smaller batch."
@@ -376,13 +540,26 @@ def warmup_local_model(model_id: str, device: str = DEFAULT_LOCAL_DEVICE) -> Non
         logger.warning("Local embedding warmup failed for %s: %s", model_id, exc)
 
 
+def _should_seed_local_embedding() -> bool:
+    """Seed when opted in, or when the installer bundled bge-small-zh + ST."""
+    if _env_flag_on("EVOFLOW_SEED_LOCAL_EMBEDDING"):
+        return True
+    try:
+        from evoflow.knowledge.embedding.bundled import bundled_local_model_available
+
+        if bundled_local_model_available() and probe_local_embedding_deps() is None:
+            return True
+    except Exception:
+        logger.debug("bundled seed check failed", exc_info=True)
+    return False
+
+
 def ensure_default_local_embedding_model() -> bool:
     """Seed the default local embedding model config if none exists.
 
-    Opt-in via ``EVOFLOW_SEED_LOCAL_EMBEDDING=1``. Desktop packages default to
-    cloud embedding and omit torch/sentence-transformers from the gateway
-    bundle; seeding a local model there would create a permanently broken
-    Settings entry. Dev/full builds that ship ST can enable seeding explicitly.
+    Auto-seeds when the desktop installer bundled ``bge-small-zh`` weights and
+    the local ST/torch stack is present. Also honors
+    ``EVOFLOW_SEED_LOCAL_EMBEDDING=1`` for dev/full builds without the bundle.
 
     Called at gateway startup. Idempotent: only inserts when no model with
     ``vendor == "local"`` or ``"embedding"`` in name/model is found.
@@ -392,18 +569,13 @@ def ensure_default_local_embedding_model() -> bool:
     not show a permanently-unavailable local model on broken installs.
     """
     try:
-        import os
-
         from evoflow.persistence.config_repositories import list_models, upsert_model
 
-        seed_opt_in = os.environ.get("EVOFLOW_SEED_LOCAL_EMBEDDING", "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        if not seed_opt_in:
-            logger.info("Skip seeding local embedding model (set EVOFLOW_SEED_LOCAL_EMBEDDING=1 to enable; cloud embedding is default)")
+        if not _should_seed_local_embedding():
+            logger.info(
+                "Skip seeding local embedding model "
+                "(need bundled bge-small-zh + ST, or EVOFLOW_SEED_LOCAL_EMBEDDING=1)"
+            )
             return False
 
         deps_err = probe_local_embedding_deps()
@@ -418,18 +590,46 @@ def ensure_default_local_embedding_model() -> bool:
             model_id = str(m.get("model", "") or "").lower()
             if vendor == "local" or "embedding" in name or "embedding" in model_id:
                 logger.debug("Embedding model already configured: %s", m.get("name"))
+                # Still pin owned-KB / code-index default when bundled.
+                try:
+                    from evoflow.knowledge.owned import settings as owned_settings
+                    from evoflow.knowledge.owned.embedding_bind import SEED_EMBEDDING_NAME
+
+                    if not owned_settings.get_default_embedding_model():
+                        owned_settings.set_default_embedding_model(SEED_EMBEDDING_NAME)
+                except Exception:
+                    logger.debug("set default embedding after existing local skipped", exc_info=True)
                 return False
+
+        from evoflow.knowledge.embedding.bundled import bundled_local_model_available
+
+        bundled = bundled_local_model_available()
+        desc = (
+            "本地语义向量模型 BAAI/bge-small-zh-v1.5（512维，约 95MB）。"
+            "用于知识库默认嵌入与代码索引语义检索；可在「设置 → 模型 → 向量模型」更换。"
+        )
+        if bundled:
+            desc += "安装包已内置权重，无需联网下载。"
+        else:
+            desc += "首次使用将从镜像下载权重。"
 
         upsert_model(
             {
                 "name": "bge-small-zh",
                 "vendor": "local",
                 "display_name": "BGE Small 中文向量模型 (本地)",
-                "description": ("本地语义向量模型 BAAI/bge-small-zh-v1.5 (512维, ~95MB)，用于自有知识库默认嵌入与代码索引语义检索。可在「设置 → 模型 → 向量模型」中更换，并设为知识库默认。首次使用自动从镜像下载。"),
+                "description": desc,
                 "model": DEFAULT_LOCAL_MODEL,
             }
         )
-        logger.info("Seeded default local embedding model: %s", DEFAULT_LOCAL_MODEL)
+        try:
+            from evoflow.knowledge.owned import settings as owned_settings
+            from evoflow.knowledge.owned.embedding_bind import SEED_EMBEDDING_NAME
+
+            owned_settings.set_default_embedding_model(SEED_EMBEDDING_NAME)
+        except Exception:
+            logger.debug("set default embedding model after seed failed", exc_info=True)
+        logger.info("Seeded default local embedding model: %s (bundled=%s)", DEFAULT_LOCAL_MODEL, bundled)
         return True
     except Exception as exc:
         logger.warning("Failed to seed default local embedding model: %s", exc)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from collections import Counter
 from typing import Any
 
@@ -70,8 +71,44 @@ def _kind_to_agent_label(kind: str) -> str:
 
 
 def _session_agent_label_for_thread(thread_id: str | None) -> str | None:
-    """Resolve the chat agent display name for a LangGraph thread (best-effort)."""
+    """Resolve the chat agent display name for a LangGraph thread (best-effort).
+
+    【self-evolution-bot · 2026-11-18 · 第47轮 · 模型:deepseek-v4.1-flash-1017】
+    为什么改成「单行查询 + 进程缓存」（本轮现网实测）：
+
+    原实现 ``load_session_map().get(sk)`` —— 为取一个 agent_id，把全部会话行
+    SELECT 出来并逐行过 ``_session_row_to_api``（effective_policy/preset/context 重建）。
+    本机 547 个会话实测 **冷 7673ms / 热 121ms**，单行查询 **0.037ms**。
+
+    致命的是调用方式：``queries.py:1318`` 与 ``summaries.py:796`` 都在**逐行循环**里调它，
+    所以一页 50 条请求记录 = 50 × 121ms ≈ **6 秒**，且随会话数线性变差。
+    同批会话行反复问同一批 thread_id，去重后实际只该查 1~N 次（N=本页不同 thread 数）。
+
+    缓存 60s + 负数结果也缓存（``None`` 同样是结论）：线程→会话绑定在运行期基本不变，
+    过期靠 TTL 兜底，与 ``find_session_key_by_thread_id`` 的 5s 缓存同源思路。
+    """
     tid = str(thread_id or "").strip()
+    if not tid:
+        return None
+    now = time.monotonic()
+    hit = _AGENT_LABEL_CACHE.get(tid)
+    if hit is not None and now - hit[0] < _AGENT_LABEL_CACHE_TTL_SECONDS:
+        return hit[1]
+    label = _resolve_session_agent_label(tid)
+    if len(_AGENT_LABEL_CACHE) > _AGENT_LABEL_CACHE_MAX:
+        _AGENT_LABEL_CACHE.clear()
+    _AGENT_LABEL_CACHE[tid] = (now, label)
+    return label
+
+
+# 缓存上限：观测量级通常几千 thread，超了就整体清空（比 LRU 简单，且这是纯展示字段）。
+_AGENT_LABEL_CACHE: dict[str, tuple[float, str | None]] = {}
+_AGENT_LABEL_CACHE_TTL_SECONDS = 60.0
+_AGENT_LABEL_CACHE_MAX = 4096
+
+
+def _resolve_session_agent_label(tid: str) -> str | None:
+    """未命中缓存时的一次真实解析（单行查询，绝不重建全表）。"""
     if not tid:
         return None
     try:
@@ -80,11 +117,13 @@ def _session_agent_label_for_thread(thread_id: str | None) -> str | None:
         sk = sess_repo.find_session_key_by_thread_id(tid)
         if not sk:
             return None
-        row = sess_repo.load_session_map().get(sk) or {}
-        ctx = row.get("context") if isinstance(row.get("context"), dict) else {}
+        # 【self-evolution-bot · 2026-11-18 · 第47轮 · 模型:deepseek-v4.1-flash-1017】
+        # 单行查询替代 load_session_map()（后者为取一个 agent_id 重建全部 547 行，
+        # 冷 7673ms / 热 121ms；本函数在列表接口里逐行调用）。
+        brief = sess_repo.get_session_row_brief(sk) or {}
+        ctx = brief.get("context") if isinstance(brief.get("context"), dict) else {}
         code = (
-            str(row.get("agentId") or row.get("agent_id") or "").strip()
-            or str(ctx.get("agent_id") or "").strip()
+            str(ctx.get("agent_id") or "").strip()
             or str(ctx.get("agent_name") or "").strip()
         )
         if not code:
@@ -842,7 +881,7 @@ def enrich_recent_request_row(row: dict[str, Any]) -> dict[str, Any]:
                 model_call_seq = None
         except (TypeError, ValueError):
             model_call_seq = None
-    from evoflow.observability.cache_metrics import enrich_model_row_cost
+    from evoflow.observability.cache_metrics import diagnose_cache_hit, enrich_model_row_cost
 
     row["usage_input_tokens"] = prompt
     row["usage_output_tokens"] = completion
@@ -850,6 +889,15 @@ def enrich_recent_request_row(row: dict[str, Any]) -> dict[str, Any]:
     row["usage_cache_creation_tokens"] = cache_creation
     row["usage_cache_miss_tokens"] = cache_miss
     enrich_model_row_cost(row)
+    cache_diag = diagnose_cache_hit(
+        cache_read_tokens=int(cache_read) if cache_read is not None else None,
+        cache_miss_tokens=int(cache_miss) if cache_miss is not None else None,
+        cache_creation_tokens=int(cache_creation) if cache_creation is not None else None,
+        model_call_seq=model_call_seq,
+        message_count=message_count,
+        invocation_kind=kind,
+        prompt_tokens=prompt,
+    )
     return {
         "id": str(row.get("id") or ""),
         "status": status,
@@ -864,6 +912,10 @@ def enrich_recent_request_row(row: dict[str, Any]) -> dict[str, Any]:
         "cache_read_tokens": int(cache_read) if cache_read is not None else None,
         "cache_creation_tokens": int(cache_creation) if cache_creation is not None else None,
         "cache_miss_tokens": int(cache_miss) if cache_miss is not None else None,
+        "cache_hit_rate": cache_diag.get("hit_rate"),
+        "cache_hit_rate_pct": cache_diag.get("hit_rate_pct"),
+        "cache_hit_status": cache_diag.get("status"),
+        "cache_hit_notes": cache_diag.get("notes") or [],
         "estimated_cost_cny": row.get("estimated_cost_cny"),
         "cost_usd": None,
         "occurred_at": str(row.get("requested_at") or ""),

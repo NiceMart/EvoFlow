@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import functools
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -13,6 +15,8 @@ from evoflow.utils.workspace_browse import (
     resolve_bound_workspace_file,
     strip_bound_workspace_prefix,
 )
+
+logger = logging.getLogger(__name__)
 
 NO_WORKSPACE_BOUND = "Error: No workspace bound to this session. Select a local workspace in the UI, then retry."
 # Kept for compatibility; path confinement is disabled.
@@ -37,7 +41,9 @@ def runtime_with_workspace(root: str, thread_id: str | None = None) -> Any:
             return data.get(key, default)
 
     try:
-        from langchain.tools import ToolRuntime
+        # 【self-evolution-bot · 2026-11-19 · 第65轮 · 模型:deepseek-v4.1-flash-1017】
+        # 真构造实例用真类；直取 langgraph.prebuilt 以避免 `langchain.tools` 拉 torch。
+        from langgraph.prebuilt.tool_node import ToolRuntime
 
         return ToolRuntime(
             state={},
@@ -66,14 +72,71 @@ def resolve_filesystem_search_root(*, runtime: Any = None) -> tuple[str, str | N
     return str(Path.cwd().resolve()), thread_id or None
 
 
+# 【self-evolution-bot · 2026-11-16 · 第23轮】员工岗位工作区检索根（判定单 2611162156 §三①）
+# 为什么：员工值守会话无侧栏 local_workspace_root，旧解析链直接落到 profile 目录的
+# code_index（root=profile），仓库索引（root=D:/dev/github/EvoFlow）从未进查询范围。
+# 在 session 绑定与 thread sandbox 之间插入「employee workspace_path」一级；
+# 非员工会话（main/小V/普通聊天）解析为 None → 走原分支，行为零变化。
+@functools.lru_cache(maxsize=64)
+def _employee_workspace_root_cached(agent_code: str) -> str:
+    """Resolve hired employee's workspace_path once per agent_code (process cache)."""
+    code = str(agent_code or "").strip()
+    if not code:
+        return ""
+    try:
+        from evoflow.proactive.employee_prompting.identity import resolve_employee_identity
+
+        info = resolve_employee_identity(code)
+    except Exception:
+        logger.debug("employee identity lookup failed code=%s", code, exc_info=True)
+        return ""
+    if not info:
+        return ""
+    ws = str(info.get("workspace_path") or "").strip()
+    if not ws:
+        return ""
+    try:
+        p = Path(os.path.expanduser(os.path.expandvars(ws))).resolve()
+    except (OSError, ValueError):
+        return ""
+    # 必须是存在的目录才采用；不做 parent 兜底（判定单 §三①）。
+    return str(p) if p.is_dir() else ""
+
+
+def _resolve_employee_workspace_root(runtime: Any = None) -> str:
+    """Current run's employee workspace_path, or empty for non-employee sessions."""
+    agent_code = ""
+    try:
+        from evoflow.authz.agent_actor import agent_actor_from_runtime
+
+        agent_code = str(agent_actor_from_runtime(runtime=runtime) or "").strip()
+    except Exception:
+        logger.debug("agent actor lookup failed", exc_info=True)
+        return ""
+    if not agent_code:
+        return ""
+    try:
+        from evoflow.proactive.employee_prompting.identity import normalize_employee_agent_code
+
+        agent_code = str(normalize_employee_agent_code(agent_code) or "").strip()
+    except Exception:
+        pass
+    if not agent_code or agent_code.lower() in {"main", "lead_agent", "auto", "user"}:
+        return ""
+    return _employee_workspace_root_cached(agent_code)
+
+
 def resolve_search_workspace_root(*, runtime: Any = None) -> tuple[str, str | None] | str:
-    """Directory root for code-index search: bound workspace or thread sandbox, else error."""
+    """Directory root for code-index search: bound workspace → employee workspace → thread sandbox, else error."""
     root_s, thread_id = resolve_tool_workspace_root(runtime=runtime)
     if root_s:
         root = Path(os.path.expanduser(os.path.expandvars(root_s))).resolve()
         norm_root = _normalize_bound_workspace_dir(root)
         if not isinstance(norm_root, str):
             return str(norm_root), thread_id or None
+    emp_ws = _resolve_employee_workspace_root(runtime=runtime)
+    if emp_ws:
+        return emp_ws, str(thread_id or "").strip() or None
     tid = str(thread_id or "").strip()
     if tid:
         try:
@@ -120,6 +183,37 @@ def _resolve_relative_under_root(root: Path, raw: str) -> Path:
             pass
     rel = strip_bound_workspace_prefix(norm)
     return (root / rel.lstrip("/")).resolve()
+
+
+def _bash_cwd_for_thread(thread_id: str, workspace_root: str = "") -> Path | None:
+    """同一 thread 在 bash 里学到的当前目录；read/replace/grep 相对路径复用它。
+
+    【self-evolution-bot · 2026-11-20 · 第89轮 · 模型:deepseek-v4.1-flash-1017】
+    改了什么/为什么：此前 bash 学到的 cwd **只对 bash 自己生效**，而 read/replace/grep
+    按「进程 cwd / 会话工作区根」各自拼接——三套「当前目录」互不相通。于是 bash 返回
+    `cwd: /d/dev/github/EvoFlow` 之后，read 仍拼出 `backend/backend/...`、grep 仍拼到
+    profile 目录，模型只能每条都写 `D:/dev/github/EvoFlow/...` 全量路径。
+    现网实证（近7天 obs）：read/replace/grep 相对路径调用 209 次、失败 116 次，
+    其中目标文件真在仓库根下的 16 次 —— 判据不是路径写错，是「当前目录」不一致。
+
+    惰性 import：bash_tool 顶层已 import 本模块，反向顶层 import 会成环。
+    """
+    tid = str(thread_id or "").strip()
+    if not tid:
+        return None
+    try:
+        from evoflow.tools.zcode_port.bash_tool import thread_cwd_for
+
+        cand = thread_cwd_for(tid, str(workspace_root or "").strip())
+    except Exception:
+        return None
+    if not cand:
+        return None
+    try:
+        p = Path(cand)
+        return p.resolve() if p.is_dir() else None
+    except (OSError, ValueError):
+        return None
 
 
 def resolve_tool_path(
@@ -173,6 +267,23 @@ def resolve_tool_path(
         )
 
     root_s, _tid = resolve_tool_workspace_root(runtime=runtime)
+
+    # 【self-evolution-bot · 2026-11-20 · 第89轮 · 模型:deepseek-v4.1-flash-1017】
+    # 相对路径优先按**该 thread 在 bash 里学到的 cwd** 解析：IDE 语义下一个 session
+    # 只有一个「当前目录」，不该 bash 认仓库根、read 认进程 cwd、grep 认会话根。
+    # 只在命中真实存在才采用；未命中一律回落下面的旧逻辑，错误文案保持不变。
+    bash_cwd = _bash_cwd_for_thread(_tid, root_s)
+    if bash_cwd is not None:
+        cand = (bash_cwd / expanded).resolve()
+        if cand.exists():
+            return _finalize_path(
+                cand,
+                must_exist=must_exist,
+                must_be_file=must_be_file,
+                must_be_dir=must_be_dir,
+                label=path,
+            )
+
     if root_s:
         root = Path(os.path.expanduser(os.path.expandvars(root_s))).resolve()
         norm_root = _normalize_bound_workspace_dir(root)
@@ -180,8 +291,19 @@ def resolve_tool_path(
             return norm_root
         root = norm_root
         target = _resolve_relative_under_root(root, norm)
+        base_dir: Path | None = root
+        base_kind = "会话工作区根"
     else:
         target = (Path.cwd() / expanded).resolve()
+        base_dir = Path.cwd()
+        base_kind = "进程当前目录"
+
+    # 【self-evolution-bot · 2026-11-20 · 第89轮 · 模型:deepseek-v4.1-flash-1017】
+    # 把**真正参与拼接的根**传给报错文案。原先 _not_found_detail 无条件写
+    # 「按会话工作区根拼的」，而现网 6/8 会话根本没绑工作区、拼的是进程 cwd，
+    # 照着那句假话去改路径只会更错。
+    if bash_cwd is not None:
+        base_kind = f"{base_kind}（bash 当前目录 {bash_cwd} 下未命中，已回落）"
 
     return _finalize_path(
         target,
@@ -189,6 +311,8 @@ def resolve_tool_path(
         must_be_file=must_be_file,
         must_be_dir=must_be_dir,
         label=path,
+        base_dir=base_dir,
+        base_kind=base_kind,
     )
 
 
@@ -268,6 +392,66 @@ def format_tool_path_label(resolved: Path, *, runtime: Any = None) -> str:
         return resolved.as_posix()
 
 
+def _not_found_detail(
+    p: Path,
+    label: str,
+    *,
+    base_dir: Path | None = None,
+    base_kind: str = "",
+) -> str:
+    r"""路径不存在时的报错：回显入参 + 实际查找的绝对路径。
+
+    【self-evolution-bot · 2026-11-19 · 第60轮 · 模型:deepseek-v4.1-flash-1017】
+    改了什么：原本只回显 `label`（即调用方传进来的原始路径），现在补上实际
+    查找的绝对路径。为什么：相对路径会被拼到工作区根下（本岗那根是
+    C:/Users/admin/.evoflow/profiles/default），而传相对路径的人心里想的往往是仓库根；
+    只报入参就分不清“路径写错”还是“根不对”，只能猜一次再绕一步。
+    实证：2026-11-19 00:31 本岗 replace("craft/电脑控制写入长文本-记事本实测.md")
+    报“Path not found”，没说查的是哪，只能去槽位本地反复确认目录。
+    与 read_file.py 第20轮的修法同一口径（“实际查找的绝对路径”），保持全仓一致。
+
+    不变部分：第一行仍然以 `Error: Path not found: <入参>` 开头。
+    evopanel/src/lib/chat-normalize.js:1221 用
+    /Error: (?:Path not found|File not found):\s*(.+?)(?:\r?\n|$)/ 从这句里抽路径显示给用户，
+    操作端只读第一行；补充信息必须放第二行起，否则前端会把整段当成路径。
+
+    【self-evolution-bot · 2026-11-20 · 第89轮 · 模型:deepseek-v4.1-flash-1017】
+    改了什么：第二行原来**无条件**写「相对路径是按会话工作区根拼的」。现网实测这句
+    在三种情况下都不成立：① 会话未绑定工作区（最近 8 条会话 6 条 local_workspace_root=None）
+    时拼的是**网关进程当前目录**（`EvoFlow/backend`）；② 第 89 轮起相对路径先按 bash
+    学到的 cwd 试；③ 目标根是 profile 目录时也不是「会话工作区根」。
+    为什么必须改：本岗亲测在 `EvoFlow/backend` 下 read `backend/app/...` 被拼成
+    `backend/backend/...`，文案却说「按会话工作区根拼的」——照着这句去改只会更错。
+    现在由调用方把**真正参与拼接的那个根**（base_dir / base_kind）传进来，按实回报；
+    没传就只报绝对路径，不再猜一个根名。
+    """
+    base = f"Error: Path not found: {label}"
+    try:
+        actual = str(p)
+    except (OSError, ValueError):
+        return base
+    if not actual:
+        return base
+    raw = str(label or "").replace("\\", "/")
+    is_absolute = bool(raw) and (raw[1:3] == ":/" or raw.startswith("//"))
+    # 绝对路径入参：只有在真被重映射时才补一句，否则只回显入参。
+    # 否则就是把「相对路径按工作区根拼」这句无关话术塞给绝对路径调用方
+    # —— read_file.py 第20轮的反证用例已经把它钉死了（本轮我自己先踩一次）。
+    if is_absolute:
+        if actual.replace("\\", "/").lower() == raw.lower():
+            return base
+        return f"{base}\n（实际查找的绝对路径：{actual}）"
+    if actual == str(label):
+        return base
+    if base_dir is not None and base_kind:
+        return (
+            f"{base}\n"
+            f"（实际查找的绝对路径：{actual}；相对路径是按{base_kind} "
+            f"{base_dir} 拼接的，如果你想指的是仓库，请改用 D:/ 开头的绝对路径）"
+        )
+    return f"{base}\n（实际查找的绝对路径：{actual}）"
+
+
 def _finalize_path(
     p: Path,
     *,
@@ -275,9 +459,11 @@ def _finalize_path(
     must_be_file: bool,
     must_be_dir: bool,
     label: str,
+    base_dir: Path | None = None,
+    base_kind: str = "",
 ) -> Path | str:
     if must_exist and not p.exists():
-        return f"Error: Path not found: {label}"
+        return _not_found_detail(p, label, base_dir=base_dir, base_kind=base_kind)
     if must_be_file and p.exists() and not p.is_file():
         hint = " Use terminal (e.g. dir / ls) to browse a directory, or read with a concrete file path (e.g. outputs/result.txt), not the workspace root '.'." if p.is_dir() else ""
         return f"Error: Path is not a file: {label}.{hint}" if hint else f"Error: Path is not a file: {label}"

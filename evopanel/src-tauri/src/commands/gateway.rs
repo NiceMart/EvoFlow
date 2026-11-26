@@ -12,6 +12,12 @@ use super::backend;
 const STREAM_EOF: &str = "__DF_EOF__";
 /// 单包心跳 tag，JS 端识别后跳过：避免长 idle 流被中间设备 RST。
 const STREAM_PING: &str = "__DF_PING__";
+/// 连接成功后首包：把 remint 响应头带给 JS（Channel 只传 body 时否则读不到）。
+const STREAM_HDRS_PREFIX: &str = "__DF_HDRS__";
+const REMINT_RESPONSE_HEADERS: [&str; 2] = [
+    "x-evoflow-new-thread-id",
+    "x-evoflow-old-thread-id",
+];
 /// Connect-class retries during cold start / port reclaim (≈5–8s total).
 const PROXY_MAX_ATTEMPTS: u32 = 6;
 const PROXY_RETRY_DELAYS_MS: [u64; 5] = [200, 400, 800, 1600, 2400];
@@ -171,6 +177,31 @@ fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
     err.is_connect() || err.is_timeout()
 }
 
+/// 短超时请求（如 V4 subscribe 12s）禁止「整段超时 × 6 次」重试。
+/// 现场：Gateway 卡住时 subscribe 连失败 6×12s≈75s，面板空投影 + 乐观「工作中」假忙。
+/// connect 类仍允许多试几次；timeout 在短预算下只再试 1 次。
+fn proxy_max_attempts_for_timeout(timeout: Duration) -> u32 {
+    if timeout.as_millis() <= 15_000 {
+        2
+    } else {
+        PROXY_MAX_ATTEMPTS
+    }
+}
+
+fn should_retry_proxy_error(err: &reqwest::Error, attempt: u32, max_attempts: u32) -> bool {
+    if attempt + 1 >= max_attempts {
+        return false;
+    }
+    if err.is_connect() {
+        return true;
+    }
+    // 短超时预算下 timeout 再重试只会把失败从 12s 拖到 24s+，对「服务端已堵」无益。
+    if err.is_timeout() {
+        return max_attempts >= PROXY_MAX_ATTEMPTS;
+    }
+    false
+}
+
 /// Upstream SSE often ends with a reset/half-closed body; reqwest surfaces that as decode errors.
 /// Treat those as normal EOF for long-lived streams so the panel can reconnect without error spam.
 fn is_benign_upstream_stream_end(err: &reqwest::Error) -> bool {
@@ -203,9 +234,11 @@ async fn send_proxy_request(
     url: String,
     body: Option<Value>,
     headers: &BTreeMap<String, String>,
+    timeout: Duration,
 ) -> Result<reqwest::Response, String> {
     let mut last_err: Option<String> = None;
-    for attempt in 0..PROXY_MAX_ATTEMPTS {
+    let max_attempts = proxy_max_attempts_for_timeout(timeout);
+    for attempt in 0..max_attempts {
         let mut req = client.request(method.clone(), &url);
         for (k, v) in headers {
             req = req.header(k.as_str(), v.as_str());
@@ -218,7 +251,7 @@ async fn send_proxy_request(
         }
         match req.send().await {
             Ok(resp) => return Ok(resp),
-            Err(e) if is_retryable_reqwest_error(&e) && attempt + 1 < PROXY_MAX_ATTEMPTS => {
+            Err(e) if should_retry_proxy_error(&e, attempt, max_attempts) => {
                 last_err = Some(format!("网关请求失败: {e}"));
                 proxy_retry_delay(attempt).await;
             }
@@ -272,7 +305,8 @@ pub async fn gateway_proxy(request: GatewayProxyRequest) -> Result<GatewayProxyR
         .build()
         .map_err(|e| format!("创建网关 HTTP 客户端失败: {e}"))?;
 
-    let resp = send_proxy_request(&client, method, url, request.body, &request.headers).await?;
+    let resp =
+        send_proxy_request(&client, method, url, request.body, &request.headers, timeout).await?;
     let status = resp.status().as_u16();
     // 显式按 UTF-8 解码，避免 reqwest `.text()` 在无 charset 时做编码嗅探，
     // 将中文 UTF-8 误判为 GBK 而把「搞定了吗」显示成「鎼炲畾浜嗗悧」。
@@ -331,6 +365,28 @@ pub async fn gateway_proxy_stream(
             text
         };
         return Err(format!("网关流请求失败: {msg}"));
+    }
+
+    // Remint 头必须在首个 body chunk 前到达 JS，否则 chatSend 读不到、V4 订旧 topic。
+    // 正常流（无 remint 头）不发任何 meta 包 → 协议与旧客户端完全一致，不影响日常聊天。
+    {
+        let mut remint: BTreeMap<String, String> = BTreeMap::new();
+        for name in REMINT_RESPONSE_HEADERS {
+            if let Some(val) = resp.headers().get(name) {
+                if let Ok(s) = val.to_str() {
+                    let t = s.trim();
+                    if !t.is_empty() {
+                        remint.insert(name.to_string(), t.to_string());
+                    }
+                }
+            }
+        }
+        if !remint.is_empty() {
+            let payload = serde_json::json!({ "headers": remint });
+            let mut meta = STREAM_HDRS_PREFIX.as_bytes().to_vec();
+            meta.extend_from_slice(payload.to_string().as_bytes());
+            let _ = on_chunk.send(meta);
+        }
     }
 
     // ★ 优化：binary channel + 50ms 窗口合并 + 长 stream 心跳

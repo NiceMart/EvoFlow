@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from evoflow.persistence.chat_message_content import (
@@ -16,6 +17,8 @@ from evoflow.persistence.chat_message_content import (
 )
 from evoflow.persistence.db import db_connection_lock, get_db, run_db_transaction
 from evoflow.persistence.timestamps import iso_z_to_ms, ms_to_iso_z, now_iso_z
+
+logger = logging.getLogger(__name__)
 
 # Real user turns kept immediately before the compaction marker (runtime-aligned).
 _PRE_COMPACTION_KEEP_USER_TURNS = 3
@@ -123,6 +126,15 @@ _INJECTED_USER_TOOL_NAMES = frozenset(
         "todo_reminder",
         "collab_phase_hint",
         "xiaomi_ui_context",
+        # 【self-evolution-bot · 2026-11-21 · 第107轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：把后台任务完成通知加进「不得作为 user 转录落库」的名单。
+        # 为什么（本轮现网实证）：个人助理会话里出现一条
+        #   role=user / tool_name=task-notification / content=<task-notification>…</task-notification>
+        #   （16:15:08.855 写入）。前端按 user 行渲染气泡，用户看到的就是一段机器 XML
+        #   冒充自己说的话。这正是「为啥总是要这样去显示」的第二类来源。
+        # 判据：系统注入一律不该出现在用户气泡里；对应 write 点在
+        #   session_transcript_hydration_middleware.py:246（tool_name="task-notification"）。
+        "task-notification",
     }
 )
 
@@ -153,6 +165,12 @@ def _is_injected_user_transcript(*, role: str, payload: dict[str, Any], tool_nam
     text = plain_text(payload).lstrip()
     if not text:
         return False
+    # 【self-evolution-bot · 2026-11-21 · 第107轮 · 模型:deepseek-v4.1-flash-1017】
+    # 改了什么：按文本前缀兜底排除后台任务/子任务完成通知。
+    # 为什么：tool_name 只在新写入点带得上，历史行与别处的注入可能为空；
+    #   这类注入绝不是用户说的，绝不能进用户气泡。
+    if text.startswith("<task-notification>") or text.startswith("<subagent-notification>"):
+        return True
     if text.startswith("<xiaomi_ui_context>"):
         return True
     lower = text.lower()
@@ -565,6 +583,36 @@ def delete_messages_for_session(session_key: str, *, conn: Any | None = None) ->
 
     def _delete(db: Any) -> int:
         cur = db.execute("DELETE FROM evoflow_chat_messages WHERE session_key = ?", (sk,))
+        return int(cur.rowcount or 0)
+
+    if conn is not None:
+        return _delete(conn)
+    return run_db_transaction(_delete)
+
+
+def delete_message_by_message_id(
+    session_key: str, message_id: str, *, conn: Any | None = None
+) -> int:
+    """Delete one transcript row by ``message_id`` (deterministic ids only). Returns deleted count.
+
+    【self-evolution-bot · 2026-11-22 · 第118轮 · 模型:deepseek-v4.1-flash-1017】
+    改了什么：新增本函数。
+    为什么：``empty-run-<turn_id>`` 这类占位现在会真的落库（见 agui_mirror
+      ``_persist_notice_assistant_text``），但「迟到正文到达 → 撤占位」原实现只动 hub
+      内存行（``author_remove_rows``），DB 那条会留下来 —— 刷新后同一轮里既有真回复、
+      又有「本轮未产出可见回复」，比不落库更糟。本函数给撤占位提供 DB 侧出口。
+    边界：只按 ``message_id`` 精确删一行，不按前缀/时间删；空值直接返回 0。
+    """
+    sk = str(session_key or "").strip()
+    mid = str(message_id or "").strip()
+    if not sk or not mid:
+        return 0
+
+    def _delete(db: Any) -> int:
+        cur = db.execute(
+            "DELETE FROM evoflow_chat_messages WHERE session_key = ? AND message_id = ?",
+            (sk, mid),
+        )
         return int(cur.rowcount or 0)
 
     if conn is not None:
@@ -1045,6 +1093,11 @@ def append_messages_batch(
                     token_totals[key] += int(res.get(key) or 0)
             else:
                 skipped += 1
+        # 大批量（迁移/导入千条）分批提交：每 50 行 commit 一次，把 checkpoints/主库
+        # 跨进程写竞争窗口从「整批」缩到「单批」。条目幂等（skip_if_message_id_exists），
+        # 中途失败重放安全。
+        if conn is None and (appended + skipped) and (appended + skipped) % 50 == 0:
+            db.commit()
         batch_run = str(run_id or "").strip() or None
         if batch_run:
             _backfill_run_id_on_turn_tail(sk, batch_run, thread_id=thread_id, conn=db)
@@ -1153,6 +1206,15 @@ def _row_to_display_dict(row: dict[str, Any]) -> dict[str, Any]:
         msg["round_id"] = row["round_id"]
     if row.get("thread_id"):
         msg["thread_id"] = row["thread_id"]
+    # 【self-evolution-bot · 2026-11-19 · 第60轮 · 模型:deepseek-v4.1-flash-1017】
+    # 改了什么：display dict 补回 ``created_at_ms``（原始毫秒）。
+    # 为什么：此前本函数只在**末尾**产出 ``timestamp``（ISO 串），而
+    # ``employees.messages`` 读 ``created_at`` / ``created_at_ms`` ⇒ 现网实测每条
+    # 消息时间全为 null，「最近几条对话」看不出先后、判断不了哪条是新回复。
+    # 上游行本来就有 ``created_at_ms``，是这一层丢掉的。给毫秒原值（下游可精确
+    # 格式化），``timestamp`` 保持不动以免影响既有读侧。
+    if row.get("created_at_ms") is not None:
+        msg["created_at_ms"] = row["created_at_ms"]
     if row.get("parent_thread_id"):
         msg["parent_thread_id"] = row["parent_thread_id"]
     if row.get("model_name"):
@@ -1467,6 +1529,33 @@ def _is_hidden_context_user_transcript_row(row: dict[str, Any]) -> bool:
     return _is_hidden_context_user_transcript(role=role, payload=payload, tool_name=row.get("tool_name"))
 
 
+def _is_injected_user_transcript_row(row: dict[str, Any]) -> bool:
+    # 【self-evolution-bot · 2026-11-21 · 第107轮 · 模型:deepseek-v4.1-flash-1017】
+    # 改了什么：给「显示路径」补一个行级注入判据（复用写入侧同一函数）。
+    # 为什么（本轮现网实证）：写入侧只拦新数据，历史行早已落库；而显示路径
+    #   _is_hidden_context_user_transcript_row 只认 hidden 名单，不认 injected 名单，
+    #   于是 <task-notification> 这类系统注入照样被渲染成 user 气泡。
+    # 现网复算（库 evoflow.db，4465 条 user 行）：显示路径当前会漏出 875 行，
+    #   100% 是 <task-notification> 开头的 XML；补此判据后降为 0。
+    # 边界：conversation_summary 在 _is_injected_user_transcript 里显式放行（摘要要可见）。
+    role = str(row.get("role") or "").strip().lower()
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else loads_payload(str(row.get("content_json") or ""))
+    return _is_injected_user_transcript(role=role, payload=payload, tool_name=row.get("tool_name"))
+
+
+def _display_visible_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # 【self-evolution-bot · 2026-11-21 · 第107轮 · 模型:deepseek-v4.1-flash-1017】
+    # 改了什么：显示路径统一走这一个「哪些行该给用户看」的判据，
+    #   同时滤掉 hidden（goal/duty brief 等）与 injected（task-notification 等）。
+    # 为什么：四处调用点各自只写了一半判据，新增一类注入就要满地找；
+    #   合成单点后，下次新增注入类型只改 _INJECTED_USER_TOOL_NAMES 一处。
+    return [
+        r
+        for r in rows
+        if not _is_hidden_context_user_transcript_row(r) and not _is_injected_user_transcript_row(r)
+    ]
+
+
 def _find_latest_real_user_lead_row(session_key: str) -> dict[str, Any] | None:
     """Newest main-session user row with real content (scan backward in transcript)."""
     sk = str(session_key or "").strip()
@@ -1493,11 +1582,14 @@ def _find_latest_real_user_lead_row(session_key: str) -> dict[str, Any] | None:
 
 
 def _anchor_latest_real_user_into_lead_rows(rows: list[dict[str, Any]], session_key: str) -> list[dict[str, Any]]:
-    """Ensure a genuine user turn is present for model context when the tail omits one.
+    """Ensure a genuine user turn is present for model context when the stitch omits one.
 
-    After ``conversation_summary`` exists, post-compaction rows are stitched verbatim
-    from DB (summary row through latest). User context for that segment is injected
-    via system prompt — do not splice session-wide user rows into the transcript.
+    After ``conversation_summary`` exists the happy path is
+    ``[pre-bridge users] → [summary] → [post tail]``. When the pre-bridge is empty
+    (historical bug: newest-N window from ``anchor_seq`` slid past the live ask once
+    the post-summary tool tail grew), splice the newest *pre-summary* real user
+    immediately before the summary so the model does not continue from Goal alone.
+    Never splice a post-summary user in front of the marker — that belongs in the tail.
     """
     if not rows:
         return rows
@@ -1508,7 +1600,19 @@ def _anchor_latest_real_user_into_lead_rows(rows: list[dict[str, Any]], session_
             summary_idx = i
 
     if summary_idx >= 0:
-        return rows
+        if any(_is_real_user_transcript_row(r) for r in rows[:summary_idx]):
+            return rows
+        anchor = _find_latest_real_user_lead_row(session_key)
+        if anchor is None:
+            return rows
+        anchor_seq = int(anchor.get("seq") or 0)
+        summary_seq = int(rows[summary_idx].get("seq") or 0)
+        # Only recover users that belong *before* the marker.
+        if anchor_seq <= 0 or (summary_seq > 0 and anchor_seq >= summary_seq):
+            return rows
+        if any(int(r.get("seq") or 0) == anchor_seq for r in rows):
+            return rows
+        return [*rows[:summary_idx], anchor, *rows[summary_idx:]]
 
     if any(_is_real_user_transcript_row(r) for r in rows):
         return rows
@@ -1617,20 +1721,37 @@ def find_latest_compaction_seq(session_key: str) -> int | None:
 
 
 def get_session_hydration_watermark(session_key: str) -> tuple[int, int | None]:
-    """Cheap ``(max_seq, compaction_seq)`` for hydration cache fingerprinting."""
+    """Cheap ``(max_seq, compaction_seq)`` for hydration cache fingerprinting.
+
+    Soft-fail on ``db_process_lock_timeout``: this runs from
+    ``SessionTranscriptHydrationMiddleware.before_model`` on LangGraph's
+    asyncio bg-loop. Raising kills the whole run; LangGraph serde then shows
+    a fake 「An internal error occurred」. Prefer ``(0, None)`` and skip rebuild.
+    """
     sk = str(session_key or "").strip()
     if not sk:
         return 0, None
-    row = (
-        get_db()
-        .execute(
-            "SELECT COALESCE(MAX(seq), 0) FROM evoflow_chat_messages WHERE session_key = ?",
-            (sk,),
+    try:
+        row = (
+            get_db()
+            .execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM evoflow_chat_messages WHERE session_key = ?",
+                (sk,),
+            )
+            .fetchone()
         )
-        .fetchone()
-    )
-    max_seq = int(row[0] or 0) if row else 0
-    return max_seq, find_latest_compaction_seq(sk)
+        max_seq = int(row[0] or 0) if row else 0
+        return max_seq, find_latest_compaction_seq(sk)
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "db_process_lock_timeout" in msg or "database is locked" in msg:
+            logger.warning(
+                "get_session_hydration_watermark skipped (db busy) session=%s: %s",
+                sk[:48],
+                str(exc)[:180],
+            )
+            return 0, None
+        raise
 
 
 def load_conversation_summary_text(session_key: str) -> str | None:
@@ -1860,9 +1981,19 @@ def list_lead_chat_rows_for_model_hydration(
     row_cap = None if limit is None else max(1, int(limit))
     if compaction_seq is not None:
         anchor_seq = _find_pre_compaction_anchor_seq(session_key, compaction_seq)
-        pre_cap = max(_PRE_COMPACTION_KEEP_USER_TURNS * 4, 12)
+        # Load the half-open interval [anchor_seq, compaction_seq) only.
+        # Do NOT use ``_list_lead_chat_rows_from_min_seq(..., max_want=N)`` here:
+        # that keeps the *newest* N rows with seq>=anchor, so once the post-summary
+        # CUA/tool tail grows past N, every pre-bridge user falls out of the window
+        # and the model only sees summary Goal + orphan tool hops (paint redraw loop).
+        pre_raw = _list_lead_chat_rows(
+            session_key,
+            limit=None,
+            min_seq=int(anchor_seq),
+            before_seq=int(compaction_seq),
+        )
         pre_rows = _filter_pre_compaction_bridge_rows(
-            _list_lead_chat_rows_from_min_seq(session_key, anchor_seq, max_want=pre_cap),
+            pre_raw,
             compaction_seq=int(compaction_seq),
         )
         summary_row = _lead_row_at_seq(session_key, int(compaction_seq))
@@ -2226,7 +2357,12 @@ def list_messages_for_display_all(
     # 同 paginated：显示路径不做 on-read 全表 backfill（抢 SQLite 锁）。
     lead_rows = _enrich_run_ids_for_display_rows(lead_rows)
     if not include_hidden:
-        lead_rows = [r for r in lead_rows if not _is_hidden_context_user_transcript_row(r)]
+        lead_rows = _display_visible_rows(lead_rows)
+    else:
+        # 【self-evolution-bot · 2026-11-21 · 第107轮 · 模型:deepseek-v4.1-flash-1017】
+        # include_hidden 只该放行 hidden（duty brief 这类调试要看），
+        # 系统注入（task-notification 等）任何时候都不该冒充用户说话。
+        lead_rows = [r for r in lead_rows if not _is_injected_user_transcript_row(r)]
     messages = [_row_to_display_dict(r) for r in lead_rows]
     oldest_seq = int(lead_rows[0]["seq"]) if lead_rows else None
     return {"messages": messages, "has_more": False, "oldest_seq": oldest_seq, "round_id": rid}
@@ -2255,7 +2391,7 @@ def list_messages_for_display_paginated(
     # 显示列表路径禁止 on-read 全表 UPDATE backfill：会在共享 SQLite 锁上拖到数秒，
     # 与 chatSend / RUN_STARTED 抢锁。缺 run_id 只做内存 enrich；持久化另走后台任务。
     lead_rows = _enrich_run_ids_for_display_rows(lead_rows)
-    lead_rows = [r for r in lead_rows if not _is_hidden_context_user_transcript_row(r)]
+    lead_rows = _display_visible_rows(lead_rows)
     lead_rows = _align_display_page_to_user_turn(sk, lead_rows, page_limit=lim)
     messages = [_row_to_display_dict(r) for r in lead_rows]
     oldest_seq = int(lead_rows[0]["seq"]) if lead_rows else None
@@ -2294,7 +2430,7 @@ def _align_display_page_to_user_turn(
         older_chunk = _list_lead_chat_rows(sk, limit=8, before_seq=cursor)
         if not older_chunk:
             break
-        visible = [r for r in older_chunk if not _is_hidden_context_user_transcript_row(r)]
+        visible = _display_visible_rows(older_chunk)
         if not visible:
             # Only hidden rows older — advance cursor past them
             try:
@@ -2307,7 +2443,7 @@ def _align_display_page_to_user_turn(
             older_chunk = _list_lead_chat_rows(sk, limit=1, before_seq=cursor)
             if not older_chunk:
                 break
-            visible = [r for r in older_chunk if not _is_hidden_context_user_transcript_row(r)]
+            visible = _display_visible_rows(older_chunk)
             if not visible:
                 break
         # Prepend oldest→newest so out[0] moves backward

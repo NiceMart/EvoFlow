@@ -81,11 +81,37 @@ def _workflow_app_result(data: dict[str, Any]) -> dict[str, Any]:
 # ── knowledge ──────────────────────────────────────────────────────────────
 
 
-def knowledge_list(_args: dict[str, Any]) -> dict[str, Any]:
+def knowledge_list(args: dict[str, Any]) -> dict[str, Any]:
+    """列出平台自有知识库；默认去掉与 ``storageDir`` 逐字相同的 ``resolvedStorageDir``。
+
+    【self-evolution-bot · 2026-11-19 · 第60轮 · 模型:deepseek-v4.1-flash-1017】
+    改了什么：默认对每条库做去重（``resolvedStorageDir`` 与 ``storageDir`` 同值时删掉
+    前者），``full=true`` 回 service 原文。
+    为什么：现网 7 个库实测 **10235 字节**，其中 ``storageDir`` 686 + ``resolvedStorageDir``
+    686，而 **7/7 两条逐字相同**——`resolvedStorageDir` 只在「存储根被重定向」时才有
+    存在的必要。真正需要的是 ``id``（``platform_workflow_schema`` 明写
+    ``knowledge.list → 知识库 id``），不是同一路径说两遍。
+    注意：``owned_service.list_bases()`` 可能返回进程内缓存，**必须复制**后再删键，
+    否则会把下游读到的对象一起改掉。
+    """
     from evoflow.admin import knowledge as kn
 
     data = kn.list_bases()
-    return {"ok": True, **data}
+    if _arg_bool(args, "full", False):
+        return {"ok": True, **data}
+    items: list[dict[str, Any]] = []
+    for row in data.get("items") or []:
+        copy = dict(row) if isinstance(row, dict) else row
+        if isinstance(copy, dict) and copy.get("resolvedStorageDir") == copy.get("storageDir"):
+            copy.pop("resolvedStorageDir", None)
+        items.append(copy)
+    return {
+        "ok": True,
+        **{k: v for k, v in data.items() if k != "items"},
+        "items": items,
+        "deduped": True,
+        "note": "resolvedStorageDir 与 storageDir 相同时已省略；要原文传 full=true。",
+    }
 
 
 def knowledge_search(args: dict[str, Any]) -> dict[str, Any]:
@@ -606,16 +632,96 @@ def workflow_restore_revision(args: dict[str, Any]) -> dict[str, Any]:
 # ── settings / models ──────────────────────────────────────────────────────
 
 
-def settings_list_models(_args: dict[str, Any]) -> dict[str, Any]:
+# 【self-evolution-bot · 2026-11-19 · 第62轮 · 模型:deepseek-v4.1-flash-1017】
+# 改了什么：``settings.list_models`` 默认不再逐条回「模型实例化开关」
+# （``thinking`` / ``when_thinking_enabled`` / ``use``），改为顶层 ``sharedConfig``
+# 去重存放 + ``configOmitted`` 说明；``include_config=true`` 逐字还原旧输出。
+# 为什么：现网 43 个模型实测返回 **26486 字节**，三项合计 6816（26%），
+# 且高度同质（``thinking`` 36/43 完全相同、``when_thinking_enabled`` 25/43、
+# ``use`` 42/43 都是 ``langchain_openai:ChatOpenAI``）。这三个键是**建客户端时传给
+# LangChain 的参数**，不是「我配了哪些模型」的判断依据；看能力看
+# ``supports_thinking`` / ``supports_vision`` 布尔即可，真要调参用 ``settings.get_model``。
+_MODEL_INSTANCE_CONFIG_KEYS = ("thinking", "when_thinking_enabled", "use")
+_MODEL_LIST_SHARED_THRESHOLD = 0.8
+
+
+def settings_list_models(args: dict[str, Any]) -> dict[str, Any]:
     from evoflow.admin import models as models_admin
 
     primary = models_admin.get_primary_model()
     listed = models_admin.list_models()
-    return {
+    models = list(listed.get("models") or [])
+    if _arg_bool(args, "include_config", False):
+        return {
+            "ok": True,
+            "primary_model": primary.get("primary_model"),
+            "models": models,
+            "count": len(models),
+            "configIncluded": True,
+        }
+
+    # 找出「取值在大多少模型上相同」的实例化开关 → 提到顶层 sharedConfig，条目里删掉。
+    # 少数派取值（如某个模型的 thinking default_level 是 low）不回顶层，保留在条目上，
+    # 绝不静默丢差异：宁可多回几个字节，也不许让调用方以为所有模型都长一样。
+    total = len(models)
+    hoisted: dict[str, Any] = {}
+    drop_from_rows: set[tuple[int, str]] = set()
+    if total >= 2:
+        for key in _MODEL_INSTANCE_CONFIG_KEYS:
+            buckets: dict[str, list[int]] = {}
+            for idx, row in enumerate(models):
+                if not isinstance(row, dict) or key not in row:
+                    continue
+                sig = json.dumps(row.get(key), sort_keys=True, ensure_ascii=False, default=str)
+                buckets.setdefault(sig, []).append(idx)
+            if not buckets:
+                continue
+            sig, idxs = max(buckets.items(), key=lambda kv: len(kv[1]))
+            if len(idxs) / total < _MODEL_LIST_SHARED_THRESHOLD:
+                continue
+            hoisted[key] = json.loads(sig)
+            drop_from_rows.update((idx, key) for idx in idxs)
+
+    slim: list[Any] = []
+    for idx, row in enumerate(models):
+        if not isinstance(row, dict):
+            slim.append(row)
+            continue
+        copy = dict(row)
+        for key in _MODEL_INSTANCE_CONFIG_KEYS:
+            if (idx, key) in drop_from_rows:
+                copy.pop(key, None)
+        slim.append(copy)
+
+    # 【self-evolution-bot · 2026-11-19 · 第62轮 · 模型:deepseek-v4.1-flash-1017】
+    # 改了什么：note 由**固定列举三个键**改成按本次实际提出去的键动态生成。
+    # 为什么：重启后真调发现文案与行为不符——note 写着「已省去 thinking /
+    # when_thinking_enabled / use」，而 when_thinking_enabled 只占 25/43（低于 80% 阈值）
+    # 根本没被提走，43 条里全都在。固定列举的说明会随数据漂移而说谎。
+    omitted = sorted(hoisted.keys())
+    if omitted:
+        note = (
+            "条目内已省去与多数模型相同的实例化开关（"
+            + " / ".join(omitted)
+            + "），它们的共同取值见 sharedConfig；某个模型自己的差异值仍留在该条目上。"
+            "要看全部逐条配置传 include_config=true，或对单个模型用 settings.get_model。"
+        )
+    else:
+        note = (
+            "本次没有在多数模型间重复的实例化开关，输出未做省略；"
+            "要看完整逐条配置传 include_config=true。"
+        )
+    out: dict[str, Any] = {
         "ok": True,
         "primary_model": primary.get("primary_model"),
-        "models": listed.get("models") or [],
+        "models": slim,
+        "count": total,
+        "configOmitted": omitted,
+        "note": note,
     }
+    if hoisted:
+        out["sharedConfig"] = hoisted
+    return out
 
 
 def settings_get_default_model(_args: dict[str, Any]) -> dict[str, Any]:
@@ -786,9 +892,57 @@ def openai_vision(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def assets_get_profile(args: dict[str, Any]) -> dict[str, Any]:
+    """查看用户画像；``principal_id`` 缺失时必须大声说，不许回空白模板冒充「画像」。
+
+    【self-evolution-bot · 2026-11-19 · 第60轮 · 模型:deepseek-v4.1-flash-1017】
+    改了什么：``principal_id`` 为空时不再静默落到默认 entity 的**空白模板**，改为
+    返回 ``ok`` 仍 True 但带 ``empty_template: true`` + ``degraded_reason``，并在
+    ``hint`` 里明说「这不是某个人的画像」。``principal_id`` 有值时照旧。
+    为什么：现网实测 ``assets_get_profile({})`` 返回的 USER.md 是**未填写的模板**
+    （「（希望 Agent 如何称呼您；…）」），而 ``assets_get_profile({"principal_id":
+    "admin"})`` 才拿到真画像（「称呼：**银泰**…」）。两者都是 ``ok: true`` 和
+    ``dimensions``，调一次根本分不出「这人还没写」和「我没找对人」——
+    这类数据必须自带「我读的是谁的」标识。
+    """
     from evoflow.admin import profile as profile_admin
 
-    return {"ok": True, **profile_admin.get_user_profile(principal_id=_arg_str(args, "principal_id"))}
+    principal = _arg_str(args, "principal_id", "principalId", "user_id", "user")
+    data = profile_admin.get_user_profile(principal_id=principal)
+    # 【self-evolution-bot · 2026-11-19 · 第60轮 · 模型:deepseek-v4.1-flash-1017】
+    # 改了什么：``dimensions["USER.md"]`` 与 ``fields["USER.md"]`` **逐字相同**时删掉
+    # ``dimensions``，改为 ``dimensionsAliasOfFields: true``；``full=true`` 还原。
+    # 为什么：重启后真调实测本动作 **4907 字节**，``dimensions`` 1401 全用在把
+    # ``fields["USER.md"]``（565 字）再抄一遍——``dimensions`` 只是历史兼容视角
+    # （``read_user_profile_dimensions`` 的 docstring 自称 "Compat: returns {USER.md: text}"）。
+    if _arg_bool(args, "full", False):
+        out = {"ok": True, "principal_id": principal, **data}
+        return out
+    dims = data.get("dimensions") if isinstance(data.get("dimensions"), dict) else {}
+    fields = data.get("fields") if isinstance(data.get("fields"), dict) else {}
+    if dims and all(fields.get(k) == v for k, v in dims.items()):
+        data = {k: v for k, v in data.items() if k != "dimensions"}
+        data["dimensionsAliasOfFields"] = True
+    if principal:
+        return {"ok": True, "principal_id": principal, **data}
+    # 【self-evolution-bot · 2026-11-19 · 第60轮 · 模型:deepseek-v4.1-flash-1017】
+    # 判「是不是空白模板」只认 USER.md 这一份：``fields`` 里还含 README.md / affect.md，
+    # 那两份有内容，混进来会把空白模板判成「已填写」（我第一版就这么写错了，
+    # 无参分支的 empty_template 从 True 变成 False）。
+    source = data.get("fields") if isinstance(data.get("fields"), dict) else {}
+    user_md = str((source or {}).get("USER.md") or "").strip()
+    blank = (not user_md) or ("填写后" in user_md[:200]) or ("（希望 Agent" in user_md)
+    return {
+        "ok": True,
+        "principal_id": "",
+        **data,
+        "empty_template": blank,
+        "degraded_reason": (
+            "没拿到 principal_id，读的是默认 entity 下的 USER.md；"
+            + ("内容仍是未填写的空白模板，" if blank else "")
+            + "这**不代表某个人没画像**，也不代表画像为空。"
+        ),
+        "hint": "要读某个人的画像请传 principal_id（如 admin）；对话内注入的画像走 assets profile，与这里同源。",
+    }
 
 
 def assets_update_profile(args: dict[str, Any]) -> dict[str, Any]:
@@ -797,9 +951,26 @@ def assets_update_profile(args: dict[str, Any]) -> dict[str, Any]:
     path = _arg_str(args, "path", "dimension", "dim")
     content = args.get("content")
     if content is None:
-        content = args.get("text") or args.get("profile")
+        # 【self-evolution-bot · 2026-11-18 · 第54轮 · 模型:deepseek-v4.1-flash-1017】
+        # 补 ``append`` / ``body`` 作为 content 的别名。
+        # 为什么：现网 obs 里 ``assets.update_profile`` 的 2 次 ``content is required``，
+        # 其中一次入参是 ``{"path": "...", "append": "..."}`` —— ``append`` 是 ``assets``
+        # 工具 write 分支的参数名，模型把两个工具的键混用了。语义完全一致（都是正文），
+        # 没有理由因为键名不同就退一次。
+        content = args.get("text") or args.get("profile") or args.get("append") or args.get("body")
     if content is None or not str(content).strip():
-        raise ValidationError("content is required")
+        # 另一次是 ``content=""`` 配 ``remove_agent_note_contains``：想在档案里「删一段」。
+        # 本 action 只做写入，不提供删除语义；如实说明，不假装支持。
+        _extra_keys = sorted(k for k in ("remove_agent_note_contains", "remove", "delete") if k in args)
+        raise ValidationError(
+            "content is required — 传要写入的正文（content / text / profile / append 均可）。"
+            + (
+                f" 注意：本次带上了 {_extra_keys}，但 assets.update_profile 只做写入、"
+                "不支持按内容删除；要改档案请整段改写（mode=replace）后重传。"
+                if _extra_keys
+                else ""
+            )
+        )
     mode = _arg_str(args, "mode") or "append"
     return {
         "ok": True,
@@ -943,12 +1114,16 @@ def agents_list(args: dict[str, Any]) -> dict[str, Any]:
     tag = _arg_str(args, "tag", "tags") or None
     agent_name = _arg_str(args, "agent_name", "agentName", "name_cn") or None
     include_soul = _arg_bool(args, "include_soul", False)
+    # 【self-evolution-bot · 2026-11-19 · 第60轮 · 模型:deepseek-v4.1-flash-1017】
+    # list 默认收窄（不回每个 agent 的 system_prompt 全文）；确要全文才显式打开。
+    include_prompt = _arg_bool(args, "include_prompt", False)
     limit = args.get("limit")
     offset = args.get("offset")
     kwargs: dict[str, Any] = {
         "tag": tag,
         "agent_name": agent_name or None,
         "include_soul": include_soul,
+        "include_prompt": include_prompt,
     }
     if limit is not None:
         try:
@@ -1000,6 +1175,14 @@ def agents_create(args: dict[str, Any]) -> dict[str, Any]:
             out["hint"] = agent.get("hint")
         if agent.get("warning"):
             out["warning"] = agent.get("warning")
+        if agent.get("as_employee") is not None:
+            out["as_employee"] = agent.get("as_employee")
+        if agent.get("role_created") is not None:
+            out["role_created"] = agent.get("role_created")
+        if agent.get("employee") is not None:
+            out["employee"] = agent.get("employee")
+        if agent.get("hire_error"):
+            out["hire_error"] = agent.get("hire_error")
     out["assistant_guide"] = build_agent_create_assistant_guide(out)
     return out
 
@@ -1049,12 +1232,31 @@ def agents_delete(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def employees_list(args: dict[str, Any]) -> dict[str, Any]:
+    """列出智能体员工岗位；同一批数据只回一份。
+
+    【self-evolution-bot · 2026-11-19 · 第60轮 · 模型:deepseek-v4.1-flash-1017】
+    改了什么：默认不再返回 ``employees`` 与 ``items`` 两个**与 ``roles`` 同一对象**的
+    别名键（实测 ``d["roles"] is d["employees"] is d["items"]`` 为 True）；要旧别名
+    传 ``legacy_keys=true``。
+    为什么：现网 23 个岗位实测返回 **37309 字节**，``roles`` / ``employees`` / ``items``
+    各 12333——**同一份 list 被序列化了三遍**，白占 24666 字节（66%）。
+    别名本身是历史兼容（三个名字指同一批数据），不是三份不同的事实；
+    留一个权威键 ``roles`` 就够，调用方按名字取哪个都能从它推出来。
+    """
     from evoflow.admin import employees as emp
 
     status = _arg_str(args, "status") or None
     data = emp.list_roles(status=status)
     roles = data.get("roles") if isinstance(data.get("roles"), list) else []
-    return {"ok": True, **data, "employees": roles, "items": roles}
+    if _arg_bool(args, "legacy_keys", False):
+        return {"ok": True, **data, "employees": roles, "items": roles}
+    return {
+        "ok": True,
+        **{k: v for k, v in data.items() if k not in ("employees", "items")},
+        "roles": roles,
+        "aliases": {"employees": "roles", "items": "roles"},
+        "note": "employees/items 与 roles 是同一批数据，已不再重复返回；要旧键传 legacy_keys=true。",
+    }
 
 
 def employees_departments(_args: dict[str, Any]) -> dict[str, Any]:
@@ -1207,6 +1409,16 @@ def employees_chat_send(args: dict[str, Any]) -> dict[str, Any]:
         session_key=_arg_str(args, "session_key", "sessionKey") or "",
         task_id=_arg_str(args, "task_id", "taskId", "related_task_id", "relatedTaskId") or "",
         source=_arg_str(args, "source") or "xiaomi",
+        # 【self-evolution-bot · 2026-11-21 · 第108轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：把 deliver 透传给 chat_send。
+        # 为什么（用户 2026-11-21 点破）：默认 wake=后台跑，面板里没有流式、啥也看不到。
+        #   传 deliver="panel" 时改由桌面面板本地 chatSend，走 live SSE 逐字流，
+        #   与用户手打消息同一条通路。
+        # 【self-evolution-bot · 2026-11-21 · 第109轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：默认从 "wake" 改成 "auto"（不传就让 chat_send 自己选）。
+        # 为什么：用户要的是「和我在面板手打一样能看到流」，默认走后台 wake 就是
+        #   页面上啥也看不到。auto = 面板在就驱面板（真流式），面板不在才回落 wake。
+        deliver=_arg_str(args, "deliver", "delivery") or "auto",
     )
     # Display: Chinese role_name, else agent_name; never use English agent_code as title.
     display = str(role.role_name or "").strip()
@@ -1656,7 +1868,41 @@ def employees_bind_channel_apply(args: dict[str, Any]) -> dict[str, Any]:
 # ── tasks ──────────────────────────────────────────────────────────────────
 
 
+def _clip_long_text(text: Any, limit: int, hint: str = "") -> tuple[Any, int]:
+    """把过长的正文裁成预览，返回 (裁剪后的值, 原字符数)。非字符串原样返回。
+
+    【self-evolution-bot · 2026-11-19 · 第60轮 · 模型:deepseek-v4.1-flash-1017】
+    配套 ``tasks.list`` 的减重：裁剪**必须在返回里显式标记**（``*Chars`` 字段 +
+    结尾「…（共 N 字，正文用 X）」），不许静默砍成半句让人以为原文就这么短。
+
+    【同上·更正】``hint`` 必须由调用方传 **本动作真正对应的详情动作名**。
+    我第一版把它写死成「正文用 tasks.get」，复用给 ``items.list`` 时提示就成了
+    「…正文用 tasks.get」——**指错地方比不说更糟**，我自己写的回归测试当场抓红。
+    """
+    if not isinstance(text, str):
+        return text, 0
+    n = len(text)
+    if n <= limit:
+        return text, n
+    where = f"，正文用 {hint}" if hint else ""
+    return f"{text[:limit]}…（共 {n} 字{where}）", n
+
+
+_TASKS_LIST_TEXT_LIMIT = 200
+
+
 def tasks_list(args: dict[str, Any]) -> dict[str, Any]:
+    """列出协作任务；默认把 ``description`` / ``summary`` 裁成 200 字预览。
+
+    【self-evolution-bot · 2026-11-19 · 第60轮 · 模型:deepseek-v4.1-flash-1017】
+    改了什么：新增 ``full_text`` 开关（默认 False）。为 False 时把每条任务的
+    ``description`` / ``summary`` 裁到 200 字并附 ``descriptionChars`` /
+    ``summaryChars`` + 顶层 ``textSlim: true`` 说明；``full_text=true`` 逐字还原。
+    为什么：现网默认 50 条实测返回 **200865 字节**，其中 ``description`` 91524、
+    ``summary`` 39945，两项占 **65%**；而 `tasks.list` 的语义是「有哪些任务、什么状态」，
+    正文是 `tasks.get` 的事。之前只加了「limit 上限 200」防百万 token 转储，
+    但 50 条就已经 200KB——上限挡不住单条正文本身有多长。
+    """
     from evoflow.admin import tasks as tasks_admin
 
     # Default include_subtasks=false; hard-cap limit at 200 to avoid million-token dumps (DEF-03).
@@ -1675,17 +1921,57 @@ def tasks_list(args: dict[str, Any]) -> dict[str, Any]:
     except (TypeError, ValueError) as e:
         raise ValidationError("offset must be an integer") from e
 
+    data = tasks_admin.list_tasks(
+        status=_arg_str(args, "status") or None,
+        assignee=_arg_str(args, "assignee", "agent_code", "agentCode") or None,
+        role=_arg_str(args, "role", "role_name") or None,
+        source=_arg_str(args, "source") or None,
+        main_task_id=_arg_str(args, "main_task_id", "mainTaskId") or None,
+        include_subtasks=_arg_bool(args, "include_subtasks", False),
+        limit=limit,
+        offset=offset,
+    )
+    if _arg_bool(args, "full_text", False):
+        return {"ok": True, **data}
+
+    slimmed: list[Any] = []
+    for row in data.get("tasks") or []:
+        if not isinstance(row, dict):
+            slimmed.append(row)
+            continue
+        copy = dict(row)
+        for field, chars_key in (("description", "descriptionChars"), ("summary", "summaryChars")):
+            value, chars = _clip_long_text(copy.get(field), _TASKS_LIST_TEXT_LIMIT, "tasks.get")
+            if chars > _TASKS_LIST_TEXT_LIMIT:
+                copy[field] = value
+                copy[chars_key] = chars
+        # 【self-evolution-bot · 2026-11-19 · 第60轮 · 模型:deepseek-v4.1-flash-1017】
+        # handlers[].content 是「派给下游的指令正文」，单条约 700 字。列表里 50 条
+        # 实测占 17399 字节，而列表只需看清「派给了谁、有没有派出去」。
+        # 同样裁成预览并给 handlerContentChars，不许静默截断。
+        handlers = copy.get("handlers")
+        if isinstance(handlers, list) and handlers:
+            new_handlers: list[Any] = []
+            for handler in handlers:
+                if not isinstance(handler, dict):
+                    new_handlers.append(handler)
+                    continue
+                h = dict(handler)
+                value, chars = _clip_long_text(h.get("content"), _TASKS_LIST_TEXT_LIMIT, "tasks.get")
+                if chars > _TASKS_LIST_TEXT_LIMIT:
+                    h["content"] = value
+                    h["contentChars"] = chars
+                new_handlers.append(h)
+            copy["handlers"] = new_handlers
+        slimmed.append(copy)
     return {
         "ok": True,
-        **tasks_admin.list_tasks(
-            status=_arg_str(args, "status") or None,
-            assignee=_arg_str(args, "assignee", "agent_code", "agentCode") or None,
-            role=_arg_str(args, "role", "role_name") or None,
-            source=_arg_str(args, "source") or None,
-            main_task_id=_arg_str(args, "main_task_id", "mainTaskId") or None,
-            include_subtasks=_arg_bool(args, "include_subtasks", False),
-            limit=limit,
-            offset=offset,
+        **{k: v for k, v in data.items() if k != "tasks"},
+        "tasks": slimmed,
+        "textSlim": True,
+        "note": (
+            f"description/summary 已裁到 {_TASKS_LIST_TEXT_LIMIT} 字预览（字数见 "
+            "descriptionChars/summaryChars）；要看全文传 full_text=true 或 tasks.get。"
         ),
     }
 
@@ -1834,6 +2120,10 @@ def tasks_create(args: dict[str, Any]) -> dict[str, Any]:
             action_type=_arg_str(args, "action_type", "actionType") or None,
             round_id=_arg_str(args, "round_id", "roundId") or None,
             parent_task_id=_arg_str(args, "parent_task_id", "parentTaskId") or None,
+            # 【self-evolution-bot · 2026-11-20 · 第86轮 · 模型:deepseek-v4.1-flash-1017】透传去重逃生门与探针声明。
+            # _arg_bool 只认一个 key（第三参是 default），两种驼峰写法分开取。
+            allow_duplicate=_arg_bool(args, "allow_duplicate") or _arg_bool(args, "allowDuplicate"),
+            probe=_arg_bool(args, "probe"),
         ),
     }
 
@@ -2031,7 +2321,55 @@ def eval_progress(args: dict[str, Any]) -> dict[str, Any]:
 def skills_list(args: dict[str, Any]) -> dict[str, Any]:
     from evoflow.admin import skills as skills_admin
 
-    return {"ok": True, **skills_admin.list_skills(enabled_only=_arg_bool(args, "enabled_only", False))}
+    # 【self-evolution-bot · 2026-11-19 · 第60轮 · 模型:deepseek-v4.1-flash-1017】
+    # 改了什么：接上 ``limit`` / ``offset``，并在返回里带 ``count`` / ``total`` / ``has_more``。
+    # 为什么：注册表原先只有 ``enabled_only?``，``limit`` 传了也没人读——现网实测
+    # 传 ``limit=2`` 与不传完全同款 **97 条 / 60071 字节**，调用方以为截断了其实
+    # 一次吞满上下文。同域 ``tasks.list`` 早就有 limit/offset，属同能力漏接。
+    # 语义：先按 ``enabled_only`` 过滤，再截断（先过滤后分页，避免「前2条都停用」）。
+    raw_limit = args.get("limit", args.get("max_results"))
+    limit: int | None
+    if raw_limit in (None, ""):
+        limit = None
+    else:
+        try:
+            limit = max(1, int(raw_limit))
+        except (TypeError, ValueError) as e:
+            raise ValidationError("limit must be an integer") from e
+    try:
+        offset = max(0, int(args.get("offset", 0) or 0))
+    except (TypeError, ValueError) as e:
+        raise ValidationError("offset must be an integer") from e
+
+    data = skills_admin.list_skills(enabled_only=_arg_bool(args, "enabled_only", False))
+    skills = list(data.get("skills") or [])
+    # query：按 name / description 子串过滤（大小写不敏感）。
+    # 原先这个参数被**静默忽略**——传 {"query": "pace"} 照样返回全量 114 条，
+    # 调用方以为已经过滤，实际一次吞满上下文。与本域 limit/offset 属同类漏接。
+    query = (_arg_str(args, "query", "q") or "").strip().lower()
+    if query:
+        skills = [
+            s
+            for s in skills
+            if query in str(s.get("name") or "").lower()
+            or query in str(s.get("description") or "").lower()
+        ]
+    total = len(skills)
+    page = skills[offset:]
+    if limit is not None:
+        page = page[:limit]
+    out: dict[str, Any] = {"ok": True, **{k: v for k, v in data.items() if k != "skills"}}
+    out.update(
+        {
+            "skills": page,
+            "count": len(page),
+            "total": total,
+            "has_more": offset + len(page) < total,
+        }
+    )
+    if query:
+        out["query"] = query
+    return out
 
 
 def skills_get(args: dict[str, Any]) -> dict[str, Any]:
@@ -2199,10 +2537,73 @@ def mcp_set(args: dict[str, Any]) -> dict[str, Any]:
 # ── automation ─────────────────────────────────────────────────────────────
 
 
-def automation_list(_args: dict[str, Any]) -> dict[str, Any]:
+# 【self-evolution-bot · 2026-11-19 · 第63轮 · 模型:deepseek-v4.1-flash-1017】
+# 改了什么：``automation.list`` 默认把「23 条全都相同」的字段提到顶层
+# ``sharedDefaults``，条目里删掉；``full=true`` 逐字还原旧输出。
+# 为什么：现网实测返回 **12206 字节**，其中 ``description`` 一项 1633 字节是
+# **同一句话 "Shadow rule for smart-employee heartbeat..." 重复 23 次**；
+# 另有 ``kind`` / ``managed_by`` / ``schedule_type`` / ``langgraph_thread_mode``
+# 各只有 **1 种取值**（全部 23 条一致）——直接重复共 2760 字节（22.6%）。
+# 这些是「这类自动化长什么样」的背景常量，不是「哪条自动化要跑」的判断依据；
+# 少数派取值（如 22 条 paused / 1 条 active）仍逐条保留，不许被共享值顶掉。
+_AUTOMATION_SHAREABLE_KEYS = (
+    "kind",
+    "managed_by",
+    "schedule_type",
+    "langgraph_thread_mode",
+    "description",
+)
+
+
+def automation_list(args: dict[str, Any]) -> dict[str, Any]:
     from evoflow.admin import automation as auto_admin
 
-    return {"ok": True, **auto_admin.list_automations()}
+    data = auto_admin.list_automations()
+    rows = list(data.get("automations") or [])
+    if _arg_bool(args, "full", False):
+        return {"ok": True, **data, "full": True}
+
+    total = len(rows)
+    shared: dict[str, Any] = {}
+    dropped: list[str] = []
+    if total >= 2:
+        for key in _AUTOMATION_SHAREABLE_KEYS:
+            values = {
+                json.dumps(row.get(key), sort_keys=True, ensure_ascii=False, default=str)
+                for row in rows
+                if isinstance(row, dict) and key in row
+            }
+            # 必须「每一条都在且取值完全一致」才提；缺键或取值有差异的一律不动。
+            if len(values) != 1:
+                continue
+            if any(not isinstance(row, dict) or key not in row for row in rows):
+                continue
+            shared[key] = json.loads(values.pop())
+            dropped.append(key)
+
+    slim: list[Any] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            slim.append(row)
+            continue
+        copy = dict(row)
+        for key in dropped:
+            copy.pop(key, None)
+        slim.append(copy)
+
+    out: dict[str, Any] = dict(data)
+    out["automations"] = slim
+    out["count"] = len(slim)
+    if dropped:
+        out["sharedDefaults"] = shared
+        out["defaultsOmitted"] = dropped
+        out["note"] = (
+            "条目内已省去全部自动化都相同的字段（"
+            + " / ".join(dropped)
+            + "），共同取值见 sharedDefaults；有差异的字段仍逐条返回。"
+            "要看每条的完整字段传 full=true，或对单条用 automation.get。"
+        )
+    return {"ok": True, **out}
 
 
 def automation_get(args: dict[str, Any]) -> dict[str, Any]:
@@ -2343,7 +2744,13 @@ def sessions_status(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def sessions_compact(args: dict[str, Any]) -> dict[str, Any]:
-    """主动压缩当前（或指定）会话上下文 — 与 UI ``/compact`` 同引擎。"""
+    """主动压缩当前（或指定）会话上下文 — 与 UI ``/compact`` 同引擎。
+
+    【self-evolution-bot · 2026-11-20 · 第94轮 · 模型:deepseek-v4.1-flash-1017】
+    改了什么：新增可选 ``summary``。传了就用**调用方自己写的摘要正文**做结构化折叠，
+    不再另起 compress 模型重读 transcript；不传则沿用原路径（压缩模型生成摘要）。
+    为什么：正在跑的 agent 本来就持有这份上下文，让它直接总结能省一次长上下文调用。
+    """
     from evoflow.admin import sessions as sess
     from evoflow.agents.manual_context_compaction import ManualCompactionError, run_manual_context_compaction
 
@@ -2351,9 +2758,14 @@ def sessions_compact(args: dict[str, Any]) -> dict[str, Any]:
         session_key=_arg_str(args, "session_key", "sessionKey", "session"),
         thread_id=_arg_str(args, "thread_id", "threadId"),
     )
+    supplied = _arg_str(args, "summary", "compacted_summary", "digest")
     try:
         result = _run_coro_sync(
-            run_manual_context_compaction(prep["session_key"], session_row=prep["session_row"])
+            run_manual_context_compaction(
+                prep["session_key"],
+                session_row=prep["session_row"],
+                supplied_summary=supplied or None,
+            )
         )
     except ManualCompactionError as exc:
         return {
@@ -2379,12 +2791,21 @@ def sessions_compact(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def items_list(args: dict[str, Any]) -> dict[str, Any]:
+    """列出用户事项；默认把 ``notes`` 裁成预览（列表页用不上正文）。
+
+    【self-evolution-bot · 2026-11-19 · 第60轮 · 模型:deepseek-v4.1-flash-1017】
+    改了什么：新增 ``full_text`` 开关（默认 False）。为 False 时每条 ``notes`` 裁到
+    200 字并附 ``notesChars``；``full_text=true`` 逐字还原 service 输出。
+    为什么：现网 13 条实测返回 **14679 字节**，``notes`` 一项就 **7443（51%）**，
+    而 ``title`` 才 827。列表要回答「记了哪些事项、什么状态」，正文是 ``items.get``
+    的事；已有 ``page_size`` 挡条数，挡不住单条正文长度。
+    """
     from evoflow.admin import items as items_admin
 
     include_done = _arg_bool(args, "include_done", True)
     page = int(args.get("page") or 1)
     page_size = int(args.get("page_size") or args.get("limit") or 50)
-    return items_admin.list_items(
+    data = items_admin.list_items(
         status=_arg_str(args, "status") or None,
         priority=_arg_str(args, "priority") or None,
         tag=_arg_str(args, "tag") or None,
@@ -2393,6 +2814,25 @@ def items_list(args: dict[str, Any]) -> dict[str, Any]:
         page=page,
         page_size=page_size,
     )
+    if _arg_bool(args, "full_text", False):
+        return data
+    slim: list[Any] = []
+    for row in data.get("items") or []:
+        if not isinstance(row, dict):
+            slim.append(row)
+            continue
+        copy = dict(row)
+        value, chars = _clip_long_text(copy.get("notes"), _TASKS_LIST_TEXT_LIMIT, "items.get")
+        if chars > _TASKS_LIST_TEXT_LIMIT:
+            copy["notes"] = value
+            copy["notesChars"] = chars
+        slim.append(copy)
+    return {
+        **{k: v for k, v in data.items() if k != "items"},
+        "items": slim,
+        "textSlim": True,
+        "note": "notes 已裁成预览；要看全文传 full_text=true 或 items.get。",
+    }
 
 
 def items_get(args: dict[str, Any]) -> dict[str, Any]:
@@ -2409,7 +2849,16 @@ def items_create(args: dict[str, Any]) -> dict[str, Any]:
 
     title = _arg_str(args, "title", "name")
     if not title:
-        raise ValidationError("title is required")
+        # 【self-evolution-bot · 2026-11-18 · 第54轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：**先别再断言「你放顶层了」**——复核现网原件发现，5 次里有 4 次
+        # title 确实在顶层（那已被 platform_tool 的 extra 合并接住），剩下真的没传。
+        # 原来的文案把唯一原因说成「放在顶层会被忽略」，对真没传的那次是**指错方向**。
+        # 现在按「没给」说，并给出最小可用样例。
+        raise ValidationError(
+            "title is required — items.create 需要一个标题。"
+            '把它放进 args_json，例如 args_json={"title":"...","notes":"..."}'
+            "（放在工具顶层的散字段现在也会被自动并入 args_json）。"
+        )
     return {
         **items_admin.create_item(
             {
@@ -2956,6 +3405,12 @@ def _ui_panel_args(args: dict[str, Any]) -> dict[str, Any]:
     kind = _arg_str(args, "kind", "panel_kind", "surface_kind")
     title = _arg_str(args, "title") or None
     layout = _arg_str(args, "layout") or None
+    # 【self-evolution-bot · 2026-11-20 · 第91轮 · 模型:deepseek-v4.1-flash-1017】
+    # 改了什么：新增 expand 参数并透传给 apply_right_panel。
+    # 为什么：用户要求「用平台工具打开面板给我看」，但右栏被用户收起后
+    # ui.show 只写标签不撑开，返回 ok 而用户屏幕无变化（本轮实测 shellExists=false）。
+    # 默认 False 保持「不抢视线」语义；expand=True 才撑开。
+    expand = _arg_bool(args, "expand")
     data = args.get("data")
     if data is None:
         # Allow flat progress fields at top level for convenience.
@@ -2971,11 +3426,44 @@ def _ui_panel_args(args: dict[str, Any]) -> dict[str, Any]:
                 "layout",
                 "action",
                 "confirm",
+                "expand",
             }
         }
     if not isinstance(data, dict):
         data = {}
-    return {"kind": kind or None, "title": title, "layout": layout, "data": data}
+    return {
+        "kind": kind or None,
+        "title": title,
+        "layout": layout,
+        "data": data,
+        "expand": expand,
+    }
+
+
+def ui_activate(args: dict[str, Any]) -> dict[str, Any]:
+    """把右栏切到**用户已有的某个标签页**（不新建、不关闭、不改内容）。
+
+    【self-evolution-bot · 2026-11-20 · 第100轮 · 模型:deepseek-v4.1-flash-1017】
+    改了什么：新增 platform action=ui.activate。
+    为什么（用户明确指出）：「你要知道当前是哪一个，然后怎么去切换到哪一个要处理好。」
+      此前模型只有 show/update/hide 三种表达，**没有"切到某个已开的签"**。
+      想让人看回某页只能重新 show —— 而那会把同一份东西开成第二个签，
+      正好是用户担心的「用户还在右栏拉开了一些东西」被破坏的场景。
+    判据：只发 ``activate`` + ``key``，前端只改 activeKey；tabCount 前后必须相等。
+    """
+    from evoflow.tools.builtins.stage_tool import apply_right_panel
+
+    key = _arg_str(args, "key", "tab_key", "activeKey", "active_key")
+    if not key:
+        from app.gateway.routers.stage_right_panel import read_right_stage_state as _read
+
+        cur = _read()
+        keys = [str((t or {}).get("key") or "") for t in (cur.get("tabs") or [])]
+        raise ValidationError(
+            "ui.activate requires key (the tab key, e.g. 'employeeProcess:primary'). "
+            f"Read it from platform action=ui.current first. Current tabs: {keys or 'unknown'}"
+        )
+    return apply_right_panel(action="activate", key=key)
 
 
 def ui_show(args: dict[str, Any]) -> dict[str, Any]:
@@ -2983,10 +3471,37 @@ def ui_show(args: dict[str, Any]) -> dict[str, Any]:
 
     panel = _ui_panel_args(args)
     if not panel.get("kind"):
+        # 【self-evolution-bot · 2026-11-20 · 第87轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：报错里点名「先调 ui.kinds」，而不是只列几个 kind 名。
+        # 为什么：用户要求「模型展开前应先读一下当前支持什么类型、怎么展开」。
+        # 光报错不指路，模型下一轮还是会用同一个错 kind 再撞一次。
+        # 【self-evolution-bot · 2026-11-22 · 第120轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：括号里的示例清单改为「含内容预览类」，并补一句能打开文件。
+        # 为什么：原来只列 6 个进度/页面类，读到这句的模型会以为右栏只能开网页——
+        #   `file` / `asset` 明明早就能渲染（第113轮真机验过 PNG/MP4/PDF 全正常）。
+        #   报错文案本身就是一次「上下文注入」，列子集等于教错方向。
         raise ValidationError(
-            "ui.show requires kind "
-            "(collab-workflow | collabSubtaskTranscript | employeeProcess | web-embed | artifacts | …)"
+            "ui.show requires kind. Call platform action=ui.kinds first to read "
+            "supported kinds and their required fields "
+            "(file | asset | codeViewer | screenshot | web-embed | shell-page | "
+            "collab-workflow | collabSubtaskTranscript | employeeProcess | "
+            "sessionRuntime). To open a local file (md / code / image / video / audio / pdf) "
+            "use kind=file with data.path."
         )
+    # 【self-evolution-bot · 2026-11-21 · 第104轮 · 模型:deepseek-v4.1-flash-1017】
+    # 改了什么：建签前先校验 kind 是否被支持（别名先归一，再查白名单）。
+    # 为什么（本轮真机实测）：`ui.show(kind="not-a-kind")` 返回 ok:true 并真的 emit，
+    #   而前端渲染层对未知 kind 走到末尾 return null —— 用户得到**空白页签**，
+    #   原来那一页被顶掉。工具报成功、屏幕是空的，是这里最该拦的一类。
+    # 判据：未知 kind 必须 ok:false 且文案点名可用清单 + 指路 ui.kinds；
+    #   合法 kind（含内部 used 的 write/file/terminal）照旧放行 —— 见 KNOWN_KINDS 注释。
+    from evoflow.stage.right_panel_kinds import is_known_kind, unknown_kind_message
+    from evoflow.tools.builtins.stage_tool import _normalize_panel_kind
+
+    _kind = _normalize_panel_kind(str(panel.get("kind") or ""))
+    if not is_known_kind(_kind):
+        raise ValidationError(unknown_kind_message(_kind))
+    panel["kind"] = _kind
     return apply_right_panel(action="show", **panel)
 
 
@@ -2996,6 +3511,14 @@ def ui_update(args: dict[str, Any]) -> dict[str, Any]:
     panel = _ui_panel_args(args)
     if not panel.get("kind"):
         raise ValidationError("ui.update requires kind")
+    # 同 ui.show：未知 kind 不许写进右栏（update 同样会建出空白签）。
+    from evoflow.stage.right_panel_kinds import is_known_kind, unknown_kind_message
+    from evoflow.tools.builtins.stage_tool import _normalize_panel_kind
+
+    _kind = _normalize_panel_kind(str(panel.get("kind") or ""))
+    if not is_known_kind(_kind):
+        raise ValidationError(unknown_kind_message(_kind))
+    panel["kind"] = _kind
     return apply_right_panel(action="update", **panel)
 
 
@@ -3003,6 +3526,400 @@ def ui_hide(_args: dict[str, Any]) -> dict[str, Any]:
     from evoflow.tools.builtins.stage_tool import apply_right_panel
 
     return apply_right_panel(action="hide")
+
+
+def ui_close(args: dict[str, Any]) -> dict[str, Any]:
+    """关闭右栏里指定的**那一个**标签。
+
+    【self-evolution-bot · 2026-11-20 · 第101轮 · 模型:deepseek-v4.1-flash-1017】
+    改了什么：新增 platform action=ui.close。
+    为什么（用户当场要求）：「或者是给它关掉」。此前只有 ui.hide 整栏收起，
+      用户「只想关掉那一个、其它留着」做不到 —— 而前端 store 的 closeTab(key) 早就有了。
+    与 hide 的区别：hide 收起整栏（签还在，展开又回来）；close 真的删掉那一个签。
+    判据：close 后 tabCount 减 1；其它签的 key 原样保留；缺 key 时不静默，直接报错并指路。
+    """
+    from evoflow.tools.builtins.stage_tool import apply_right_panel
+
+    key = _arg_str(args, "key", "tab_key", "activeKey", "active_key")
+    if not key:
+        from app.gateway.routers.stage_right_panel import read_right_stage_state as _read
+
+        cur = _read()
+        keys = [str((t or {}).get("key") or "") for t in (cur.get("tabs") or [])]
+        raise ValidationError(
+            "ui.close requires key (the tab key to close, e.g. 'shell-page:shell:/tasks'). "
+            f"Read it from platform action=ui.current first. Current tabs: {keys or 'unknown'}. "
+            "若要整栏收起请用 ui.hide。"
+        )
+    return apply_right_panel(action="close", key=key)
+
+
+def ui_move(args: dict[str, Any]) -> dict[str, Any]:
+    """把右栏某个标签移到另一个标签的位置（调整顺序）。
+
+    【self-evolution-bot · 2026-11-20 · 第101轮 · 模型:deepseek-v4.1-flash-1017】
+    改了什么：新增 platform action=ui.move。
+    为什么（用户当场要求）：「或者给它调换位置」。前端 store 有 reorderTab(activeId, overId)，
+      后端一个入口都没有 —— 用户只能自己拖。
+    判据：move 必须同时给 key 与 target；完成后 tabCount 不变、两签先后顺序互换；
+      两者相同时直接报错（别发一个必然无效果的指令）。
+    """
+    from evoflow.tools.builtins.stage_tool import apply_right_panel
+
+    key = _arg_str(args, "key", "tab_key", "activeKey", "active_key")
+    target = _arg_str(args, "target", "target_key", "over", "over_key")
+    if not key or not target:
+        from app.gateway.routers.stage_right_panel import read_right_stage_state as _read
+
+        cur = _read()
+        keys = [str((t or {}).get("key") or "") for t in (cur.get("tabs") or [])]
+        raise ValidationError(
+            "ui.move requires key (要移动的签) and target (移到哪个签的位置). "
+            f"Both from platform action=ui.current → tabs[].key. Current tabs: {keys or 'unknown'}"
+        )
+    return apply_right_panel(action="move", key=key, target_key=target)
+
+
+def ui_current(_args: dict[str, Any]) -> dict[str, Any]:
+    """读用户当前右栏停在哪一页。
+
+    【self-evolution-bot · 2026-11-20 · 第100轮 · 模型:deepseek-v4.1-flash-1017】
+    改了什么：新增 platform action=ui.current。
+    为什么（用户明确指出）：「你知道我当前右侧标签页是哪个吗？这个在你的管理体系里边能查到吗？」
+      此前后端对右栏一无所知（``grep activeKey backend --include=*.py`` 命中 0 次），
+      模型 ui.show 只能盲开：要么抢走用户正看的页面，要么把同一页开成第二个签。
+    判据：``known=false`` 表示前端还没上报过（窗口没开/刚重启），
+      此时**不许**假设「右栏是空的」，要把这份不确定性如实带回给模型。
+    """
+    from app.gateway.routers.stage_right_panel import read_right_stage_state
+
+    data = read_right_stage_state()
+    out = {**data, "action": "ui.current"}
+    if not data.get("known"):
+        out["hint"] = (
+            "未知右栏状态：前端还没上报过（窗口可能没开或刚重启）。"
+            "此时不要假设右栏为空——若要开面板，优先用 ui.show 而非 ui.update，"
+            "避免对着不存在的签更新。"
+        )
+    return out
+
+
+def ui_kinds(_args: dict[str, Any]) -> dict[str, Any]:
+    """右栏支持哪些类型、每种必需字段是什么、谁能触发。
+
+    【self-evolution-bot · 2026-11-20 · 第87轮 · 模型:deepseek-v4.1-flash-1017】
+    改了什么：新增 platform action=ui.kinds，把「右栏能开什么、怎么传参」暴露给模型。
+    为什么：用户要求「模型展开前应先读一下当前支持什么类型、这些类型怎么展开」。
+    以前这份知识只存在于前端 render 分支和后端零散 if 里，模型只能猜；猜错就被
+    后端 reject 一个回合。现在模型先查这张表，再按 example 调 ui.show。
+    数据源是 stage/right_panel_kinds.py 唯一真源，与校验/前端同源。
+    """
+    from evoflow.stage.right_panel_kinds import (
+        AUTO_OPEN_ACTIONS,
+        READ_ONLY_ACTIONS,
+        kind_specs,
+    )
+
+    kinds = [spec for spec in kind_specs() if spec.get("kind") != "artifacts"]
+    return {
+        "ok": True,
+        "action": "ui.kinds",
+        "count": len(kinds),
+        "kinds": kinds,
+        "autoOpenActions": sorted(AUTO_OPEN_ACTIONS),
+        "readOnlyActions": sorted(READ_ONLY_ACTIONS),
+        "rules": {
+            "auto": "只有 autoOpenActions 里的动作会自动展开右栏；只读动作永不自动弹。",
+            "agent": "ui.show 属于「申请展示」：会写入标签但不抢用户视线，用户点了才展开。",
+            "user": "用户亲手点的才会强制撑开（forceExpand）。",
+            "artifacts": "已退役，勿用；产物走侧栏 Info Rail。",
+            # 【self-evolution-bot · 2026-11-22 · 第122轮 · 模型:deepseek-v4.1-flash】
+            # 改了什么：在模型能看到的第一手规则里点明 xiaomi 不走 ui.show。
+            # 为什么：xiaomi 不在契约表（RIGHT_PANEL_KINDS），只在 FRONTEND_ONLY_KINDS，
+            #   所以 ui.kinds 的 kinds 数组里根本没有它；但模型在别处见过 'xiaomi' 这个字，
+            #   就会去猜 uuid/primary、去 ui.show 一个它。第121轮已在 apply_right_panel
+            #   拦成 ok:false，但那是「撞了才知道」；规则里先说清，模型第一轮就能走对。
+            #   这是「报错文案与工具描述也是上下文注入」的同一条判据：
+            #   悄悄省掉不如明写，省掉的那句会变成别人多绕的一轮。
+            "xiaomi": (
+                "小V 不是可申请的普通标签：它是 workspace 级常驻单例（id 固定 global），"
+                "必须走 platform action=ui.panel op=action name=openXiaomi"
+                "（voiceMode=true 进语音全屏，showRightStage=false 只进左侧语音域）。"
+                "ui.show kind=xiaomi 会被拒。"
+            ),
+        },
+    }
+
+
+
+
+def ui_panel(args: dict[str, Any]) -> dict[str, Any]:
+    """Drive the main desktop window via ``/main-cdp/*`` (not the embed browser).
+
+    Requires EvoFlow desktop. Optional auth: env ``EVOFLOW_PANEL_CDP_TOKEN`` or
+    ``~/.evoflow/panel-cdp-token``.
+    """
+    from evoflow.tools.builtins.panel_engine import panel_request
+
+    op = _arg_str(args, "op", "action", "cmd").lower()
+    if not op:
+        raise ValidationError(
+            "ui.panel requires op: snapshot|page_dump|click|fill|type|scroll|state|focus|action|ax|screenshot|cdp|ws"
+        )
+
+    def _params_obj() -> dict[str, Any]:
+        raw = args.get("params")
+        if isinstance(raw, dict):
+            return dict(raw)
+        if isinstance(raw, str) and raw.strip():
+            import json as _json
+
+            try:
+                loaded = _json.loads(raw)
+            except Exception as exc:
+                raise ValidationError(f"params must be a JSON object: {exc}") from exc
+            if not isinstance(loaded, dict):
+                raise ValidationError("params must be a JSON object")
+            return loaded
+        return {}
+
+    if op in ("page_dump", "pagedump", "debug_snapshot", "debug"):
+        body: dict[str, Any] = {}
+        if args.get("max_turns") is not None or args.get("maxTurns") is not None:
+            body["maxTurns"] = int(args.get("max_turns") or args.get("maxTurns") or 30)
+        if args.get("max_chars_per_turn") is not None or args.get("maxCharsPerTurn") is not None:
+            body["maxCharsPerTurn"] = int(
+                args.get("max_chars_per_turn") or args.get("maxCharsPerTurn") or 1200
+            )
+        if _arg_bool(args, "include_offscreen", False) or _arg_bool(args, "includeOffscreen", False):
+            body["includeOffscreen"] = True
+        env = panel_request("POST", "page-dump", body=body or None)
+        # Installed builds may lack /main-cdp/page-dump — fall back to evaluate dump.
+        if (
+            isinstance(env, dict)
+            and not env.get("ok")
+            and str(env.get("code") or "") in {"capability_unsupported", "execution_error"}
+        ):
+            from evoflow.tools.builtins.panel_engine import build_page_dump_evaluate_expr
+
+            expr = build_page_dump_evaluate_expr(
+                max_turns=int(body.get("maxTurns") or 30),
+                max_chars_per_turn=int(body.get("maxCharsPerTurn") or 1200),
+            )
+            env = panel_request("POST", "evaluate", body={"expression": expr})
+        if isinstance(env, dict) and env.get("ok"):
+            result = env.get("result")
+            dump = result if isinstance(result, dict) else {}
+            if isinstance(result, dict) and "transcript" not in result and isinstance(result.get("result"), dict):
+                dump = result["result"]
+            text = str(dump.get("transcript") or "").strip()
+            if text:
+                env = {
+                    **env,
+                    "result": dump,
+                    "text": text,
+                    "action": "ui.panel",
+                    "op": "page_dump",
+                    "hint": "排查用页面快照：text 是当前可见对话区正文；完整 turns 见 result.turns。",
+                }
+            else:
+                env = {**env, "action": "ui.panel", "op": "page_dump"}
+        return env if isinstance(env, dict) else {"ok": False, "error": "bad response", "action": "ui.panel"}
+
+    if op == "snapshot":
+        body: dict[str, Any] = {}
+        if args.get("max_elements") is not None or args.get("maxElements") is not None:
+            body["maxElements"] = int(args.get("max_elements") or args.get("maxElements") or 150)
+        if _arg_bool(args, "include_hidden", False) or _arg_bool(args, "includeHidden", False):
+            body["includeHidden"] = True
+        mode = _arg_str(args, "mode").lower()
+        if mode in ("page", "debug", "dump"):
+            body["mode"] = mode
+        if args.get("max_turns") is not None or args.get("maxTurns") is not None:
+            body["maxTurns"] = int(args.get("max_turns") or args.get("maxTurns") or 30)
+        env = panel_request("POST", "snapshot", body=body or None)
+        # Compact text for the model when elements are present
+        result = env.get("result") if isinstance(env, dict) else None
+        snap = result if isinstance(result, dict) else {}
+        if isinstance(result, dict) and "elements" not in result and isinstance(result.get("result"), dict):
+            snap = result["result"]
+        elements = snap.get("elements") if isinstance(snap, dict) else None
+        if env.get("ok") and isinstance(elements, list):
+            lines = [
+                f"URL: {snap.get('url') or ''}",
+                f"Title: {snap.get('title') or ''}",
+                f"Elements ({len(elements)}" + (" truncated" if snap.get("truncated") else "") + "):",
+            ]
+            for el in elements[:150]:
+                if not isinstance(el, dict):
+                    continue
+                ref = el.get("ref") or "?"
+                role = el.get("role") or el.get("tag") or ""
+                name = str(el.get("name") or el.get("text") or "").replace("\n", " ")[:80]
+                line = f"  [{ref}] {role}"
+                if name:
+                    line += f' "{name}"'
+                if el.get("inViewport") is False:
+                    line += " (out of view)"
+                lines.append(line)
+            env = {**env, "text": "\n".join(lines), "action": "ui.panel", "op": op}
+        else:
+            env = {**env, "action": "ui.panel", "op": op} if isinstance(env, dict) else env
+        return env if isinstance(env, dict) else {"ok": False, "error": "bad response", "action": "ui.panel"}
+
+    if op == "click":
+        ref = _arg_str(args, "ref").lstrip("@")
+        if not ref:
+            raise ValidationError("ui.panel op=click requires ref (e.g. e2 from snapshot)")
+        env = panel_request("POST", "click", body={"ref": ref})
+        return {**env, "action": "ui.panel", "op": op}
+
+    if op == "fill":
+        ref = _arg_str(args, "ref").lstrip("@")
+        if not ref:
+            raise ValidationError("ui.panel op=fill requires ref")
+        clear = True if "clear" not in args else _arg_bool(args, "clear", True)
+        env = panel_request(
+            "POST",
+            "fill",
+            body={"ref": ref, "text": str(args.get("text") or ""), "clear": clear},
+        )
+        return {**env, "action": "ui.panel", "op": op}
+
+    if op == "type":
+        ref = _arg_str(args, "ref").lstrip("@")
+        if not ref:
+            raise ValidationError("ui.panel op=type requires ref")
+        env = panel_request("POST", "type", body={"ref": ref, "text": str(args.get("text") or "")})
+        return {**env, "action": "ui.panel", "op": op}
+
+    if op == "scroll":
+        body = {}
+        ref = _arg_str(args, "ref").lstrip("@")
+        if ref:
+            body["ref"] = ref
+        direction = _arg_str(args, "direction")
+        if direction:
+            body["direction"] = direction.lower()
+        if args.get("amount") is not None:
+            body["amount"] = int(args.get("amount") or 0)
+        if args.get("x") is not None:
+            body["x"] = float(args["x"])
+        if args.get("y") is not None:
+            body["y"] = float(args["y"])
+        env = panel_request("POST", "scroll", body=body)
+        return {**env, "action": "ui.panel", "op": op}
+
+    if op == "state":
+        env = panel_request("GET", "state")
+        return {**env, "action": "ui.panel", "op": op}
+
+    if op == "focus":
+        # 用户当前界面焦点 + 近期点击/路由留痕（与 GET state 的 focus/recentActivity 同源）
+        env = panel_request("GET", "state")
+        if isinstance(env, dict) and env.get("ok"):
+            result = env.get("result") if isinstance(env.get("result"), dict) else {}
+            focus = result.get("focus") if isinstance(result, dict) else None
+            recent = result.get("recentActivity") if isinstance(result, dict) else None
+            return {
+                "ok": True,
+                "action": "ui.panel",
+                "op": "focus",
+                "result": {
+                    "focus": focus,
+                    "recentActivity": recent if isinstance(recent, list) else [],
+                    "route": result.get("route") if isinstance(result, dict) else None,
+                    "selectedSessionKey": (
+                        result.get("selectedSessionKey") if isinstance(result, dict) else None
+                    ),
+                },
+                "text": (
+                    "Current UI focus + recent user activity. "
+                    "Use this to know which page/entity the user is on."
+                ),
+            }
+        return {**(env if isinstance(env, dict) else {"ok": False, "error": str(env)}), "action": "ui.panel", "op": "focus"}
+
+    if op == "action":
+        name = _arg_str(args, "name", "action_name", "panel_action")
+        if not name:
+            raise ValidationError(
+                "ui.panel op=action requires name "
+                "(navigate|openXiaomi|sendMessage|selectSession|setComposerText|focusComposer|"
+                "openRightStage|employeeChatSend)"
+            )
+        params = _params_obj()
+        text = str(args.get("text") or "").strip()
+        if text and "text" not in params and "message" not in params:
+            params["text"] = text
+        # Flat alias fields for navigate / selectSession
+        for key in ("path", "hash", "route", "sessionKey", "key", "surface", "kind"):
+            if key in args and key not in params and args.get(key) not in (None, ""):
+                params[key] = args.get(key)
+        # 【self-evolution-bot · 2026-11-22 · 第122轮 · 模型:deepseek-v4.1-flash】
+        # 改了什么：op=action 的平铺别名表补 voiceMode / showRightStage / navigateToChat，
+        #   三个布尔统一经 _arg_bool 归一后再转发。
+        # 为什么（本轮为对齐「语音侧开栏 vs ui.show 开栏」逐层比对时挖到）：
+        #   面板 API 的 openXiaomi 分支读的是 params.voiceMode === true /
+        #   params.showRightStage !== false / params.navigateToChat !== false
+        #   （evopanel/src/lib/panel-cdp/panel-api.ts:332），
+        #   而这里只转发 path/hash/route/sessionKey/key/surface/kind 七个键 ——
+        #   模型平铺写 `name=openXiaomi voiceMode=true` 会被静默丢掉，
+        #   小V 只开文字侧栏、不进语音全屏，回执却是 ok:true。
+        #   这正是「两边不是同一套」最实际的缺口：不是渲染不同，是同一个入口
+        #   驱动不出语音态。
+        # 判据：三个参数任一平铺传入，都必须原样落到 body.params 且类型为 bool。
+        for key in ("voiceMode", "showRightStage", "navigateToChat"):
+            if key in args and key not in params and args.get(key) is not None:
+                params[key] = _arg_bool(args, key)
+        env = panel_request("POST", "action", body={"action": name, "params": params})
+        return {**env, "action": "ui.panel", "op": op}
+
+    if op == "ax":
+        env = panel_request("GET", "ax")
+        return {**env, "action": "ui.panel", "op": op}
+
+    if op == "screenshot":
+        env = panel_request("GET", "screenshot")
+        # Strip huge base64 from default return; keep a short note
+        if isinstance(env, dict) and env.get("ok"):
+            result = env.get("result")
+            data_b64 = None
+            if isinstance(result, dict):
+                data_b64 = result.get("data")
+                if data_b64 is None and isinstance(result.get("result"), dict):
+                    data_b64 = result["result"].get("data")
+            if data_b64:
+                return {
+                    "ok": True,
+                    "action": "ui.panel",
+                    "op": op,
+                    "hasImage": True,
+                    "bytesApprox": int(len(str(data_b64)) * 3 / 4),
+                    "hint": (
+                        "Screenshot captured via CDP. Prefer op=snapshot for readable refs; "
+                        "raw base64 omitted from tool result to protect context."
+                    ),
+                    "data": data_b64 if _arg_bool(args, "include_data", False) else None,
+                }
+        return {**(env if isinstance(env, dict) else {"ok": False, "error": str(env)}), "action": "ui.panel", "op": op}
+
+    if op == "cdp":
+        method = _arg_str(args, "method", "cdp_method")
+        if not method:
+            raise ValidationError("ui.panel op=cdp requires method (e..find Runtime.evaluate)")
+        env = panel_request("POST", "cdp", body={"method": method, "params": _params_obj()})
+        return {**env, "action": "ui.panel", "op": op}
+
+    if op == "ws":
+        env = panel_request("GET", "ws")
+        return {**env, "action": "ui.panel", "op": op}
+
+    raise ValidationError(
+        f"unsupported ui.panel op={op!r}; "
+        "use snapshot|page_dump|click|fill|type|scroll|state|action|ax|screenshot|cdp|ws"
+    )
+
 
 
 # ── extensions（Agent应用 / UI 扩展；侧栏 #/extensions）─────────────────────
@@ -3045,7 +3962,19 @@ def _remote_extension_manifest(*, ext_id: str, name: str, entry: str) -> dict[st
     }
 
 
-def extensions_list(_args: dict[str, Any]) -> dict[str, Any]:
+def extensions_list(args: dict[str, Any]) -> dict[str, Any]:
+    """列出 Agent应用；默认只给摘要，``include_manifest=true`` 才带整份 manifest。
+
+    【self-evolution-bot · 2026-11-19 · 第60轮 · 模型:deepseek-v4.1-flash-1017】
+    改了什么：新增 ``include_manifest`` 开关，默认 False 时不返回完整 ``manifest``，
+    改为 ``manifestKeys`` / ``manifestBytes`` / ``name`` / ``description`` / ``ui`` /
+    ``service.mode`` 等摘要字段；传 ``include_manifest=true`` 逐字还原旧输出。
+    为什么：现网 11 个扩展实测返回 **19867 字节**，其中 ``extensions`` 占 13068，
+    而单个 manifest 里 ``service.start.default`` 与 ``service.start.windows``
+    重复、``bridge``/``permissions``/``schema``/``icon`` 这些**列表页根本不用**的
+    部署细节占了七成。反问「装了哪些 Agent应用」不该顺带灌 13KB 启动参数，
+    要单看详情有 ``extensions.get``，要全量有开关。
+    """
     from evoflow.admin.ui_extensions_registry import read_registry, registry_path
 
     try:
@@ -3053,11 +3982,42 @@ def extensions_list(_args: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         _map_extension_error(exc)
         raise
+    include_manifest = _arg_bool(args, "include_manifest", False)
+    if not include_manifest:
+        slim: list[dict[str, Any]] = []
+        for row in rows:
+            manifest = row.get("manifest") if isinstance(row.get("manifest"), dict) else {}
+            service = manifest.get("service") if isinstance(manifest.get("service"), dict) else {}
+            slim.append(
+                {
+                    "id": row.get("id") or manifest.get("id"),
+                    "name": manifest.get("name") or row.get("id"),
+                    "version": manifest.get("version"),
+                    "enabled": row.get("enabled"),
+                    "description": manifest.get("description") or "",
+                    "ui": manifest.get("ui") or None,
+                    "serviceMode": service.get("mode") or "none",
+                    "manifestKeys": sorted(manifest.keys()),
+                    "manifestBytes": len(json.dumps(manifest, ensure_ascii=False, default=str).encode()),
+                    "install_path": row.get("install_path"),
+                    "installed_at": row.get("installed_at"),
+                    "source": row.get("source"),
+                }
+            )
+        return {
+            "ok": True,
+            "extensions": slim,
+            "count": len(slim),
+            "registry_path": str(registry_path()),
+            "full": False,
+            "note": "默认只给摘要；完整 manifest 传 include_manifest=true，单个详情用 extensions.get。",
+        }
     return {
         "ok": True,
         "extensions": rows,
         "count": len(rows),
         "registry_path": str(registry_path()),
+        "full": True,
     }
 
 
@@ -3180,13 +4140,57 @@ def _map_plugin_error(exc: Exception) -> None:
     raise exc
 
 
-def plugins_overview(_args: dict[str, Any]) -> dict[str, Any]:
+def plugins_overview(args: dict[str, Any]) -> dict[str, Any]:
+    """插件总览；默认把「可装」与「已装」里逐字重复的字段去掉，``full=true`` 还原。
+
+    【self-evolution-bot · 2026-11-19 · 第60轮 · 模型:deepseek-v4.1-flash-1017】
+    改了什么：新增 ``full`` 开关（默认 False）。为 False 时从 ``availablePlugins[]``
+    的 ``listing`` 里删掉与父级 **逐字相同** 的 ``description`` / ``displayName``
+    （父级 ``description`` / ``name`` 已有），从 ``installedPlugins[]`` 的同上两处
+    以及与其在 ``availablePlugins`` 中同 id 条目重复的 ``listing``。``full=true``
+    返回 service 原样（逐字还原）。
+    为什么：现网实测本动作 **11248 字节**（availablePlugins 4349 + installedPlugins
+    6445），其中 ``listing`` 共 3660 字节、**1978 字节是与父级字段逐字重复的同一句话**；
+    9 个插件的 available/installed 两个数组装的是同一个 id 集合（实测 installed 是
+    available 的子集，无差异项），同一份 ``listing`` 被序列化了两遍。宿主面板读的是
+    Gateway 的 ``/plugins`` 路由（``_plugins_service().overview()`` 原文），不受影响。
+    """
     try:
         data = _plugins_service().overview()
     except Exception as exc:
         _map_plugin_error(exc)
         raise
-    return {"ok": True, **data}
+    if _arg_bool(args, "full", False):
+        return {"ok": True, **data}
+
+    def _slim(item: dict[str, Any], drop_listing: bool = False) -> dict[str, Any]:
+        out = dict(item)
+        listing = out.get("listing")
+        if isinstance(listing, dict):
+            listing = dict(listing)
+            if drop_listing:
+                out.pop("listing", None)
+            else:
+                if listing.get("description") == out.get("description"):
+                    listing.pop("description", None)
+                if listing.get("displayName") == out.get("name"):
+                    listing.pop("displayName", None)
+                if listing:
+                    out["listing"] = listing
+                else:
+                    out.pop("listing", None)
+        return out
+
+    available = [_slim(item) for item in (data.get("availablePlugins") or []) if isinstance(item, dict)]
+    avail_ids = {item.get("id") for item in available}
+    installed = [
+        _slim(item, drop_listing=item.get("id") in avail_ids)
+        for item in (data.get("installedPlugins") or [])
+        if isinstance(item, dict)
+    ]
+    out = {"ok": True, **data, "availablePlugins": available, "installedPlugins": installed}
+    out["note"] = "default 已去掉与父级逐字重复的 listing 字段；需要与 service 逐字一致传 full=true。"
+    return out
 
 
 def plugins_list(_args: dict[str, Any]) -> dict[str, Any]:
@@ -3391,13 +4395,43 @@ def org_install(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def org_list(args: dict[str, Any]) -> dict[str, Any]:
+    """列出资源包实例；默认不逐条回整份 ``manifest``（换 ``manifestKeys/Bytes``）。
+
+    【self-evolution-bot · 2026-11-19 · 第60轮 · 模型:deepseek-v4.1-flash-1017】
+    改了什么：新增 ``include_manifest`` 开关（默认 False）。为 False 时每条实例的
+    ``manifest`` 换成 ``manifestKeys`` + ``manifestBytes``；``include_manifest=true``
+    逐字还原。
+    为什么：现网 6 个实例实测返回 **9024 字节**，``manifest`` 一项 **4432（49%）**；
+    ``org.list`` 的问题是「装了哪些包、什么状态」，包清单正文是 ``org.get`` 的事。
+    """
     from evoflow.organizations.registry import list_org_instances
 
     status = _arg_str(args, "status") or "active"
     if status == "all":
         status = ""
     items = list_org_instances(status=status or None)
-    return {"ok": True, "items": items, "count": len(items)}
+    if _arg_bool(args, "include_manifest", False):
+        return {"ok": True, "items": items, "count": len(items), "full": True}
+    slim: list[Any] = []
+    for row in items or []:
+        if not isinstance(row, dict):
+            slim.append(row)
+            continue
+        copy = dict(row)
+        manifest = copy.pop("manifest", None)
+        if isinstance(manifest, dict):
+            copy["manifestKeys"] = sorted(manifest.keys())
+            copy["manifestBytes"] = len(
+                json.dumps(manifest, ensure_ascii=False, default=str).encode()
+            )
+        slim.append(copy)
+    return {
+        "ok": True,
+        "items": slim,
+        "count": len(slim),
+        "full": False,
+        "note": "默认不回 manifest 正文（只给键与体积）；要整份传 include_manifest=true 或 org.get。",
+    }
 
 
 def org_get(args: dict[str, Any]) -> dict[str, Any]:
@@ -3435,9 +4469,17 @@ def org_uninstall(args: dict[str, Any]) -> dict[str, Any]:
         )
         opts["keep_workspace"] = not delete_ws
     elif "keep_workspace" in args:
-        opts["keep_workspace"] = _arg_bool(args, "keep_workspace", True)
+        opts["keep_workspace"] = _arg_bool(args, "keep_workspace", False)
     elif "keepWorkspace" in args:
-        opts["keep_workspace"] = _arg_bool(args, "keepWorkspace", True)
+        opts["keep_workspace"] = _arg_bool(args, "keepWorkspace", False)
+    if "keep_knowledge" in args:
+        opts["keep_knowledge"] = _arg_bool(args, "keep_knowledge", False)
+    elif "keepKnowledge" in args:
+        opts["keep_knowledge"] = _arg_bool(args, "keepKnowledge", False)
+    elif "keep_vault_data" in args:
+        opts["keep_knowledge"] = _arg_bool(args, "keep_vault_data", False)
+    elif "keepVaultData" in args:
+        opts["keep_knowledge"] = _arg_bool(args, "keepVaultData", False)
     try:
         data = uninstall_organization(oid, options=opts or None)
     except OrganizationInstallError as exc:
@@ -3477,13 +4519,33 @@ def org_export(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def org_market_catalog(_args: dict[str, Any]) -> dict[str, Any]:
+    """资源市场目录（合并所有已启用源）。
+
+    【self-evolution-bot · 2026-11-19 · 第60轮 · 模型:deepseek-v4.1-flash-1017】
+    改了什么：全部源都抓取失败且一个包都没拿到时，补 ``degraded=true`` +
+    ``degraded_reason``（**保留 ok=true 不动**，避免破坏既有调用方语义）。
+    为什么：现网实测该动作返回 ``{"ok": true, "packs": [], "errors": [{"sourceId":"official",
+    "error":"<urlopen error timed out>"}]}`` 且耗时 4026ms。``ok:true`` 是第一眼信号，
+    调用方据此往下走「市场里没有资源包」这条错误结论——真实原因是**没连上**。
+    错误信息本来就在 errors 里，缺的是一句能被一眼读到的判断，故只加标记不改 ok。
+    """
     from evoflow.organizations.market_sources import fetch_merged_catalog
 
     try:
         data = fetch_merged_catalog(force=bool(_args.get("force")))
-        return {"ok": True, **data}
     except Exception as exc:
         raise ValidationError(f"Failed to fetch market catalog: {exc}") from exc
+    errors = data.get("errors") or []
+    source_count = len(data.get("sources") or [])
+    if errors and not data.get("packs") and len(errors) >= source_count:
+        data = dict(data)
+        data["degraded"] = True
+        data["degraded_reason"] = (
+            f"全部 {source_count} 个市场源都没抓通（拿不到任何资源包）；"
+            "这**不代表市场为空**，是网络/源不可达。"
+            f"首个错误：{errors[0].get('error') if isinstance(errors[0], dict) else errors[0]}"
+        )
+    return {"ok": True, **data}
 
 
 def org_market_install(args: dict[str, Any]) -> dict[str, Any]:

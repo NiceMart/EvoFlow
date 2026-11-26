@@ -99,6 +99,110 @@ def test_catchup_from_transcript_noops_on_same_fingerprint() -> None:
     assert out["changed"] is False
     assert out.get("reason") == "fingerprint-unchanged"
     assert out["rows"] == rows
+    assert out.get("tipRowId") is not None
+    assert int(out["tipRowId"]) > 0
+
+
+def test_catchup_client_stale_resync_when_client_tip_ahead_of_hub() -> None:
+    """FE tip 高于 hub tip（错过 recovery）→ fingerprint 未变也要再广播 recovery。"""
+    hub = V4ConversationHub()
+    with _msgs(MESSAGES_V1):
+        hub.catchup_from_transcript(THREAD)
+    sess = hub.get_session(THREAD)
+    assert sess is not None and sess.rows
+    hub_tip = max(int(r.get("rowId") or 0) for r in sess.rows.values())
+    with _msgs(MESSAGES_V1):
+        # 微差（+2）不得触发 client-stale（live 采样噪声）
+        micro = hub.catchup_from_transcript(
+            THREAD,
+            client_tip_row_id=hub_tip + 2,
+            client_log_epoch=str(sess.log_epoch),
+        )
+        assert micro.get("reason") == "fingerprint-unchanged"
+        assert micro.get("changed") is False
+        out = hub.catchup_from_transcript(
+            THREAD,
+            client_tip_row_id=hub_tip + 100,
+            client_log_epoch=str(sess.log_epoch),
+        )
+    assert out["ok"] is True
+    assert out["changed"] is True
+    assert out.get("reason") == "client-stale-resync"
+    assert int(out.get("tipRowId") or 0) == hub_tip
+    assert int(out.get("clientTipRowId") or 0) == hub_tip + 100
+
+
+def test_catchup_client_behind_resync_when_client_tip_lags_hub() -> None:
+    """FE tip 低于 hub tip（frames 丢了）→ fingerprint 未变也要再广播 recovery。"""
+    from app.gateway.v4.agui_mirror import mirror_reset_thread
+
+    # 前序 live-mirror 用例可能把 THREAD 留在 mirror live；先清掉以免挡 hydrate。
+    mirror_reset_thread(THREAD)
+    hub = V4ConversationHub()
+    with _msgs(MESSAGES_V1):
+        hub.catchup_from_transcript(THREAD)
+    sess = hub.get_session(THREAD)
+    assert sess is not None and sess.rows
+    real_tip = max(int(r.get("rowId") or 0) for r in sess.rows.values())
+    # V1 tip 往往 <5；用 stub 抬高 hub tip，专测 Δ≥5 的 behind 阈值（不污染 fingerprint）。
+    with (
+        _msgs(MESSAGES_V1),
+        patch.object(V4ConversationHub, "_hub_tip_row_id", return_value=real_tip + 10),
+    ):
+        out = hub.catchup_from_transcript(
+            THREAD,
+            client_tip_row_id=real_tip + 5,
+            client_log_epoch=str(sess.log_epoch),
+        )
+    assert out["ok"] is True
+    assert out["changed"] is True
+    assert out.get("reason") == "client-behind-resync"
+    assert int(out.get("clientTipRowId") or 0) == real_tip + 5
+
+
+def test_catchup_prefer_settle_only_never_wipes_existing_rows() -> None:
+    """切回校准：客户端已有投影时只 settle，禁止 clear_projection wipe。"""
+    hub = V4ConversationHub()
+    with _msgs(MESSAGES_V1):
+        hub.catchup_from_transcript(THREAD)
+    rows = len(hub.get_session(THREAD).rows)
+    epoch = hub.get_session(THREAD).log_epoch
+    with _msgs(MESSAGES_V2):
+        out = hub.catchup_from_transcript(THREAD, prefer_settle_only=True)
+    assert out["ok"] is True
+    assert out["changed"] is False
+    assert out.get("reason") == "settle-only"
+    assert out["rows"] == rows
+    assert len(hub.get_session(THREAD).rows) == rows
+    assert hub.get_session(THREAD).log_epoch == epoch
+
+
+def test_catchup_prefer_settle_only_still_resyncs_when_client_tip_diverges() -> None:
+    """preferSettleOnly 不得吞掉 tip 分叉（现场 FE=2155 hub=1 被 settle-only 跳死）。
+
+    用 V2 指纹（与 hub catchup_fp 不同）走到 settle-only 分支，而不是
+    fingerprint-unchanged 早退——专门钉住 settle-only 里的 tip 对账。
+    """
+    hub = V4ConversationHub()
+    with _msgs(MESSAGES_V1):
+        hub.catchup_from_transcript(THREAD)
+    sess = hub.get_session(THREAD)
+    assert sess is not None and sess.rows
+    hub_tip = max(int(r.get("rowId") or 0) for r in sess.rows.values())
+    rows = len(sess.rows)
+    with _msgs(MESSAGES_V2):
+        out = hub.catchup_from_transcript(
+            THREAD,
+            prefer_settle_only=True,
+            client_tip_row_id=hub_tip + 200,
+        )
+    assert out["ok"] is True
+    assert out["changed"] is True
+    assert out.get("reason") == "client-stale-resync"
+    assert int(out.get("tipRowId") or 0) == hub_tip
+    assert out["rows"] == rows
+    assert "notified" in out
+    assert "subscriberCount" in out
 
 
 def test_catchup_skips_wipe_when_only_tail_content_grows() -> None:
@@ -185,6 +289,42 @@ def test_catchup_skips_wipe_while_channel_mirror_live() -> None:
     assert out["changed"] is False
     assert out.get("reason") == "live-mirror"
     assert len(hub.get_session(THREAD).rows) == rows_with_live
+
+
+def test_catchup_client_behind_under_live_mirror_broadcasts_recovery() -> None:
+    """live-mirror 不得挡住 FE tip 落后时的 recovery（WIRE_WITHOUT_V4_TIP）。"""
+    import app.gateway.v4.agui_mirror as mir
+    from app.gateway.v4.agui_mirror import mirror_channel_run_started, mirror_reset_thread
+    from app.gateway.v4.conversation import _Subscription
+
+    hub = V4ConversationHub()
+    mir._MIRROR = mir.V4Mirror(hub)
+    with _msgs(MESSAGES_V1):
+        hub.catchup_from_transcript(THREAD)
+    mirror_reset_thread(THREAD)
+    mirror_channel_run_started(THREAD, "run-live")
+    sess = hub.get_session(THREAD)
+    assert sess is not None and sess.rows
+    hub_tip = max(int(r.get("rowId") or 0) for r in sess.rows.values())
+    assert hub_tip > 1
+    hub._subscriptions["sub-live"] = _Subscription(  # noqa: SLF001
+        subscription_id="sub-live",
+        session_id=THREAD,
+        connection_id="c-live",
+        topic=f"conversation/{THREAD}",
+    )
+    # live-mirror 例外门槛：hub_tip - client_tip >= 5（防噪声），差 1 仍走 live-mirror。
+    with _msgs(MESSAGES_V2):
+        out = hub.catchup_from_transcript(
+            THREAD,
+            client_tip_row_id=hub_tip - 5,
+            client_log_epoch=str(sess.log_epoch),
+        )
+    assert out["ok"] is True
+    assert out["changed"] is True
+    assert out.get("reason") == "client-behind-resync"
+    assert int(out.get("tipRowId") or 0) == hub_tip
+    assert int(out.get("notified") or 0) >= 1
 
 
 def test_channel_assistant_mirror_appends_text() -> None:
@@ -292,6 +432,217 @@ def test_catchup_settles_stale_running_when_db_terminal() -> None:
     assert sess.control_override is None
     texts = [str(r.get("text") or "") for r in sess.rows.values() if r.get("kind") == "assistantText"]
     assert any("第二版更新" in t for t in texts), "终态回复必须进投影"
+
+
+def test_catchup_settles_draft_inflight_when_db_terminal() -> None:
+    """DB done + phase=draft 但仍有 streaming tip → settle（压缩后僵尸思考）。"""
+    thread = "settle-thread-draft-inflight"
+    hub = V4ConversationHub()
+    with _msgs(MESSAGES_V1):
+        hub.catchup_from_transcript(thread)
+    sess = hub.get_session(thread)
+    assert sess is not None and sess.rows
+    sess.phase = "draft"
+    sess.control_override = None
+    sess.catchup_fp = "pinned-fp-keep"
+    sess.last_author_at_ms = 0.0
+    # 人工钉一条 streaming 思考，模拟 tip「正在思考」孤儿。
+    rid = int(sess.next_row_id)
+    sess.next_row_id = rid + 1
+    sess.rows[rid] = {
+        "rowId": rid,
+        "kind": "reasoning",
+        "state": "streaming",
+        "text": "",
+        "turnId": "zombie-tip",
+        "createdAt": 1,
+        "startedAt": 1,
+    }
+    with patch(
+        "app.gateway.v4.hydration.read_run_status_row",
+        return_value={"status": "done", "updated_at_ms": 1, "run_id": "run-x"},
+    ), patch(
+        "app.gateway.v4.hydration.transcript_fingerprint_for_thread",
+        return_value="pinned-fp-keep",
+    ):
+        out = hub.catchup_from_transcript(thread)
+    assert out["ok"] is True
+    assert out.get("settledPhase") == "completedSuccess"
+    assert out.get("reason") == "fingerprint-unchanged"
+    sess2 = hub.get_session(thread)
+    assert sess2.phase == "completedSuccess"
+
+
+def test_trim_projection_after_fingerprint_tip_drops_ghost_tail() -> None:
+    """库尾 message 之后的幽灵轮必须裁掉（durable-replay 追加旧 live tip）。"""
+    from app.gateway.v4.conversation import V4ConversationHub
+
+    hub = V4ConversationHub()
+    with _msgs(MESSAGES_V2):
+        hub.catchup_from_transcript(THREAD)
+    sess = hub.get_session(THREAD)
+    assert sess is not None
+    fp = transcript_fingerprint(MESSAGES_V2)
+    base = int(sess.next_row_id)
+    sess.next_row_id = base + 2
+    sess.rows[base] = {
+        "rowId": base,
+        "kind": "toolCall",
+        "status": "cancelled",
+        "toolName": "bash",
+        "turnId": "run-07cc-ghost",
+        "inputText": "",
+    }
+    sess.rows[base + 1] = {
+        "rowId": base + 1,
+        "kind": "reasoning",
+        "state": "complete",
+        "text": "ghost tip",
+        "turnId": "run-07cc-ghost",
+    }
+    assert V4ConversationHub._projection_tip_matches_fingerprint(sess, fp) is False
+    removed = V4ConversationHub._trim_projection_after_fingerprint_tip(sess, fp)
+    assert removed == 2
+    assert V4ConversationHub._projection_tip_matches_fingerprint(sess, fp) is True
+    assert not any(str(r.get("turnId") or "") == "run-07cc-ghost" for r in sess.rows.values())
+
+
+def test_catchup_force_rehydrates_when_tip_mismatches_fingerprint() -> None:
+    """指纹已是库尾，但 tip 仍挂着更早一轮的 tool/思考 → 强制重灌（允许 shrink）。
+
+    394bc37f：SQL tip=「两条都通了」，面板 tip=旧 run cancelled bash；
+    fingerprint-unchanged + refuse-shrink 会把错误 tip 钉死。
+    """
+    thread = "tip-mismatch-thread-001"
+    hub = V4ConversationHub()
+    with _msgs(MESSAGES_V2):
+        hub.catchup_from_transcript(thread)
+    sess = hub.get_session(thread)
+    assert sess is not None and sess.rows
+    fp = transcript_fingerprint(MESSAGES_V2)
+    assert sess.catchup_fp == fp
+    # 库尾 m3 已在投影里；再在更高 rowId 挂另一轮幽灵 tip。
+    assert any(
+        str(r.get("entityId") or "") == "m3" for r in sess.rows.values()
+    ), "hydrate 必须带上库尾 message_id"
+    base_rid = int(sess.next_row_id)
+    sess.next_row_id = base_rid + 3
+    sess.rows[base_rid] = {
+        "rowId": base_rid,
+        "kind": "turnHeader",
+        "state": "completedSuccess",
+        "turnId": "run-ghost-old",
+        "createdAt": 9_000,
+        "startedAt": 9_000,
+        "endedAt": 9_100,
+    }
+    sess.rows[base_rid + 1] = {
+        "rowId": base_rid + 1,
+        "kind": "toolCall",
+        "status": "cancelled",
+        "toolName": "bash",
+        "inputText": "",
+        "turnId": "run-ghost-old",
+        "createdAt": 9_001,
+    }
+    sess.rows[base_rid + 2] = {
+        "rowId": base_rid + 2,
+        "kind": "reasoning",
+        "state": "complete",
+        "text": "Let me reconsider. 有问题的修复掉",
+        "turnId": "run-ghost-old",
+        "createdAt": 9_002,
+    }
+    prev = len(sess.rows)
+    sess.last_author_at_ms = 0.0
+    with (
+        _msgs(MESSAGES_V2),
+        patch(
+            "app.gateway.v4.hydration.read_run_status_row",
+            return_value={"status": "done", "updated_at_ms": 1, "run_id": "run-2"},
+        ),
+    ):
+        out = hub.catchup_from_transcript(thread)
+    assert out["ok"] is True
+    assert out["changed"] is True
+    assert out.get("reason") == "tip-mismatch-rehydrated"
+    assert int(out.get("rows") or 0) < prev
+    sess2 = hub.get_session(thread)
+    assert not any(
+        str(r.get("turnId") or "") == "run-ghost-old" for r in sess2.rows.values()
+    )
+    texts = [
+        str(r.get("text") or "")
+        for r in sess2.rows.values()
+        if r.get("kind") == "assistantText"
+    ]
+    assert any("第二版更新" in t for t in texts)
+
+
+def test_catchup_defers_tip_mismatch_while_run_active_inflight_tip() -> None:
+    """DB running + 库尾后仍有 streaming tip → 不 tip-mismatch-rehydrate。
+
+    remint 后 mirror_live 常仍为 false，但投影 tip 是本轮 live 行；
+    若仍 force rehydrate 会周期性 recovery dump，体感「没流式、突然整段」。
+    """
+    thread = "tip-mismatch-live-defer-001"
+    hub = V4ConversationHub()
+    with _msgs(MESSAGES_V2):
+        hub.catchup_from_transcript(thread)
+    sess = hub.get_session(thread)
+    assert sess is not None and sess.rows
+    fp = transcript_fingerprint(MESSAGES_V2)
+    assert sess.catchup_fp == fp
+    base_rid = int(sess.next_row_id)
+    sess.next_row_id = base_rid + 2
+    sess.rows[base_rid] = {
+        "rowId": base_rid,
+        "kind": "turnHeader",
+        "state": "running",
+        "turnId": "run-remint-live",
+        "createdAt": 9_000,
+        "startedAt": 9_000,
+    }
+    sess.rows[base_rid + 1] = {
+        "rowId": base_rid + 1,
+        "kind": "assistantText",
+        "state": "streaming",
+        "text": "正在流式…",
+        "turnId": "run-remint-live",
+        "createdAt": 9_001,
+    }
+    prev = len(sess.rows)
+    # 写手刚停（或 remint 间隙）：靠 DB running / inflight tip 触发 defer，
+    # 不依赖 mirror_live / turn_task。
+    sess.last_author_at_ms = 0.0
+    with (
+        _msgs(MESSAGES_V2),
+        patch(
+            "app.gateway.v4.hydration.read_run_status_row",
+            return_value={
+                "status": "running",
+                "updated_at_ms": 9_000,
+                "run_id": "run-remint-live",
+            },
+        ),
+        patch(
+            "app.gateway.v4.agui_mirror.mirror_thread_is_live",
+            return_value=False,
+        ),
+    ):
+        out = hub.catchup_from_transcript(thread)
+    assert out["ok"] is True
+    assert out.get("reason") != "tip-mismatch-rehydrated"
+    assert out.get("changed") is False or out.get("reason") == "fingerprint-unchanged"
+    sess2 = hub.get_session(thread)
+    assert len(sess2.rows) == prev
+    assert any(
+        str(r.get("turnId") or "") == "run-remint-live" for r in sess2.rows.values()
+    )
+    assert any(
+        r.get("kind") == "assistantText" and r.get("state") == "streaming"
+        for r in sess2.rows.values()
+    )
 
 
 def test_catchup_keeps_running_control_while_run_active() -> None:

@@ -23,6 +23,7 @@ from evoflow.persistence import tool_approval_repositories as ta_repo
 from evoflow.persistence.tool_approval_policy import (
     POLICY_GRANT_ALL,
     effective_policy,
+    effective_policy_for_thread,
     is_grant_all_policy,
     set_session_policy,
 )
@@ -36,10 +37,12 @@ logger = logging.getLogger(__name__)
 _approval_locks: dict[str, threading.RLock] = {}
 _approval_locks_guard = threading.Lock()
 _APPROVAL_LOCKS_MAX = 4096
+_shed_warning_emitted = False
 
 
 def _get_approval_lock(thread_id: str) -> threading.RLock:
     """Get or create a per-thread reentrant lock for approval operations."""
+    global _shed_warning_emitted
     tid = str(thread_id or "").strip()
     if not tid:
         tid = "__global__"
@@ -48,9 +51,16 @@ def _get_approval_lock(thread_id: str) -> threading.RLock:
         if lock is None:
             lock = threading.RLock()
             _approval_locks[tid] = lock
-            # Shed stale entries when the dict grows too large.
-            if len(_approval_locks) > _APPROVAL_LOCKS_MAX:
-                _approval_locks.clear()
+            # 超 4096 只告警、不清字典：clear() 会丢掉其他线程仍持有的锁对象，
+            # 新线程拿新锁与持旧锁线程并行进同一 tid 临界区 → 重复 grant/replay
+            # （正是本锁要防的 TOCTOU）。每条 ~160B，5000 线程 <1MB，正确性优先。
+            if len(_approval_locks) > _APPROVAL_LOCKS_MAX and not _shed_warning_emitted:
+                _shed_warning_emitted = True
+                logger.warning(
+                    "approval locks dict grew to %d entries (expected bounded by thread count); "
+                    "not shedding held locks to preserve mutual exclusion",
+                    len(_approval_locks),
+                )
         return lock
 
 
@@ -81,6 +91,14 @@ def thread_has_pending_approvals(thread_id: str) -> bool:
     tid = str(thread_id or "").strip()
     if not tid:
         return False
+    # 完全访问 / grant_all：不应再挡流或弹授权；顺手清掉策略切换后残留的 ghost pending。
+    try:
+        if is_grant_all_policy(effective_policy_for_thread(tid)):
+            if ta_repo.thread_has_pending_approvals(tid):
+                ta_repo.cancel_pending_and_approved_for_thread(tid)
+            return False
+    except Exception:
+        logger.debug("grant_all pending probe failed thread=%s", tid, exc_info=True)
     return ta_repo.thread_has_pending_approvals(tid)
 
 
@@ -240,6 +258,18 @@ def consume_signature_grant(
 def list_pending_approvals(thread_id: str) -> list[dict[str, Any]]:
     """Pending items awaiting user decision (for EvoPanel poll)."""
     from evoflow.agents.tool_approval_config import tool_risk_level
+
+    tid = str(thread_id or "").strip()
+    if tid and is_grant_all_policy(effective_policy_for_thread(tid)):
+        # 完全访问下不应再出现待批；清残留，避免 UI 仍弹授权。
+        n = ta_repo.cancel_pending_and_approved_for_thread(tid)
+        if n:
+            logger.info(
+                "Cleared %s stale tool approval(s) under grant_all thread=%s",
+                n,
+                tid,
+            )
+        return []
 
     _maybe_expire_stale_pending(thread_id)
 
@@ -755,6 +785,20 @@ def make_pending_entry(
 
 def append_pending(thread_id: str, entry: dict[str, Any]) -> None:
     sk, tid = _session_for_thread(thread_id)
+    # 完全访问 / grant_all：中间件本应提前放行；这里再挡一道，避免竞态
+    # （刚切档位、兄弟工具批量登记）仍写出 pending，UI 像「还要授权」。
+    # sk 为空时仍看全局默认——否则 worker 一时找不到会话会误挂 pending + pause。
+    from evoflow.persistence.tool_approval_policy import get_global_default_policy
+
+    policy = effective_policy(sk) if sk else get_global_default_policy()
+    if is_grant_all_policy(policy):
+        logger.info(
+            "Skip tool approval pending under grant_all thread=%s tool=%s tc=%s",
+            tid,
+            entry.get("tool_name"),
+            entry.get("tool_call_id"),
+        )
+        return
     existing = ta_repo.get_approval_row(sk, str(entry.get("tool_call_id") or ""))
     if existing and str(existing.get("status") or "") in (
         ta_repo.STATUS_EXECUTED,

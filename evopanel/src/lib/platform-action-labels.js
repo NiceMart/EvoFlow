@@ -34,7 +34,7 @@ export const PLATFORM_DOMAIN_ZH = {
 /** @type {Record<string, string>} */
 export const PLATFORM_ACTION_ZH = {
   'agents.bindings': '可绑定能力包 packs + 工具/技能/MCP/知识库（创建前先查；优先选 pack）',
-  'agents.create': '创建智能体（优先 capability_pack；省略 tools→空；tools:null 须 confirm_inherit_all）',
+  'agents.create': '创建智能体员工（默认进花名册可对话；as_employee=false 仅能力体；优先 capability_pack）',
   'agents.delete': '删除智能体',
   'agents.get': '查看智能体详情',
   'agents.list': '列出智能体角色',
@@ -179,6 +179,8 @@ export const PLATFORM_ACTION_ZH = {
   'tasks.reclaim_zombies': '回收僵尸任务（默认 dry_run；apply=true 才执行）',
   'tasks.set_state': '行政侧变更 Task 状态（合法流转：pending→executing→completed 等；非法时错误含 next_states）',
   'ui.hide': '关闭右侧面板',
+  'ui.kinds': '查询右栏面板类型',
+  'ui.panel': '控制主窗口',
   'ui.show': '打开右侧面板（进度/网页/产物等；读操作无需 confirm）',
   'ui.update': '更新已打开的右侧面板内容',
   'verification.catalog': '查询全平台可验证接口清单（按域/风险/关键词）',

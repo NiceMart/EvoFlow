@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
+# 【self-evolution-bot · 2026-11-20 · 第99轮 · 模型:deepseek-v4.1-flash-1017】
+# 改了什么：补模块级 logger。为什么：第99轮 sweep 新增的降级分支调用了
+# `logger.warning`，而本模块此前**从未定义 logger**（全仓唯一引用就是新加那行），
+# 真触发降级时会变成 NameError，把「sweep 少清几条」升级成「sweep 整轮崩」。
 from evoflow.persistence.db import get_db, run_db_transaction
 from evoflow.persistence.timestamps import iso_z_to_ms, ms_to_iso_z, now_iso_z
+
+logger = logging.getLogger(__name__)
 
 
 def _dumps(obj: Any) -> str:
@@ -45,6 +52,60 @@ def upsert_live_run_snapshot(
     updated_at = now_iso_z()
 
     def _tx(db: Any) -> dict[str, Any]:
+        # 【self-evolution-bot · 2026-11-22 · 第119轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：在 upsert 之前加一道「迟到心跳」闸——要写回 `running` 时，若会话
+        # 已是终态（done/fail/cancelled/…）且 `current_run_id` 与本条 run_id 不对齐，
+        # 直接丢弃这次写入，返回库里现有快照。
+        # 为什么（本轮现网取证，09:35 三条真实成功回合）：回合正常答完、assistant 行
+        # 09:35:46.9～47.9 已落库，10 秒后（09:35:56.9～57.9）同一 sk 又被 PUT 回
+        # `status=running`；`updated_at - last_event_at` 恰为 **10.004～10.009s**，与前端
+        # `LIVE_RUN_PUT_BACKGROUND_MS=10000` 完全吻合 —— 是那个 debounce 定时器在回合收尾
+        # 之后才触发。后果：`/live-run/check` 按 `status.startswith('completed_')` 判完成，
+        # 于是一个**已经答完的回合**被认成还在跑，要等 sweep（本机 interval=600s）把它标成
+        # `completed_error` 才解开；成功轮因此被记进 error 桶（现网 125 error / 12 success）。
+        # 判据与 `sweep_stale_running_snapshots` 的第二路完全一致，避免两处各说一套。
+        # 边界：只在「要写 running」时挡。终态写入（completed_success/error）永远放行；
+        # 会话行缺失、会话仍 running、run_id 对齐（真是当前轮）时也一律放行。
+        if st == "running":
+            try:
+                srow = db.execute(
+                    """
+                    SELECT run_status, current_run_id FROM evoflow_chat_sessions
+                    WHERE session_key = ? AND COALESCE(is_deleted, 0) = 0
+                    LIMIT 1
+                    """,
+                    (sk,),
+                ).fetchone()
+                if srow:
+                    sd = dict(srow)
+                    sess_rs = str(sd.get("run_status") or "").strip().lower()
+                    cur_run = str(sd.get("current_run_id") or "").strip()
+                    terminal = sess_rs in (
+                        "done", "success", "fail", "error",
+                        "cancelled", "stopped", "completed", "idle",
+                    )
+                    if terminal and not (cur_run and cur_run == rid):
+                        logger.info(
+                            "live-run upsert dropped late heartbeat: sk=%s run=%s "
+                            "status=%s session_run_status=%s current_run_id=%s",
+                            sk, rid, st, sess_rs, cur_run or "-",
+                        )
+                        existing = db.execute(
+                            """
+                            SELECT session_key, thread_id, run_id, status,
+                                   partial_text, partial_tools_json, display_segments_json,
+                                   last_event_at, updated_at
+                            FROM evoflow_chat_live_runs
+                            WHERE session_key = ?
+                            LIMIT 1
+                            """,
+                            (sk,),
+                        ).fetchone()
+                        return _row_to_dict(existing) if existing else {}
+            except Exception:
+                # 会话表不可用时不要挡写入：宁可留下一条待 sweep 的孤儿，
+                # 也不能把正在跑的真回合心跳丢掉。
+                logger.warning("live-run upsert late-heartbeat check failed", exc_info=True)
         db.execute(
             """
             INSERT INTO evoflow_chat_live_runs (
@@ -96,6 +157,71 @@ def get_live_run_snapshot(session_key: str, *, conn: Any | None = None) -> dict[
         (sk,),
     ).fetchone()
     return _row_to_dict(row)
+
+
+# 【self-evolution-bot · 2026-11-22 · 第120轮 · 模型:deepseek-v4.1-flash-1017】
+# 改了什么：新增 `snapshot_completed_state()` —— 把 `/live-run/check` 的「是否已完成」
+# 判据从「只看 status 前缀」升级为「前缀 OR 会话终态且 run_id 不对齐」。
+# 为什么（本轮现网取证 + 读侧调用链）：`install-visibility-reattach.ts:53-87` 拿到
+# `completed=false` 就走 `stale-run-refresh` 分支（多刷一次、还要再等）；而进程被杀 /
+# 窗口关闭留下的 running 行，要等 sweep 才清——本机 `EVOFLOW_ZOMBIE_SWEEP_INTERVAL_S=600`，
+# 也就是说一个**早已死掉的回合**最长会被认成「还在跑」10 分钟。
+# 判据与 `sweep_stale_running_snapshots` 第二路逐字一致，避免两处各说一套：
+#   会话 run_status ∈ {done,success,fail,error,cancelled,stopped,completed,idle}
+#   且 current_run_id 与该快照 run_id 不对齐 → 孤儿，已完成。
+# 边界：会话行缺失 / 会话仍 running / run_id 对齐 → 一律回 completed=false（真回合）。
+def snapshot_completed_state(session_key: str, *, conn: Any | None = None) -> dict[str, Any]:
+    """Decide whether a session's live run should be treated as finished by readers.
+
+    Read-only: never mutates the snapshot. Sweeping stays the sweeper's job.
+    """
+    sk = str(session_key or "").strip()
+    if not sk:
+        return {"completed": False, "status": None, "runId": None, "reason": "no_session_key"}
+
+    def _read(db: Any) -> dict[str, Any]:
+        snap = db.execute(
+            """
+            SELECT run_id, status FROM evoflow_chat_live_runs
+            WHERE session_key = ? LIMIT 1
+            """,
+            (sk,),
+        ).fetchone()
+        if not snap:
+            return {"completed": False, "status": None, "runId": None, "reason": "no_snapshot"}
+        sd = dict(snap)
+        status = str(sd.get("status") or "").strip()
+        run_id = str(sd.get("run_id") or "").strip()
+        if status.lower().startswith("completed_"):
+            return {"completed": True, "status": status, "runId": run_id, "reason": "terminal"}
+        if status.lower() != "running":
+            return {"completed": False, "status": status, "runId": run_id, "reason": "unknown_status"}
+        try:
+            srow = db.execute(
+                """
+                SELECT run_status, current_run_id FROM evoflow_chat_sessions
+                WHERE session_key = ? AND COALESCE(is_deleted, 0) = 0 LIMIT 1
+                """,
+                (sk,),
+            ).fetchone()
+        except Exception:
+            return {"completed": False, "status": status, "runId": run_id, "reason": "session_lookup_failed"}
+        if not srow:
+            return {"completed": False, "status": status, "runId": run_id, "reason": "no_session_row"}
+        rs = dict(srow)
+        sess_rs = str(rs.get("run_status") or "").strip().lower()
+        cur_run = str(rs.get("current_run_id") or "").strip()
+        terminal = sess_rs in (
+            "done", "success", "fail", "error",
+            "cancelled", "stopped", "completed", "idle",
+        )
+        if terminal and not (cur_run and cur_run == run_id):
+            return {"completed": True, "status": status, "runId": run_id, "reason": "orphan_terminal_session"}
+        return {"completed": False, "status": status, "runId": run_id, "reason": "live"}
+
+    if conn is not None:
+        return _read(conn)
+    return run_db_transaction(_read)
 
 
 def delete_live_run_snapshot(session_key: str, *, conn: Any | None = None) -> bool:
@@ -308,3 +434,118 @@ def check_run_completed(thread_id: str, *, conn: Any | None = None) -> dict[str,
         "run_id": run_id,
         "status": completion_status,
     }
+
+
+# 【self-evolution-bot · 2026-11-20 · 第96轮 · 模型:deepseek-v4.1-flash-1017】
+# 改了什么：新增 `sweep_stale_running_snapshots()`——把「心跳早就停了但状态仍是
+# running」的快照就地标成 `completed_error`。
+# 为什么（本轮现网取证）：`evoflow_chat_live_runs` 里进程被杀后留下的 running 行
+# **没有任何回收路径**。`delete_live_run_snapshot()` 只有两个调用点：前端主动 DELETE，
+# 或 stream 正常收尾 flush。重启=tokill，两者都不会发生。实测现网 118 条 running，
+# 其中 **116 条心跳早于当天 17:00**，最早停在 11-18。
+# 后果链条：`GET /{sk}/live-run/check` 用 `status.startswith("completed_")` 判完成 →
+# 这些行永远返回 completed=False → 前端 `install-visibility-reattach` 认为「run 还没结束、
+# 只是没在流」，于是一直等着接续一条早已死掉的 run，表现就是重启后卡住、叫不醒。
+# 为什么不直接 DELETE：标 `completed_error` 才能让 `/live-run/check` 返回 completed=True，
+# 前端据此刷新消息并自行清快照；直接删会让它退化成「没有快照」的旧分支，仍要等超时。
+def sweep_stale_running_snapshots(*, max_age_s: float, conn: Any | None = None) -> dict[str, int]:
+    """Mark ``running`` snapshots whose heartbeat is older than ``max_age_s`` as terminal.
+
+    ``max_age_s <= 0`` disables the sweep (returns zeros). Rows without any
+    ``last_event_at`` are treated as stale too — a running row with no heartbeat
+    can never become fresh again on its own.
+    """
+    stats = {"scanned": 0, "swept": 0}
+    if max_age_s is None or float(max_age_s) <= 0:
+        return stats
+    import time as _time
+
+    # 用 epoch 毫秒比较，避免手搓 ISO 串时区/格式差异（库里既有 +08:00 也有 Z 结尾）。
+    cutoff_ms = (_time.time() - float(max_age_s)) * 1000.0
+
+    def _tx(db: Any) -> dict[str, int]:
+        rows = db.execute(
+            """
+            SELECT session_key, run_id, last_event_at, updated_at
+            FROM evoflow_chat_live_runs
+            WHERE lower(status) = 'running'
+            """
+        ).fetchall()
+        current_time = now_iso_z()
+        local: dict[str, int] = {"scanned": 0, "swept": 0}
+
+        # 【self-evolution-bot · 2026-11-20 · 第99轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：除「心跳过期」外，再加一条判据——**会话本身已是终态**（done/fail/
+        # cancelled/idle/…）而快照还挂着 running，一律按孤儿回收，不看心跳。
+        # 为什么：前端重启后仍会每 ~5s PUT 一次心跳。只按心跳判，会把「已经死掉但没有
+        # 会话在跑」的快照喂成永远新鲜——现网实测 23:29 两条 running 快照心跳是**当秒**
+        # 的，而它们的 session.run_status 同为 running（旧 run 未收尾），启动 sweep 只扫到
+        # 1 条就再也抓不到。会话终态是比心跳更强的信号：run_status 已终就不可能有活着的
+        # 流，与前端心跳无关。
+        # 边界：会话行缺失时**不**按孤儿处理（可能是快照先写、会话行后插的竞态窗口），
+        # 这类仍走心跳过期那条路。
+        # 边界②：**run_id 对齐就不清**。会话声称「当前轮」正是这条快照
+        # （`current_run_id == live.run_id`）时，即使 run_status 已经是 done，也可能是
+        # 收尾瞬间或刚发新消息的中间态 —— 此时退回心跳判据，不按孤儿回收。
+        # 现网实证据（00:39）：`…05-07-10.588Z` 会话 current_run_id 与快照 run_id 完全一致
+        # 且两边都是 running（真在跑）；而 `…16-15-39.290Z` 会话 current_run_id 为空、
+        # 快照 run_id 是前端占位符 `run-964e7593228f`（真孤儿）。对齐判据正好把两者分开。
+        terminal_current_run: dict[str, str] = {}
+        keys = [str(dict(r).get("session_key") or "") for r in rows]
+        for i in range(0, len(keys), 500):
+            chunk = [k for k in keys[i : i + 500] if k]
+            if not chunk:
+                continue
+            q = ", ".join("?" * len(chunk))
+            try:
+                trows = db.execute(
+                    f"""
+                    SELECT session_key, current_run_id FROM evoflow_chat_sessions
+                    WHERE session_key IN ({q})
+                      AND COALESCE(is_deleted, 0) = 0
+                      AND lower(COALESCE(run_status, '')) IN (
+                          'done', 'success', 'fail', 'error',
+                          'cancelled', 'stopped', 'completed', 'idle'
+                      )
+                    """,
+                    tuple(chunk),
+                ).fetchall()
+                for t in trows:
+                    td = dict(t)
+                    terminal_current_run[str(td.get("session_key") or "")] = str(
+                        td.get("current_run_id") or ""
+                    )
+            except Exception:
+                # 会话表不可用时退化为纯心跳判据，不要让整轮 sweep 挂掉。
+                logger.warning("live-run sweep: session terminal lookup failed", exc_info=True)
+                terminal_current_run.clear()
+                break
+
+        for row in rows:
+            d = dict(row)
+            local["scanned"] += 1
+            sk = str(d.get("session_key") or "")
+            snap_run = str(d.get("run_id") or "")
+            beat = str(d.get("last_event_at") or d.get("updated_at") or "").strip()
+            beat_ms = iso_z_to_ms(beat) if beat else 0
+            if sk in terminal_current_run and not (
+                terminal_current_run[sk] and snap_run and terminal_current_run[sk] == snap_run
+            ):
+                pass  # 会话已终态且 run_id 不对齐：无论心跳多新，快照都是孤儿
+            elif beat_ms and beat_ms >= cutoff_ms:
+                continue
+            cur = db.execute(
+                """
+                UPDATE evoflow_chat_live_runs
+                SET status = 'completed_error', updated_at = ?
+                WHERE session_key = ? AND lower(status) = 'running'
+                """,
+                (current_time, str(d.get("session_key") or "")),
+            )
+            if int(cur.rowcount or 0) > 0:
+                local["swept"] += 1
+        return local
+
+    if conn is not None:
+        return _tx(conn)
+    return run_db_transaction(_tx)

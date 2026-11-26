@@ -103,7 +103,22 @@ def embedding_error_is_soft_unavailable(exc: BaseException) -> tuple[bool, float
 
 
 def note_embedding_unavailable(exc: BaseException) -> bool:
-    """Arm embedding cool-down for any EmbeddingError; return True if soft."""
+    """Arm embedding cool-down for an EmbeddingError; return True if soft.
+
+    Only genuine embedding failures may open the process-wide skip window. Any
+    unrelated exception that happens to fly through a ``except Exception`` next
+    to an embedding call (observed 2026-11-21: a sqlite3 ProgrammingError from a
+    malformed ``?`` binding in hybrid search) must NOT do it — the window is
+    global, so one unrelated bug silently downgraded every later document to
+    keyword-only and stamped that bug's text into each doc's ``error_message``.
+    """
+    if not isinstance(exc, EmbeddingError):
+        logger.warning(
+            "not an embedding failure — embedding skip window left untouched: %s: %s",
+            type(exc).__name__,
+            str(exc)[:300],
+        )
+        return False
     soft, cool_s = embedding_error_is_soft_unavailable(exc)
     arm_embedding_quota_skip(str(exc), seconds=cool_s if soft else _EMBED_SKIP_HARD_S)
     return soft
@@ -224,7 +239,14 @@ async def run_parse_index(
                 """,
                 (combined, combined, utc_now(), doc_id),
             )
-        logger.error("parse_file failed doc=%s kb=%s: %s", doc_id, kb_id, full_tb)
+        # Permanent corrupt/unsupported sources: warn (not error) — worker +
+        # orphan reconcile already skip requeue via _PARSE_FAIL_HINTS.
+        from evoflow.knowledge.owned.service import _error_looks_like_parse_failure
+
+        if _error_looks_like_parse_failure(user_msg, last_line):
+            logger.warning("parse_file permanent failure doc=%s kb=%s: %s", doc_id, kb_id, last_line)
+        else:
+            logger.error("parse_file failed doc=%s kb=%s: %s", doc_id, kb_id, full_tb)
         raise
 
     jobs.update_progress(job_id, {"phase": "assets", "percent": 25, "message": "抽取图片"})

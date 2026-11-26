@@ -155,6 +155,17 @@ export function toUserFacingError(raw, fallback = DEFAULT_FALLBACK) {
     return facing
   }
 
+  // Parallel platform 生图 → multiple viewed_images updates in one graph step.
+  // 2026-11-26：raw 含 INVALID_CONCURRENT_GRAPH_UPDATE，旧逻辑当栈痕迹 → 「操作失败」。
+  if (
+    /INVALID_CONCURRENT_GRAPH_UPDATE|Can receive only one value per step/i.test(msg) ||
+    (/viewed_images/i.test(msg) && /Annotated key|only one value/i.test(msg))
+  ) {
+    const facing = '本轮生成失败：并行生图状态冲突，可再发一次；批量出图请稍等或分批'
+    logRawUserFacingError(raw, facing)
+    return facing
+  }
+
   // Bare AG-UI RUN_ERROR code / model disconnect — do not leave users with only "run_error".
   if (
     /^(run_error|error|unknown|failed|failure)$/i.test(msg) ||
@@ -165,6 +176,21 @@ export function toUserFacingError(raw, fallback = DEFAULT_FALLBACK) {
   ) {
     const facing =
       '本轮生成失败：模型服务中断或本机负载过高，请稍后重试；超长对话建议开新会话'
+    logRawUserFacingError(raw, facing)
+    return facing
+  }
+
+  // 【self-evolution-bot · 2026-11-21 · 第115轮 · 模型:deepseek-v4.1-flash-1017】
+  // 改了什么：新增「上游只给一句通用英文错误」这一档。
+  // 为什么（本轮现网实证）：23:26:49 文档撰写师第二轮，上游回
+  //   "An internal error occurred"（供应商通用错误，仓库里搜不到这句）。
+  //   它无 CJK、无栈、长度 25 —— 三条判据全不命中，最后落到 `facing = msg`，
+  //   等于把英文原文直接投给用户，既不说原因也不说下一步。
+  //   实测同一句重发一次即成功，所以默认动作应当是「再发一次」。
+  // 边界：只认短、纯英文、无冒号细节的整句，不吞掉带具体原因的原文。
+  if (/^(an?\s+)?(internal|unexpected|unknown)\s+(server\s+)?error\s+(occurred|happened)\.?$/i.test(msg) ||
+      /^something went wrong\.?$/i.test(msg)) {
+    const facing = '本轮生成失败：模型服务临时内部错误，直接再发一次通常就能过'
     logRawUserFacingError(raw, facing)
     return facing
   }

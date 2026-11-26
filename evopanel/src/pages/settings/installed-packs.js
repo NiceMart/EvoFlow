@@ -13,6 +13,8 @@ let _root = null
 let _items = []
 /** @type {string} */
 let _detailId = ''
+/** @type {Map<string, Record<string, any>>} pack_id → update info */
+let _updatesByPackId = new Map()
 
 function esc(s) {
   return String(s ?? '')
@@ -55,20 +57,44 @@ function fmtTime(iso) {
   }
 }
 
-const ARTIFACT_LABELS = [
-  ['employees', 'BOT'],
-  ['agents', '智能体'],
-  ['apps', '工作流'],
-  ['skills', '技能'],
-  ['extensions', '扩展'],
-  ['knowledge', '知识库'],
+/**
+ * 产物分组：一个标签可以覆盖多个 artifacts 键。
+ * 【self-evolution-bot · 2026-11-19 · 第76轮 · 模型:deepseek-v4.1-flash-1017】
+ * 改了什么：BOT 与「智能体」合并成一组（keys 同时吃 employees / agents，按 id 去重），
+ * extensions 的标签由「扩展」改为「Agent应用」。
+ * 为什么：员工就是智能体，是同一份配置，包内两个键写的是同一个对象；
+ * 分开列会让同一个 BOT 显示成「BOT 1 · 智能体 1」两遍。
+ */
+const ARTIFACT_GROUPS = [
+  { keys: ['employees', 'agents'], label: 'BOT' },
+  { keys: ['apps'], label: '工作流' },
+  { keys: ['skills'], label: '技能' },
+  { keys: ['extensions'], label: 'Agent应用' },
+  { keys: ['knowledge'], label: '知识库' },
+  { keys: ['mcp'], label: 'MCP' },
 ]
 
-function artifactSummary(arts) {
+/** 把多个 artifacts 键的 id 合成一份去重列表（顺序保持：先 employees 后 agents）。 */
+function groupIds(arts, keys) {
   const a = arts && typeof arts === 'object' ? arts : {}
+  const out = []
+  const seen = new Set()
+  for (const key of keys) {
+    const ids = Array.isArray(a[key]) ? a[key] : []
+    for (const raw of ids) {
+      const id = String(raw ?? '').trim()
+      if (!id || seen.has(id)) continue
+      seen.add(id)
+      out.push(id)
+    }
+  }
+  return out
+}
+
+function artifactSummary(arts) {
   const parts = []
-  for (const [key, label] of ARTIFACT_LABELS) {
-    const n = Array.isArray(a[key]) ? a[key].length : 0
+  for (const { keys, label } of ARTIFACT_GROUPS) {
+    const n = groupIds(arts, keys).length
     if (n) parts.push(`${label} ${n}`)
   }
   return parts.length ? parts.join(' · ') : '无产物记录'
@@ -76,6 +102,25 @@ function artifactSummary(arts) {
 
 function packTitle(it) {
   return String(it?.pack_name || it?.name || it?.pack_id || '').trim() || '未命名资源包'
+}
+
+function shortPath(p) {
+  const s = String(p || '').trim()
+  if (s.length <= 64) return s
+  return `…${s.slice(-56)}`
+}
+
+async function revealPath(absPath) {
+  const p = String(absPath || '').trim()
+  if (!p) {
+    toast.error('没有可打开的路径')
+    return
+  }
+  try {
+    await api.revealPathInFileManager(p)
+  } catch (e) {
+    toast.error(String(e?.message || e))
+  }
 }
 
 function shellHtml(embedded) {
@@ -116,6 +161,7 @@ function shellHtml(embedded) {
             <h3 data-ip-detail-title style="margin:0">资源包详情</h3>
           </div>
           <div class="sr-inline-actions">
+            <button type="button" class="sr-btn sr-btn--primary" data-ip-act="upgrade-detail" hidden data-ip-upgrade-btn>升级</button>
             <button type="button" class="sr-btn sr-btn--danger" data-ip-act="uninstall-detail">卸载</button>
           </div>
         </div>
@@ -142,25 +188,115 @@ function showDetailPane() {
   if (detailPane) detailPane.hidden = false
 }
 
-function artifactRows(arts, details, key) {
-  const detailed = details && Array.isArray(details[key]) ? details[key] : null
-  if (detailed && detailed.length) {
-    return detailed
-      .map((row) => {
-        const id = String(row?.id || '').trim()
-        const name = String(row?.name || '').trim()
-        if (!id && !name) return null
-        return { id, name: name || id }
-      })
-      .filter(Boolean)
+/**
+ * 取一组的产物行：多个键（如 employees + agents）合并后按 id 去重。
+ * 有 artifact_details 时优先用带显示名的行。
+ */
+function groupRows(arts, details, keys) {
+  const out = []
+  const seen = new Set()
+  for (const key of keys) {
+    const detailed = details && Array.isArray(details[key]) ? details[key] : null
+    const rows = detailed && detailed.length
+      ? detailed
+          .map((row) => {
+            const id = String(row?.id || '').trim()
+            const name = String(row?.name || '').trim()
+            if (!id && !name) return null
+            return { id, name: name || id }
+          })
+          .filter(Boolean)
+      : (Array.isArray(arts?.[key]) ? arts[key] : []).map((id) => ({ id: String(id), name: String(id) }))
+    for (const row of rows) {
+      const dedupeKey = row.id || row.name
+      if (seen.has(dedupeKey)) continue
+      seen.add(dedupeKey)
+      out.push(row)
+    }
   }
-  const ids = arts && Array.isArray(arts[key]) ? arts[key] : []
-  return ids.map((id) => ({ id: String(id), name: String(id) }))
+  return out
+}
+
+function chipList(items, empty = '无') {
+  const arr = Array.isArray(items) ? items.filter((x) => String(x || '').trim()) : []
+  if (!arr.length) return `<span class="sr-muted">${esc(empty)}</span>`
+  return `<div class="sr-chip-row">${arr
+    .map((x) => `<span class="sr-chip">${esc(String(x))}</span>`)
+    .join('')}</div>`
+}
+
+function truncateText(s, n = 480) {
+  const t = String(s || '').trim()
+  if (!t) return ''
+  if (t.length <= n) return t
+  return `${t.slice(0, n).trim()}…`
+}
+
+function renderPortabilityHints(it) {
+  const bits = []
+  const portable = it?.portable
+  if (portable === false) {
+    bits.push('本包含 folder-link / 本机路径，换机安装可能失效；分享请导出为 zip 或改为包内 copy。')
+  } else if (portable === true) {
+    bits.push('便携安装：Agent应用/技能已复制到本机数据目录，适合分享给同事。')
+  }
+  const extInstalls = Array.isArray(it?.extension_installs) ? it.extension_installs : []
+  const linkish = extInstalls.some((row) => {
+    const src = String(row?.source || '')
+    return src.includes('folder-link') || src.includes('link')
+  })
+  if (linkish) {
+    bits.push('含本机链接 Agent应用：路径只在你这台机器有效，别人装你的「本机路径」看不到。')
+  }
+  if (!bits.length) return ''
+  return `<div class="sr-detail-block">
+    <h4>分享说明</h4>
+    ${bits.map((b) => `<p class="sr-warn" style="margin:0 0 8px">${esc(b)}</p>`).join('')}
+  </div>`
+}
+
+function renderBotBindingCards(bindings) {
+  const rows = Array.isArray(bindings) ? bindings : []
+  if (!rows.length) return ''
+  return `
+    <div class="sr-detail-block">
+      <h4>BOT 绑定 <span class="sr-muted">(${rows.length})</span></h4>
+      <p class="sr-muted" style="margin:0 0 10px">BOT（原「智能体」）是同一份配置：系统提示词、工具、MCP、技能、知识库都在这里。</p>
+      ${rows
+        .map((b) => {
+          const title = esc(b.name || b.code)
+          const code = esc(b.code || '')
+          const soul = truncateText(b.soul || b.system_prompt || '', 600)
+          const err = b.error ? `<p class="sr-warn">${esc(b.error)}</p>` : ''
+          return `
+        <details class="sr-bot-card" open>
+          <summary>
+            <span class="sr-bot-card__title">${title}</span>
+            ${code && code !== title ? `<code>${code}</code>` : ''}
+            ${b.missing ? '<span class="sr-badge sr-badge--warn">未找到运行态</span>' : ''}
+          </summary>
+          <div class="sr-bot-card__body">
+            ${err}
+            <dl class="sr-kv">
+              <div><dt>工具</dt><dd>${chipList(b.tools, '未绑定工具')}</dd></div>
+              <div><dt>MCP</dt><dd>${chipList(b.mcp_servers, '未绑定 MCP')}</dd></div>
+              <div><dt>技能</dt><dd>${chipList(b.skills, '未绑定技能')}</dd></div>
+              <div><dt>知识库</dt><dd>${chipList(b.knowledge_labels || b.knowledge_vault_ids, '未绑定知识库')}</dd></div>
+            </dl>
+            <div class="sr-bot-soul">
+              <div class="sr-bot-soul__label">系统提示词 / SOUL</div>
+              <pre class="sr-bot-soul__text">${soul ? esc(soul) : '<span class="sr-muted">（空）</span>'}</pre>
+            </div>
+          </div>
+        </details>`
+        })
+        .join('')}
+    </div>`
 }
 
 function renderArtifactBlocks(arts, details) {
-  const blocks = ARTIFACT_LABELS.map(([key, label]) => {
-    const rows = artifactRows(arts, details, key)
+  const blocks = ARTIFACT_GROUPS.map(({ keys, label }) => {
+    const rows = groupRows(arts, details, keys)
     if (!rows.length) return ''
     const chips = rows
       .map((row) => {
@@ -181,6 +317,63 @@ function renderArtifactBlocks(arts, details) {
     return `<div class="sr-detail-block"><p class="sr-muted">暂无产物记录</p></div>`
   }
   return blocks.join('')
+}
+
+/**
+ * 拉取 BOT/Agent 运行态绑定，便于核对「装完后 MCP/工具是否还在」。
+ * @param {Record<string, any>} it
+ */
+async function loadBotBindings(it) {
+  const arts = it?.artifacts && typeof it.artifacts === 'object' ? it.artifacts : {}
+  const details = it?.artifact_details && typeof it.artifact_details === 'object' ? it.artifact_details : {}
+  const codes = new Set()
+  for (const row of groupRows(arts, details, ['employees', 'agents'])) {
+    if (row.id) codes.add(row.id)
+  }
+  /** @type {Array<Record<string, any>>} */
+  const out = []
+  for (const code of codes) {
+    try {
+      const agent = await api.getAgent(code)
+      let knowledgeLabels = []
+      try {
+        const role = await api.proactiveGetRole(code)
+        const cfg = role?.config || role || {}
+        const ids = Array.isArray(cfg.knowledge_vault_ids)
+          ? cfg.knowledge_vault_ids
+          : Array.isArray(agent?.knowledge_vault_ids)
+            ? agent.knowledge_vault_ids
+            : []
+        knowledgeLabels = ids.map((id) => String(id))
+      } catch {
+        knowledgeLabels = Array.isArray(agent?.knowledge_vault_ids)
+          ? agent.knowledge_vault_ids.map((id) => String(id))
+          : []
+      }
+      out.push({
+        code,
+        name: agent?.agent_name || agent?.role_name || code,
+        tools: agent?.tools || [],
+        mcp_servers: agent?.mcp_servers || [],
+        skills: agent?.skills || [],
+        knowledge_vault_ids: agent?.knowledge_vault_ids || [],
+        knowledge_labels: knowledgeLabels,
+        soul: agent?.soul || agent?.system_prompt || '',
+        system_prompt: agent?.system_prompt || '',
+      })
+    } catch (e) {
+      out.push({
+        code,
+        name: code,
+        missing: true,
+        error: String(e?.message || e),
+        tools: [],
+        mcp_servers: [],
+        skills: [],
+      })
+    }
+  }
+  return out
 }
 
 function renderList(items) {
@@ -208,6 +401,9 @@ function renderList(items) {
       const title = packTitle(it)
       const desc = String(it.description || '').trim()
       const showId = it.pack_id && it.pack_id !== title
+      const upd = _updatesByPackId.get(String(it.pack_id || ''))
+      const canUpdate = !!upd
+      const availVer = upd ? String(upd.available_version || '') : ''
       return `
       <article class="sr-card sr-card--clickable" data-org-id="${id}" data-ip-act="open-detail" tabindex="0" role="button" aria-label="查看 ${esc(title)} 详情">
         <span class="sr-type-icon" title="${esc(kindLabel(it.kind))}">${kindIcon(it.kind)}</span>
@@ -216,6 +412,7 @@ function renderList(items) {
             <span>${esc(title)}</span>
             <span class="sr-badge">${esc(kindLabel(it.kind))}</span>
             <span class="sr-badge sr-badge--muted">v${esc(it.pack_version)}</span>
+            ${canUpdate ? `<span class="sr-badge sr-badge--update">可更新 → v${esc(availVer)}</span>` : ''}
           </div>
           ${desc ? `<div class="sr-card-meta">${esc(desc)}</div>` : ''}
           <div class="sr-card-meta">${esc(artifactSummary(it.artifacts))}${
@@ -224,8 +421,14 @@ function renderList(items) {
           <div class="sr-card-meta">安装于 ${esc(fmtTime(it.installed_at))}${
             it.workspace_path ? ` · 工作区 ${esc(it.workspace_path)}` : ''
           }</div>
+          ${
+            it.pack_root || (Array.isArray(it.artifacts?.pack_root) && it.artifacts.pack_root[0])
+              ? `<div class="sr-card-meta">包目录 <code title="${esc(it.pack_root || it.artifacts.pack_root[0])}">${esc(shortPath(it.pack_root || it.artifacts.pack_root[0]))}</code></div>`
+              : ''
+          }
         </div>
         <div class="sr-card-actions">
+          ${canUpdate ? `<button type="button" class="sr-btn sr-btn--primary" data-ip-act="upgrade" data-pack-id="${esc(it.pack_id)}">升级</button>` : ''}
           <button type="button" class="sr-btn" data-ip-act="open-detail" data-org-id="${id}">详情</button>
           <button type="button" class="sr-btn sr-btn--danger" data-ip-act="uninstall" data-org-id="${id}">卸载</button>
         </div>
@@ -237,13 +440,44 @@ function renderList(items) {
 function renderDetail(it) {
   const host = _root?.querySelector('[data-ip-detail]')
   const titleEl = _root?.querySelector('[data-ip-detail-title]')
+  const upgradeBtn = _root?.querySelector('[data-ip-upgrade-btn]')
   if (!host) return
   const title = packTitle(it)
   if (titleEl) titleEl.textContent = title
+  const upd = _updatesByPackId.get(String(it.pack_id || ''))
+  if (upgradeBtn instanceof HTMLElement) {
+    upgradeBtn.hidden = !upd
+    upgradeBtn.setAttribute('data-pack-id', String(it.pack_id || ''))
+    upgradeBtn.textContent = upd ? `升级到 v${upd.available_version || ''}` : '升级'
+  }
   const ws = String(it.workspace_path || '').trim()
+  const packRoot = String(
+    it.pack_root || (Array.isArray(it.artifacts?.pack_root) && it.artifacts.pack_root[0]) || '',
+  ).trim()
+  const extInstalls = Array.isArray(it.extension_installs) ? it.extension_installs : []
   const wsWarn = ws.includes('${')
     ? `<p class="sr-warn">工作区路径仍含占位符,可能是安装时未展开。重新安装或在安装时选择工作区可修复。</p>`
     : ''
+  const updateBanner = upd
+    ? `<p class="sr-warn">市场有新版本：v${esc(it.pack_version)} → v${esc(upd.available_version)}。点右上角「升级」一键覆盖安装。</p>`
+    : ''
+  const extBlock = extInstalls.length
+    ? `<div class="sr-detail-block">
+        <h4>Agent应用安装目录</h4>
+        <p class="sr-muted" style="margin:0 0 10px">市场安装会复制到本机；首次打开时会自动准备 npm/pip 环境。</p>
+        ${extInstalls
+          .map((row) => {
+            const ip = String(row.install_path || '').trim()
+            return `<div class="sr-chip-row" style="margin-bottom:8px;align-items:center;gap:8px;flex-wrap:wrap">
+              <span class="sr-chip sr-chip--named"><b>${esc(row.name || row.id)}</b><code>${esc(row.id)}</code></span>
+              ${ip ? `<code title="${esc(ip)}" style="font-size:12px">${esc(shortPath(ip))}</code>
+              <button type="button" class="sr-btn" data-ip-act="reveal-path" data-path="${esc(ip)}">打开目录</button>` : '<span class="sr-muted">路径未知</span>'}
+            </div>`
+          })
+          .join('')}
+      </div>`
+    : ''
+  const botBlock = renderBotBindingCards(it._botBindings)
   host.innerHTML = `
     <div class="sr-detail-hero">
       <div>
@@ -251,9 +485,13 @@ function renderDetail(it) {
           <span>${esc(title)}</span>
           <span class="sr-badge">${esc(kindLabel(it.kind))}</span>
           <span class="sr-badge sr-badge--muted">v${esc(it.pack_version)}</span>
+          ${upd ? `<span class="sr-badge sr-badge--update">可更新 → v${esc(upd.available_version)}</span>` : ''}
           <span class="sr-badge sr-badge--muted">${esc(it.status || 'active')}</span>
+          ${it.portable === true ? '<span class="sr-badge sr-badge--portable">便携</span>' : ''}
+          ${it.portable === false ? '<span class="sr-badge sr-badge--local">本机链接</span>' : ''}
         </div>
         <p class="sr-card-meta" style="margin:0">${esc(it.description || '无描述')}</p>
+        ${updateBanner}
       </div>
     </div>
     <div class="sr-detail-block">
@@ -264,12 +502,21 @@ function renderDetail(it) {
         <div><dt>实例 id</dt><dd><code>${esc(it.org_instance_id || '—')}</code></dd></div>
         <div><dt>安装时间</dt><dd>${esc(fmtTime(it.installed_at))}</dd></div>
         <div><dt>工作区</dt><dd>${ws ? `<code>${esc(ws)}</code>` : '—'}</dd></div>
+        <div><dt>包目录</dt><dd>${
+          packRoot
+            ? `<code>${esc(packRoot)}</code>
+               <button type="button" class="sr-btn" style="margin-left:8px" data-ip-act="reveal-path" data-path="${esc(packRoot)}">打开目录</button>`
+            : '—'
+        }</dd></div>
       </dl>
       ${wsWarn}
     </div>
+    ${renderPortabilityHints(it)}
+    ${extBlock}
+    ${botBlock}
     <div class="sr-detail-block">
       <h4>已装产物</h4>
-      <p class="sr-muted" style="margin:0 0 10px">安装时写入系统的员工 / 智能体 / 技能 / 扩展等;主文案为中文显示名,编码可悬停查看。</p>
+      <p class="sr-muted" style="margin:0 0 10px">安装时写入系统的 BOT / 工作流 / 技能 / MCP / Agent应用等；主文案为中文显示名，编码可悬停查看。</p>
       ${renderArtifactBlocks(it.artifacts, it.artifact_details)}
     </div>
   `
@@ -288,6 +535,12 @@ async function openDetail(orgId) {
     if (remote && typeof remote === 'object') it = { ...(it || {}), ...remote }
     if (!it) throw new Error(`未找到实例：${id}`)
     renderDetail(it)
+    // 绑定详情异步补齐，避免挡住基础信息
+    const bindings = await loadBotBindings(it)
+    if (_detailId === id) {
+      it._botBindings = bindings
+      renderDetail(it)
+    }
   } catch (e) {
     if (host) {
       host.innerHTML = `<div class="sr-empty sr-empty--error">加载失败：${esc(e?.message || e)}</div>`
@@ -296,12 +549,34 @@ async function openDetail(orgId) {
   }
 }
 
+async function refreshUpdates() {
+  try {
+    const res = await api.orgMarketUpdates()
+    const map = new Map()
+    for (const row of res?.items || []) {
+      const pid = String(row?.pack_id || '').trim()
+      if (pid) map.set(pid, row)
+    }
+    _updatesByPackId = map
+  } catch {
+    _updatesByPackId = new Map()
+  }
+}
+
 async function refresh() {
   const list = _root?.querySelector('[data-ip-list]')
   if (list && !_detailId) list.innerHTML = `<div class="sr-empty">加载中…</div>`
   try {
+    // 已装列表先渲染；市场更新检查走后台，GitHub 不通时不堵列表
     const res = await api.orgList('active')
     renderList(res?.items || [])
+    void refreshUpdates().then(() => {
+      if (_root && !_detailId) renderList(_items)
+      else if (_detailId) {
+        const still = _items.some((x) => x.org_instance_id === _detailId)
+        if (still) void openDetail(_detailId)
+      }
+    })
     if (_detailId) {
       const still = _items.some((x) => x.org_instance_id === _detailId)
       if (still) await openDetail(_detailId)
@@ -312,6 +587,35 @@ async function refresh() {
       list.innerHTML = `<div class="sr-empty sr-empty--error">加载失败：${esc(e?.message || e)}</div>`
     }
     toast.error(String(e?.message || e))
+  }
+}
+
+async function upgradePack(packId) {
+  const pid = String(packId || '').trim()
+  if (!pid) return
+  const upd = _updatesByPackId.get(pid)
+  const cached = _items.find((x) => String(x.pack_id || '') === pid)
+  const label = cached ? packTitle(cached) : pid
+  const from = upd?.installed_version || cached?.pack_version || '?'
+  const to = upd?.available_version || '?'
+  const ok = await showConfirm(
+    `升级「${label}」？\n${from} → ${to}\n将用新包覆盖同名 BOT / Agent应用（保留工作区与知识库数据）。`,
+  )
+  if (!ok) return
+  try {
+    toast('正在升级…')
+    const res = await api.orgUpgrade({ pack_id: pid })
+    toast.success(`已升级到 v${res?.pack_version || to}`)
+    _detailId = ''
+    showList()
+    await refresh()
+  } catch (e) {
+    const detail = e?.detail
+    const msg =
+      (detail && typeof detail === 'object' && (detail.error || detail.detail)) ||
+      e?.message ||
+      e
+    toast.error(String(msg))
   }
 }
 
@@ -357,6 +661,9 @@ function onClick(e) {
   }
   if (act === 'uninstall') void uninstall(actBtn.getAttribute('data-org-id') || '')
   if (act === 'uninstall-detail') void uninstall(_detailId)
+  if (act === 'upgrade') void upgradePack(actBtn.getAttribute('data-pack-id') || '')
+  if (act === 'upgrade-detail') void upgradePack(actBtn.getAttribute('data-pack-id') || '')
+  if (act === 'reveal-path') void revealPath(actBtn.getAttribute('data-path') || '')
 }
 
 function onKeydown(e) {
@@ -391,4 +698,5 @@ export function cleanup() {
   }
   _items = []
   _detailId = ''
+  _updatesByPackId = new Map()
 }

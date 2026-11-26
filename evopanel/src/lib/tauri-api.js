@@ -2412,7 +2412,12 @@ export const api = {
     })
     if (r) q.set('root', r)
     if (t) q.set('thread_id', t)
-    return gatewayProxy('GET', `/workspaces/search?${q.toString()}`)
+    // Backend wall ~8s; client abort slightly above so Settings graph cannot pin Gateway
+    // (2026-11-23: q=class sat 100s+ on DATA while chat/settings looked frozen).
+    return gatewayProxy('GET', `/workspaces/search?${q.toString()}`, null, null, {
+      timeoutMs: 10_000,
+      silent: true,
+    })
   },
   /** Filename/path search for @-mention and workspace file tree (no code index). */
   searchWorkspaceFiles: async (root, query, limit = 40, threadId = undefined) => {
@@ -2857,10 +2862,12 @@ export const api = {
     gatewayProxy('GET', `/organizations/${encodeURIComponent(String(orgInstanceId || ''))}`),
   orgPreflight: async (payload) => gatewayProxy('POST', '/organizations/preflight', payload || {}),
   orgInstall: async (payload) => gatewayProxy('POST', '/organizations/install', payload || {}),
+  orgUpgrade: async (payload) => gatewayProxy('POST', '/organizations/upgrade', payload || {}),
   orgUninstall: async (payload) => gatewayProxy('POST', '/organizations/uninstall', payload || {}),
   orgExport: async (payload) => gatewayProxy('POST', '/organizations/export', payload || {}),
   orgMarketCatalog: async (force = false) =>
     gatewayProxy('GET', '/organizations/market/catalog', null, force ? { force: true } : {}),
+  orgMarketUpdates: async () => gatewayProxy('GET', '/organizations/market/updates'),
   resourceMarketSources: async () => gatewayProxy('GET', '/resource-market/sources'),
   resourceMarketSourceAdd: async (payload) =>
     gatewayProxy('POST', '/resource-market/sources', payload || {}),
@@ -3348,21 +3355,6 @@ export const api = {
       days,
       ...(runProbes ? { run_probes: true } : {}),
     }),
-  /** Person Kernel: identity + lessons + soul changelog + craft */
-  proactiveRoleGrowth: async (code, limit = 30) =>
-    gatewayProxy('GET', `/proactive/roles/${encodeURIComponent(String(code || ''))}/growth`, null, {
-      limit,
-    }),
-  proactiveRoleProposalApprove: async (code, proposalId) =>
-    gatewayProxy(
-      'POST',
-      `/proactive/roles/${encodeURIComponent(String(code || ''))}/proposals/${encodeURIComponent(String(proposalId || ''))}/approve`,
-    ),
-  proactiveRoleProposalReject: async (code, proposalId) =>
-    gatewayProxy(
-      'POST',
-      `/proactive/roles/${encodeURIComponent(String(code || ''))}/proposals/${encodeURIComponent(String(proposalId || ''))}/reject`,
-    ),
   proactiveRoleCost: async (code, days = 7) =>
     gatewayProxy('GET', `/proactive/roles/${encodeURIComponent(String(code || ''))}/cost`, null, { days }),
   proactiveGetMemory: async (code) =>
@@ -3767,6 +3759,15 @@ export const api = {
   updateApp: async (appId, payload) =>
     gatewayProxy('PUT', `/apps/${encodeURIComponent(String(appId || ''))}`, payload),
   deleteApp: async (appId) => gatewayProxy('DELETE', `/apps/${encodeURIComponent(String(appId || ''))}`),
+  listAppFolders: async () => {
+    const data = await gatewayProxy('GET', '/apps/folders', null, null, { preferGatewayHttp: true })
+    return Array.isArray(data?.items) ? data.items : Array.isArray(data) ? data : []
+  },
+  createAppFolder: async (payload) => gatewayProxy('POST', '/apps/folders', payload),
+  updateAppFolder: async (folderId, payload) =>
+    gatewayProxy('PATCH', `/apps/folders/${encodeURIComponent(String(folderId || ''))}`, payload),
+  deleteAppFolder: async (folderId) =>
+    gatewayProxy('DELETE', `/apps/folders/${encodeURIComponent(String(folderId || ''))}`),
   publishApp: async (appId) => gatewayProxy('POST', `/apps/${encodeURIComponent(String(appId || ''))}/publish`),
   listAppKeys: async (appId) => {
     const data = await gatewayProxy('GET', `/apps/${encodeURIComponent(String(appId || ''))}/keys`)

@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from pathlib import Path
 import os
 import time
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -84,6 +84,19 @@ def _effective_startup_delay_seconds() -> int:
     return _startup_delay_seconds()
 
 
+def _obs_size_cap_retry_seconds() -> int:
+    """When still over the obs size cap, retry retention sooner than the daily interval.
+
+    VACUUM INTO may be skipped by the busy guard; without a short retry the file
+    stays multi-GB until the next day (2026-11-23 non-dev: 2.5GB with ~1GB freelist).
+    """
+    raw = (os.getenv("EVOFLOW_OBS_SIZE_CAP_RETRY_S") or "3600").strip()
+    try:
+        return max(300, int(raw))
+    except ValueError:
+        return 3600
+
+
 def _vacuum_busy_guard() -> bool:
     """True = 允许本轮 VACUUM。聊天 REST / 流式 / 事件循环过载时让路。
 
@@ -120,15 +133,13 @@ def _vacuum_busy_guard() -> bool:
             return False
         snap = snapshot_inflight_requests() or {}
         inflight = list(snap.get("all") or snap.get("long_waiting") or [])
-        chatish = 0
-        for req in inflight:
-            path = str(req.get("path") or "")
-            if "/api/chat/" in path or "/api/langgraph/" in path:
-                chatish += 1
-        if chatish > 0:
+        # Any REST in flight (proactive/approvals, mcp/config, …) — not only chat.
+        # 2026-11-19 14:59 hang: VACUUM began while /api/proactive/approvals was
+        # already waiting; exclusive lock then froze the whole desktop ~86s.
+        if inflight:
             logger.info(
-                "vacuum guard: %d chat/langgraph inflight request(s) — skipping VACUUM this pass",
-                chatish,
+                "vacuum guard: %d inflight request(s) — skipping VACUUM this pass",
+                len(inflight),
             )
             return False
     except Exception:
@@ -170,16 +181,17 @@ def run_retention_once() -> dict[str, Any]:
     }
 
 
-def _run_wal_checkpoint_all() -> dict[str, Any]:
-    """Run ``PRAGMA wal_checkpoint(TRUNCATE)`` on all EvoFlow SQLite databases.
+def _run_wal_checkpoint_all(*, truncate: bool = False) -> dict[str, Any]:
+    """Run ``PRAGMA wal_checkpoint`` on all EvoFlow SQLite databases.
 
-    Called periodically (default ~hourly) by the data retention scheduler to
-    prevent WAL files from growing unbounded between full retention passes.
+    常规整点用 PASSIVE（不阻塞写入方；LG 每 superstep put / telemetry 持续写时
+    TRUNCATE 要么让写排队、要么自己失败形成「膨胀→TRUNCATE→挤压写」循环）。
+    仅 WAL 尺寸保险触发（超过上限、必须回收磁盘）时才用 TRUNCATE。
     """
     try:
         from evoflow.persistence.db import checkpoint_all_databases
 
-        return checkpoint_all_databases()
+        return checkpoint_all_databases(mode="passive" if not truncate else "truncate")
     except Exception:
         logger.warning("checkpoint_all_databases failed", exc_info=True)
         return {}
@@ -279,14 +291,18 @@ async def run_data_retention_scheduler(stop: asyncio.Event) -> None:
                 oversized = False
             if oversized and now - last_wal_checkpoint >= _WAL_SIZE_GUARD_MIN_GAP_S:
                 try:
-                    wal_summary = await asyncio.to_thread(_run_wal_checkpoint_all)
+                    wal_summary = await asyncio.to_thread(_run_wal_checkpoint_all, truncate=True)
                     logger.warning("WAL size guard triggered early checkpoint: %s", wal_summary)
                 except Exception:
                     logger.warning("WAL size-guard checkpoint failed", exc_info=True)
                 last_wal_checkpoint = time.monotonic()
 
         # --- Full data retention pass (infrequent; delayed after startup) ---
-        retention_due = now >= retention_due_at and (last_retention <= 0.0 or (now - last_retention) >= interval)
+        # Due time is already encoded in retention_due_at (daily interval OR
+        # hourly size-cap retry). Do NOT also require (now - last_retention) >=
+        # interval — that made EVOFLOW_OBS_SIZE_CAP_RETRY_S a no-op and left
+        # multi-GB freelist unreclaimed for a full day (2026-11-24→25).
+        retention_due = now >= retention_due_at
         if retention_due:
             try:
                 summary = await asyncio.to_thread(run_retention_once)
@@ -294,13 +310,22 @@ async def run_data_retention_scheduler(stop: asyncio.Event) -> None:
             except Exception:
                 logger.exception("Data retention pass failed")
             last_retention = time.monotonic()
-            retention_due_at = last_retention + interval
+            # Over size cap → retry hourly (busy-guard may have skipped VACUUM INTO).
+            if _observability_db_over_size_cap():
+                retry_s = _obs_size_cap_retry_seconds()
+                retention_due_at = last_retention + retry_s
+                logger.warning(
+                    "observability.db still over size cap; next retention in %ss (not full interval)",
+                    retry_s,
+                )
+            else:
+                retention_due_at = last_retention + interval
 
         # Wake often enough for WAL + startup delay without busy-looping.
         if last_retention <= 0.0:
             wait_for = max(5.0, min(300.0, retention_due_at - time.monotonic()))
         else:
-            wait_for = float(min(interval, wal_interval, 300))
+            wait_for = float(min(interval, wal_interval, 300, max(5.0, retention_due_at - time.monotonic())))
         try:
             await asyncio.wait_for(stop.wait(), timeout=wait_for)
         except TimeoutError:

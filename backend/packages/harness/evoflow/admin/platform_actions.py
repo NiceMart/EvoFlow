@@ -174,6 +174,8 @@ DOMAIN_GUIDES: dict[str, dict[str, str]] = {
         "when": (
             "查当前对话状态/上下文占用用 sessions.status；"
             "主动压缩上下文用 sessions.compact（confirm=true）；"
+            "**自己已经通读过这段对话时**，把结构化摘要正文写进 summary 参数一并传，"
+            "可免掉压缩模型重读一遍（更快、更准，因为它没有你手上的细节）；"
             "按关键词检索历史会话用 sessions.search"
         ),
         "not": "不是当前对话内 todo；不是系统级端口/目录（用 diagnostics.status）",
@@ -197,12 +199,16 @@ DOMAIN_GUIDES: dict[str, dict[str, str]] = {
         "not": "不是模型配置（用 settings.*）；改完后客户端会自动刷新界面",
     },
     "ui": {
-        "title": "右侧面板",
+        "title": "右侧面板 / 主窗口",
         "when": (
-            "要在右侧打开/关闭面板时：工作流图、节点进度、员工执行过程、网页内嵌、产物等。"
-            "用户要盯进度时用 ui.show（勿对每次写操作都开）"
+            "要开右侧栏/关闭面板时：工作流图、节点进度、员工执行过程、网页内嵌等；"
+            "用户要盯进度时用 ui.show（勿对每次写操作都开）。"
+            "要操作主窗口 DOM/产品动作（点按钮、填输入、开小V、发消息）用 ui.panel。"
         ),
-        "not": "不是改主题/液态玻璃（用 appearance）；不是跳页面路由（用反馈卡 CTA）",
+        "not": (
+            "不是改主题/液态玻璃等 appearance；不是整页路由（用方舟或 CTA）；"
+            "侧栏网页浏览用 browser/skill，不是 ui.panel。"
+        ),
     },
     "media": {
         "title": "生图/生视频",
@@ -272,8 +278,80 @@ def _truthy_confirm(args: dict[str, Any], confirm: bool) -> bool:
     return False
 
 
+_CARD_TITLE_MAX = 96
+
+
+def _clip_card_title(text: str, max_len: int = _CARD_TITLE_MAX) -> str:
+    s = str(text or "").strip()
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 1].rstrip() + "…"
+
+
+def _authored_card_title(args: dict[str, Any], result: dict[str, Any] | None = None) -> str | None:
+    """仅认「给人看的标题」：与 action 同级 / args 内的 title、专名。
+
+    对齐电脑控制：模型写中文 title；不从 op/method 等技术字段拼无意义串。
+    """
+    for key in (
+        "title",
+        "name",
+        "display_name",
+        "agent_name",
+        "role_name",
+        "skill_name",
+        "label",
+    ):
+        v = args.get(key)
+        if isinstance(v, str) and v.strip():
+            return _clip_card_title(v.strip())
+    if isinstance(result, dict):
+        for key in ("name", "display_name", "role_name", "skill_name", "title"):
+            v = result.get(key)
+            if isinstance(v, str) and v.strip() and len(v.strip()) <= _CARD_TITLE_MAX:
+                return _clip_card_title(v.strip())
+    return None
+
+
+def resolve_platform_card_title(
+    entry: PlatformAction,
+    args: dict[str, Any],
+    *,
+    result: dict[str, Any] | None = None,
+) -> str | None:
+    """有作者标题才返回；没有则 None（前端用中文动作短标签兜底，不发明技术串）。"""
+    return _authored_card_title(args, result)
+
+
+def _attach_platform_card_labels(
+    result: dict[str, Any],
+    entry: PlatformAction,
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    """与 ``action`` 同级 stamp：有作者 title 才写 ``title``；始终写 ``action_summary``。"""
+    if not isinstance(result, dict):
+        return result
+    action_summary = str(entry.summary or entry.name).strip() or entry.name
+    card_title = resolve_platform_card_title(entry, args, result=result)
+    result.setdefault("action", entry.name)
+    result.setdefault("domain", entry.domain)
+    result.setdefault("action_summary", action_summary)
+    existing = result.get("title")
+    if isinstance(existing, str) and existing.strip():
+        pass
+    elif card_title:
+        result["title"] = card_title
+    ui = result.get("ui")
+    if isinstance(ui, dict) and ui:
+        if not str(ui.get("title") or "").strip() and (card_title or result.get("title")):
+            ui["title"] = str(result.get("title") or card_title or "").strip()
+        ui.setdefault("action", entry.name)
+        ui.setdefault("domain", entry.domain)
+    return result
+
+
 def _preview(action: PlatformAction, args: dict[str, Any]) -> dict[str, Any]:
-    return {
+    out = {
         "ok": True,
         "pending_confirm": True,
         "action": action.name,
@@ -281,8 +359,12 @@ def _preview(action: PlatformAction, args: dict[str, Any]) -> dict[str, Any]:
         "risk": action.risk,
         "summary": action.summary,
         "args": args,
-        "hint": (f"这是{action.risk}操作，尚未执行。向用户复述将要做的事；用户确认后再次调用 platform(action={action.name!r}, args_json=..., confirm=true)。"),
+        "hint": (
+            f"这是{action.risk}操作，尚未执行。向用户复述将要做的事；"
+            f"用户确认后再次调用 platform(action={action.name!r}, args_json=..., confirm=true)。"
+        ),
     }
+    return _attach_platform_card_labels(out, action, args)
 
 
 def _A(
@@ -308,7 +390,15 @@ def _A(
 def _build_registry() -> dict[str, PlatformAction]:
     items: list[PlatformAction] = [
         # knowledge
-        _A("knowledge.list", "knowledge", "列出平台自有知识库", "read", "无", H.knowledge_list, "有哪些知识库"),
+        _A(
+            "knowledge.list",
+            "knowledge",
+            "列出平台自有知识库；默认省略与 storageDir 相同的 resolvedStorageDir",
+            "read",
+            "full?（默认 false，去重版）",
+            H.knowledge_list,
+            "有哪些知识库",
+        ),
         _A("knowledge.search", "knowledge", "检索自有知识库（默认 hybrid 多库扇出）", "read", "query, vaultId?/kbId?, top_k?, mode?, category?", H.knowledge_search, "怎么配置 MCP"),
         _A("knowledge.create", "knowledge", "新建平台自有知识库", "write", "name, description?, embeddingModelRef?", H.knowledge_create, "建个英语单词库"),
         _A("knowledge.ingest", "knowledge", "写入一篇笔记", "write", "title, content, vaultId?/kbId?, inboxPath?", H.knowledge_ingest, "把大纲写进库"),
@@ -363,7 +453,7 @@ def _build_registry() -> dict[str, PlatformAction]:
         _A("workflow.run_status", "workflow", "查看运行状态", "read", "runId", H.workflow_run_status, "那个运行到哪了"),
         _A("workflow.list_runs", "workflow", "查看应用运行历史", "read", "appId, limit?, page?", H.workflow_list_runs, "这个应用跑过几次"),
         # settings
-        _A("settings.list_models", "settings", "列出模型与默认模型", "read", "无", H.settings_list_models, "有哪些模型"),
+        _A("settings.list_models", "settings", "列出模型与默认模型（默认省去逐条实例化开关，共同取值收在 sharedConfig）", "read", "include_config?（默认 false）", H.settings_list_models, "有哪些模型"),
         _A("settings.get_default_model", "settings", "查看默认模型", "read", "无", H.settings_get_default_model, "默认模型是啥"),
         _A("settings.set_default_model", "settings", "设置默认模型", "write", "model", H.settings_set_default_model, "默认改成 glm-5.2"),
         _A("settings.get_model", "settings", "查看单个模型配置", "read", "model", H.settings_get_model, "glm 怎么配的"),
@@ -421,9 +511,9 @@ def _build_registry() -> dict[str, PlatformAction]:
         _A(
             "assets.get_profile",
             "assets",
-            "查看用户画像（资产中心：profile/USER.md）",
+            "查看用户画像（资产中心：profile/USER.md）；不传 principal_id 会标注读到的是默认档案",
             "read",
-            "无",
+            "principal_id?（强烈建议传，否则读默认 entity）",
             H.assets_get_profile,
             "我的用户画像",
         ),
@@ -512,25 +602,98 @@ def _build_registry() -> dict[str, PlatformAction]:
             "把背景换成本地视频路径",
         ),
         # ui（右侧面板；原独立 panel_set 工具已并入）
+        # 【self-evolution-bot · 2026-11-20 · 第87轮 · 模型:deepseek-v4.1-flash-1017】
+        # 新增 ui.kinds（模型调 ui.show 前先查契约，不再靠猜 kind/字段）；
+        # ui.show 描述从「打开右侧面板」降级为「申请展示，不抢视线」，示例改为 data.agentCode。
+        _A(
+            "ui.kinds",
+            "ui",
+            "查询右栏支持哪些面板类型、每种必需字段与触发语义（调 ui.show 前先查）",
+            "read",
+            "无",
+            H.ui_kinds,
+            "右栏能开哪些面板",
+            "ui.show 支持什么 kind",
+        ),
+        # 【self-evolution-bot · 2026-11-20 · 第100轮 · 模型:deepseek-v4.1-flash-1017】
+        # 新增 ui.current：让模型在开面板前知道**用户此刻右栏停在哪一页**。
+        # 为什么（用户明确指出）：此前后端对右栏状态一无所知（grep activeKey backend 命中 0），
+        # 模型 ui.show 只能盲开——要么抢走用户正看的东西，要么把同一页开成第二个签。
+        # 判据：known=false（前端从没上报）时不得假设「右栏为空」，要点明这一不确定性。
+        _A(
+            "ui.current",
+            "ui",
+            "读取用户当前右栏停在哪一页（activeKey/标签清单/是否收起）；开面板前先查，避免抢视线或重复开签",
+            "read",
+            "无",
+            H.ui_current,
+            "我右栏现在开着什么",
+            "用户当前在看哪个标签页",
+        ),
+        # 【self-evolution-bot · 2026-11-20 · 第100轮 · 模型:deepseek-v4.1-flash-1017】
+        # 新增 ui.activate：切到**用户已开的某个标签页**。
+        # 为什么（用户明确指出）：「你要知道当前是哪一个，然后怎么去切换到哪一个要处理好。」
+        #   只有 show/update/hide 时，模型想让人看回某页只能重新 show ——
+        #   那会把同一份东西开成第二个签，正好破坏「用户右栏还拉开着东西」的现场。
+        #   activate 只改 activeKey：不新建、不关闭、不改内容，tabCount 前后相等。
+        _A(
+            "ui.activate",
+            "ui",
+            "把右栏切到用户已存在的某个标签页（只改当前查看的签；不新建/不关闭/不改内容，用户拉开的其它标签原样保留）",
+            "read",
+            "key（先 ui.current 取 tabs[].key）",
+            H.ui_activate,
+            "切回刚才那个员工执行过程标签",
+            "让用户看回他开着的文件页",
+        ),
         _A(
             "ui.show",
             "ui",
-            "打开右侧面板（进度/网页/产物等；读操作无需 confirm）",
+            "申请在右侧展示面板（进度/网页/内嵌页等；会写入标签但不抢用户视线，用户点了才展开）",
             "read",
             "kind, data?, title?, layout?",
             H.ui_show,
             "打开任务工作流图 kind=collab-workflow data.mainTaskId",
-            "打开员工执行过程 kind=employeeProcess data.taskId+agentCode",
+            "打开员工执行过程 kind=employeeProcess data.agentCode",
             "打开节点进度 kind=collabSubtaskTranscript",
+            "给用户看网页 kind=web-embed data.url",
         ),
         _A(
             "ui.hide",
             "ui",
-            "关闭右侧面板",
+            "关闭右侧面板（整栏收起）",
             "read",
             "无",
             H.ui_hide,
             "把右侧面板收起来",
+        ),
+        # 【self-evolution-bot · 2026-11-20 · 第101轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：新增 ui.close（关单个标签）与 ui.move（调换标签位置）。
+        # 为什么（用户当场要求，原话）：「你可以切换到哪个进行一个显示，或者是给它关掉，
+        #   或者是打开，或者给它调换位置。就这种像人一样的操作。」
+        #   此前 ui 域只有 show/update/hide/activate：hide 是整栏收起，
+        #   用户「只想关掉那一个」做不到；「调换位置」更是完全没入口，
+        #   而前端 store 里 closeTab / reorderTab 早就写好了，只是没暴露给模型。
+        # 判据：close 后 tabCount 减 1 且其它签 key 不变；move 后 tabCount 不变、两签顺序互换。
+        _A(
+            "ui.close",
+            "ui",
+            "关闭右栏里指定的那一个标签（其它标签与整栏展开状态不受影响；要整栏收起用 ui.hide）",
+            "read",
+            "key（先 ui.current 取 tabs[].key）",
+            H.ui_close,
+            "把那个任务页标签关掉",
+            "关掉截图标签，其它留着",
+        ),
+        _A(
+            "ui.move",
+            "ui",
+            "调整右栏标签的先后顺序（把 key 这个签移到 target 那个签的位置；不新建/不关闭/不改内容）",
+            "read",
+            "key, target（两者都从 ui.current → tabs[].key 取）",
+            H.ui_move,
+            "把员工过程标签挪到最前面",
+            "把任务页调到网页前面",
         ),
         # media（生图 / 生视频；默认火山 Agent Plan / jimeng）
         _A(
@@ -591,8 +754,35 @@ def _build_registry() -> dict[str, PlatformAction]:
             H.ui_update,
             "刷新节点进度面板数据",
         ),
+        # 主窗口 CDP（非侧栏 embed browser）：经 /main-cdp/* 控制产品 chrome
+        _A(
+            "ui.panel",
+            "ui",
+            "控制主窗口（非侧栏浏览器）：snapshot/page_dump/click/fill/type/scroll/state/action/ax/screenshot/cdp/ws；排查看页面正文用 page_dump（或 snapshot mode=debug）；产品动作走 op=action + name",
+            "read",
+            "op, ref?, text?, direction?, amount?, clear?, name?, params?, method?, mode?, max_elements?, max_turns?, include_hidden?, voiceMode?, showRightStage?, navigateToChat?",
+            H.ui_panel,
+            "先 snapshot 再按 eN ref 点击主界面按钮",
+            "op=action name=openXiaomi 打开小V（文字侧栏）",
+            # 【self-evolution-bot · 2026-11-22 · 第122轮 · 模型:deepseek-v4.1-flash】
+            # 改了什么：补 voiceMode 示例，并把三个开关写进 params 清单。
+            # 为什么：只写「打开小V」会被据实理解成文字侧栏——模型想让小V 进语音态
+            #   时没有任何可读的依据；同时这三个键此前在 op=action 里会被静默丢弃，
+            #   两个缺陷叠在一起，表现为「同一个入口驱动不出语音态，回执还 ok」。
+            "op=action name=openXiaomi voiceMode=true showRightStage=false 进语音全屏",
+            "op=action name=sendMessage text=你好",
+            "op=state 看当前路由/会话/右栏",
+        ),
         # agents
-        _A("agents.list", "agents", "列出智能体角色", "read", "tag?, agent_name?, limit?, offset?, include_soul?", H.agents_list, "有哪些智能体"),
+        _A(
+            "agents.list",
+            "agents",
+            "列出智能体角色（默认不含各自 system_prompt 全文，只给字数；要正文传 include_prompt=true 或用 agents.get）",
+            "read",
+            "tag?, agent_name?, limit?, offset?, include_soul?, include_prompt?",
+            H.agents_list,
+            "有哪些智能体",
+        ),
         _A("agents.get", "agents", "查看智能体详情", "read", "name/agent_code", H.agents_get, "main 配了啥"),
         _A(
             "agents.bindings",
@@ -606,11 +796,11 @@ def _build_registry() -> dict[str, PlatformAction]:
         _A(
             "agents.create",
             "agents",
-            "创建智能体（优先 capability_pack；省略 tools→空；tools:null 须 confirm_inherit_all）",
+            "创建智能体员工（默认发布到花名册可对话；as_employee=false 仅能力体；优先 capability_pack；省略 tools→空；tools:null 须 confirm_inherit_all）",
             "write",
-            "agent_code, capability_pack?, tools_extra?, tools?, confirm_inherit_all?, confirm_wide_tools?, skills?, mcp_servers?, knowledge_vault_ids?, model?…",
+            "agent_code, as_employee?, capability_pack?, tools_extra?, tools?, confirm_inherit_all?, confirm_wide_tools?, skills?, mcp_servers?, knowledge_vault_ids?, model?…",
             H.agents_create,
-            "建个文案助手用 capability_pack=writer",
+            "建个文案助手用 capability_pack=writer（创建后即可对话，无需再 hire）",
         ),
         _A(
             "agents.update",
@@ -631,7 +821,15 @@ def _build_registry() -> dict[str, PlatformAction]:
             "删掉测试智能体",
         ),
         # employees
-        _A("employees.list", "employees", "列出智能体员工岗位", "read", "status?", H.employees_list, "现在有哪些员工"),
+        _A(
+            "employees.list",
+            "employees",
+            "列出智能体员工岗位（同一批数据只在 roles 返回一次）",
+            "read",
+            "status?, legacy_keys?（默认 false，不再重复回 employees/items 别名）",
+            H.employees_list,
+            "现在有哪些员工",
+        ),
         _A(
             "employees.departments",
             "employees",
@@ -705,9 +903,12 @@ def _build_registry() -> dict[str, PlatformAction]:
         _A(
             "employees.chat_send",
             "employees",
-            "打开/续聊员工对话：发一条消息并拉开右栏对话页（可多次调用续聊）",
+            "打开/续聊员工对话：发一条消息并拉开右栏对话页（可多次调用续聊）。"
+            "默认 deliver=auto：面板在就由面板自己 chatSend（live SSE 逐字流），"
+            "面板不在才回落后台 wake",
             "write",
-            "agent_code/role_name, message, session_key?, task_id?, source?",
+            "agent_code/role_name, message, session_key?, task_id?, source?, "
+            "deliver?=auto|panel|wake",
             H.employees_chat_send,
             "跟拆解岗说：先列三步计划",
             "继续问文案助手刚才那个标题再短一点",
@@ -809,9 +1010,11 @@ def _build_registry() -> dict[str, PlatformAction]:
         _A(
             "tasks.list",
             "tasks",
-            "列出协作 Task 台账（行政视角；默认不含子任务，limit 默认 50、上限 200）",
+            "列出协作 Task 台账（行政视角；默认不含子任务，limit 默认 50、上限 200；"
+            "description/summary 默认裁成 200 字预览）",
             "read",
-            "status?, assignee?, role?, source?, main_task_id?, limit?, offset?, include_subtasks?",
+            "status?, assignee?, role?, source?, main_task_id?, limit?, offset?, "
+            "include_subtasks?, full_text?（默认 false，只给预览）",
             H.tasks_list,
             "未结任务有哪些",
             "最近 5 条主任务",
@@ -831,7 +1034,7 @@ def _build_registry() -> dict[str, PlatformAction]:
             "tasks",
             "行政侧创建 Task（值班开单/progress/handlers 结案优先用专用工具 tasks）",
             "write",
-            "name, description?, assignee?, role?/assigned_role?, main_task_id?, status?, source?, source_ref?, raised_by?, risk_level?, action_type?, round_id?, parent_task_id?",
+            "name, description?, assignee?, role?/assigned_role?, main_task_id?, status?, source?, source_ref?, raised_by?, risk_level?, action_type?, round_id?, parent_task_id?, allow_duplicate?, probe?",
             H.tasks_create,
             "建个待办给前端岗",
         ),
@@ -878,9 +1081,10 @@ def _build_registry() -> dict[str, PlatformAction]:
         _A(
             "items.list",
             "items",
-            "列出用户事项/备忘（持久化；≠ 对话 todo、≠ Task）",
+            "列出用户事项/备忘（持久化；≠ 对话 todo、≠ Task）；notes 默认裁成预览",
             "read",
-            "status?, priority?, tag?, q?, include_done?, page?, page_size?/limit?",
+            "status?, priority?, tag?, q?, include_done?, page?, page_size?/limit?, "
+            "full_text?（默认 false，notes 只给预览）",
             H.items_list,
             "我有哪些待办事项",
             "只要高优先级未完成",
@@ -907,7 +1111,15 @@ def _build_registry() -> dict[str, PlatformAction]:
             "让拆解岗处理这条事项",
         ),
         # skills
-        _A("skills.list", "skills", "列出技能", "read", "enabled_only?", H.skills_list, "装了哪些技能"),
+        _A(
+            "skills.list",
+            "skills",
+            "列出技能（大列表用 limit/offset 分页；先按 enabled_only 过滤再截断）",
+            "read",
+            "enabled_only?, limit?, offset?",
+            H.skills_list,
+            "装了哪些技能",
+        ),
         _A("skills.get", "skills", "查看技能详情", "read", "name", H.skills_get, "evoflow-admin 技能说啥"),
         _A("skills.enable", "skills", "启用/停用技能", "write", "name, enabled", H.skills_enable, "关掉某技能"),
         _A("skills.install", "skills", "安装技能（path 或市场 slug；本地 path 可 link=true 挂载）", "write", "path 或 slug, owner?, link?", H.skills_install, "装这个技能包"),
@@ -926,9 +1138,9 @@ def _build_registry() -> dict[str, PlatformAction]:
         _A(
             "extensions.list",
             "extensions",
-            "列出已安装的 Agent应用（侧栏扩展）",
+            "列出已安装的 Agent应用（侧栏扩展）；默认摘要",
             "read",
-            "无",
+            "include_manifest?（默认 false，只给摘要）",
             H.extensions_list,
             "装了哪些 Agent应用",
             "侧栏有哪些扩展网页",
@@ -974,9 +1186,9 @@ def _build_registry() -> dict[str, PlatformAction]:
         _A(
             "plugins.overview",
             "plugins",
-            "插件总览：市场 + 可装 + 已装",
+            "插件总览：市场 + 可装 + 已装；默认去掉重复字段",
             "read",
-            "无",
+            "full?（默认 false，去重版）",
             H.plugins_overview,
             "插件市场里有啥",
             "现在装了哪些插件",
@@ -1108,7 +1320,15 @@ def _build_registry() -> dict[str, PlatformAction]:
             H.org_install,
             "装这个内容运营资源包",
         ),
-        _A("org.list", "org", "列出已装资源包实例", "read", "status?=active|uninstalled|all", H.org_list, "装过哪些资源包"),
+        _A(
+            "org.list",
+            "org",
+            "列出已装资源包实例；默认只给 manifest 键与体积",
+            "read",
+            "status?=active|uninstalled|all, include_manifest?（默认 false）",
+            H.org_list,
+            "装过哪些资源包",
+        ),
         _A("org.get", "org", "查看资源包实例详情", "read", "org_instance_id", H.org_get, "这个资源包装了啥"),
         _A(
             "org.uninstall",
@@ -1206,7 +1426,7 @@ def _build_registry() -> dict[str, PlatformAction]:
             "扫码完成，写入飞书凭证",
         ),
         # automation
-        _A("automation.list", "automation", "列出定时自动化", "read", "无", H.automation_list, "有哪些定时任务"),
+        _A("automation.list", "automation", "列出定时自动化（默认省去全部条目都相同的字段，共同值见 sharedDefaults）", "read", "full?（默认 false）", H.automation_list, "有哪些定时任务"),
         _A("automation.get", "automation", "查看自动化详情", "read", "id", H.automation_get, "这个自动化咋配的"),
         _A("automation.history", "automation", "自动化运行历史", "read", "id, limit?", H.automation_history, "最近跑过几次"),
         _A("automation.create", "automation", "创建定时自动化", "write", "name, prompt, cron/rrule/schedule?", H.automation_create, "每天九点巡检"),
@@ -1243,10 +1463,11 @@ def _build_registry() -> dict[str, PlatformAction]:
             "sessions",
             "主动压缩当前（或指定）对话上下文（与 /compact 同引擎；需 confirm=true）",
             "write",
-            "session_key?/thread_id?, confirm=true",
+            "session_key?/thread_id?, summary?, confirm=true",
             H.sessions_compact,
             "帮我压缩一下上下文",
             "上下文太满了，压缩当前对话",
+            "我自己写好了摘要，按这个压缩上下文",
         ),
         # diagnostics（系统已知日志源 + 异常扫描 + 可转发时间线）
         _A(
@@ -1644,6 +1865,22 @@ def dispatch_platform_action(
         allowed_names = allowed_action_names(employee_scope, get_registry().values())
 
     key = act.lower()
+    # 【self-evolution-bot · 2026-11-19 · 第79轮 · 模型:deepseek-v4.1-flash-1017】
+    # 改了什么：`<域>.catalog` / `<域>.help` 在注册表里不存在时，归一化为顶层
+    #   catalog/help（域自动落到 domain 参数），不再回 unknown action。
+    # 为什么：catalog/help 是**顶层动作**（正确写法 action="catalog", domain="mcp"），
+    #   但 media 域与 verification 域恰好注册了 media.catalog / verification.catalog
+    #   两个**真动作** —— 模型据此无法从命名规律上分辨「哪些域能点 .catalog」，只能试。
+    #   现网近 7 天 platform 600 次里 91 次失败（15.2%），其中 mcp./employees./agents./
+    #   settings./skills./diagnostics. 这一族 `xxx.catalog` 猜错占 20 余次，每次白烧一整轮。
+    #   真动作优先：命中注册表的写法完全不走这条分支。
+    if "." in key and key not in get_registry():
+        _dom_part, _leaf_part = key.split(".", 1)
+        if _leaf_part in {"catalog", "list_actions", "目录", "help", "manual", "说明书"}:
+            key = "help" if _leaf_part in {"help", "manual", "说明书"} else "catalog"
+            act = key
+            if not domain:
+                domain = _dom_part.strip()
     # Parse args early so catalog/help can take domain/summary from args_json (DEF-04).
     try:
         early_args = _parse_args(args_json) if key in {"help", "manual", "说明书", "catalog", "list_actions", "目录", "domains"} else None
@@ -1683,9 +1920,23 @@ def dispatch_platform_action(
         known_domains = {d.lower() for d in PLATFORM_DOMAINS}
         matches: list[str] = []
         basis = "无相近动作"
+        # 【self-evolution-bot · 2026-11-18 · 第57轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：只传域本身（如 action="agents"、domain 省略）时，把 act 当域处理。
+        # 为什么：`agents` 是 PLATFORM_DOMAINS 里的合法域、注册表里有 5 个 agents.* 动作，
+        # 但原判据写的是 `if raw_dom and raw_dom in known_domains`，而 raw_dom 只在
+        # act 含 "." 时才非空 —— 于是 action="agents" 走进"无相近动作"分支，
+        # suggestions=[] 且 basis 谎称「无相近动作」（现网 2026-11-17T21:42 实测，
+        # 返回 domains 里明明列着 agents）。模型据此只能盲猜或去翻 catalog。
+        if not raw_dom and key in known_domains:
+            raw_dom = key
+            leaf = ""
         if raw_dom and raw_dom in known_domains:
             matches = [n for n in reg if n.split(".", 1)[0].lower() == raw_dom]
-            basis = f"域 {raw_dom!r} 下的已注册动作（域存在，但没有 {leaf!r}）"
+            basis = (
+                f"域 {raw_dom!r} 下的已注册动作（域存在，但没有 {leaf!r}）"
+                if leaf
+                else f"域 {raw_dom!r} 下的全部已注册动作（你只给了域名，没给具体动作）"
+            )
             # leaf 的近邻排前：employees.status → employees.org_status 才该被第一眼看到。
             if leaf:
                 matches.sort(key=lambda n: (leaf not in n.split(".", 1)[-1].lower(), n))
@@ -1722,37 +1973,49 @@ def dispatch_platform_action(
 
         scope_ok, scope_reason = action_allowed(employee_scope, entry.name, entry.risk)
         if not scope_ok:
-            return {
-                "ok": False,
-                "error": "capability_denied",
-                "action": entry.name,
-                "risk": entry.risk,
-                "reason": scope_reason,
-                "allowed_domains": (
-                    sorted({str(d).strip().lower() for d in employee_scope.domains})
-                    if employee_scope.mode == "custom"
-                    else []
-                ),
-                "max_risk": employee_scope.max_risk,
-                "hint": "该动作超出本岗位能力清单；可调用 action=catalog 查看已授权范围，或告知用户在岗位设置中调整平台能力。",
-            }
+            return _attach_platform_card_labels(
+                {
+                    "ok": False,
+                    "error": "capability_denied",
+                    "action": entry.name,
+                    "risk": entry.risk,
+                    "reason": scope_reason,
+                    "allowed_domains": (
+                        sorted({str(d).strip().lower() for d in employee_scope.domains})
+                        if employee_scope.mode == "custom"
+                        else []
+                    ),
+                    "max_risk": employee_scope.max_risk,
+                    "hint": "该动作超出本岗位能力清单；可调用 action=catalog 查看已授权范围，或告知用户在岗位设置中调整平台能力。",
+                },
+                entry,
+                args,
+            )
 
     risk = entry.risk
     if risk in {"write", "destructive"} and not _truthy_confirm(args, confirm):
         if risk == "destructive":
-            return {
-                "ok": False,
-                "error": "destructive_requires_confirm",
-                "action": entry.name,
-                "risk": risk,
-                "summary": entry.summary,
-                "args": args,
-                "hint": "破坏性操作必须用户明确确认后，带 confirm=true 再调用。",
-            }
+            return _attach_platform_card_labels(
+                {
+                    "ok": False,
+                    "error": "destructive_requires_confirm",
+                    "action": entry.name,
+                    "risk": risk,
+                    "summary": entry.summary,
+                    "args": args,
+                    "hint": "破坏性操作必须用户明确确认后，带 confirm=true 再调用。",
+                },
+                entry,
+                args,
+            )
         return _preview(entry, args)
 
     if entry.handler is None:
-        return {"ok": False, "error": "handler_missing", "action": entry.name}
+        return _attach_platform_card_labels(
+            {"ok": False, "error": "handler_missing", "action": entry.name},
+            entry,
+            args,
+        )
 
     # Thread principal / current conversation into handlers (extra keys are
     # inert when unused). Task「责任人」uses ambient ContextVar, not args.
@@ -1779,12 +2042,20 @@ def dispatch_platform_action(
             ui = build_platform_ui_feedback(entry, args, result)
             if ui:
                 result["ui"] = ui
-        return result
+        return _attach_platform_card_labels(result, entry, args)
     except (AdminError, ValidationError, NotFoundError, ValueError) as exc:
-        return {"ok": False, "error": str(exc), "action": entry.name}
+        return _attach_platform_card_labels(
+            {"ok": False, "error": str(exc), "action": entry.name},
+            entry,
+            args,
+        )
     except Exception as exc:
         logger.exception("platform action=%s failed", entry.name)
-        return {"ok": False, "error": str(exc), "action": entry.name}
+        return _attach_platform_card_labels(
+            {"ok": False, "error": str(exc), "action": entry.name},
+            entry,
+            args,
+        )
 
 
 def slugify_vault_name(name: str) -> str:

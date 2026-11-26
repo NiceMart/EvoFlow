@@ -14,9 +14,13 @@ to ``evoflow_chat_messages`` so partial AI output survives mid-stream interrupts
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import functools
 import json
 import logging
+import threading
 from collections.abc import Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from langchain.agents import AgentState
@@ -35,13 +39,80 @@ from evoflow.agents.middlewares.stream_accumulator import (
 
 logger = logging.getLogger(__name__)
 
+# 【self-evolution-bot · 2026-11-17 · 第36轮】transcript 落库改走专用线程池，不再用默认 executor。
+# 为什么：现网 obs 同批 4 个工具调用，最内层 tool_end 实测只有 10~22ms（assets）、246~419ms（bash），
+#   但 tool_error_handling 记的 duration_ms 是 2142ms / 2363ms —— 差值固定约 1.9~2.1s，且四条几乎
+#   同刻结束（barrier 形状）。回推调用链：本中间件在 ``await handler(request)`` 之后
+#   ``await asyncio.to_thread(self._persist_tool_result_now, ...)``，而 ``asyncio.to_thread`` 用的
+#   是事件循环的**默认** executor —— 全仓 231 处 to_thread + langchain ``run_in_executor(None, ...)``
+#   （同步工具如 assets 的默认路径）全挤这同一个池（32 核机器默认 max_workers≈32）。
+#   复现：默认池塞满 32 个 blocker 后跑同一条 awrap 路径，工具体仍只花 10ms，但 4 并发墙钟
+#   530ms → 3786ms（见本轮 journal）。即用户看到的「删/写要 2 秒」不是资产代码慢，是落库排队。
+# 修复边界：只把**本中间件自己的落库**挪到专用池，默认池与其它 230 处不动（不改变任何工具行为）。
+#   池上限取 4：这里每次只写一条 batch，4 个并发工具足够；再多会加剧 SQLite 单连接锁竞争
+#   （get_db() 是单共享连接 + 进程级 RLock，并发写本来就是串行的）。
+# 判据：改完必须复算现网同一批并发，duration_ms 应回到 ≈工具体耗时（assets 十毫秒级）。
+_TRANSCRIPT_POOL_MAX_WORKERS = 4
+_TRANSCRIPT_POOL: ThreadPoolExecutor | None = None
+_TRANSCRIPT_POOL_GUARD = threading.Lock()
+
+
+def _transcript_pool() -> ThreadPoolExecutor:
+    """Lazy singleton so importing this module never starts threads."""
+    global _TRANSCRIPT_POOL
+    with _TRANSCRIPT_POOL_GUARD:
+        if _TRANSCRIPT_POOL is None:
+            _TRANSCRIPT_POOL = ThreadPoolExecutor(
+                max_workers=_TRANSCRIPT_POOL_MAX_WORKERS,
+                thread_name_prefix="evoflow-transcript",
+            )
+        return _TRANSCRIPT_POOL
+
+
+async def _run_in_transcript_pool(fn: Callable[..., Any], /, *args: Any) -> Any:
+    """Run blocking transcript persistence off the loop, on the private pool.
+
+    Must copy ``contextvars`` like ``asyncio.to_thread`` does. Live runs put
+    ``thread_id`` in LangGraph config / runtime contextvars; without the copy,
+    pool workers see empty ``get_config()`` and skip all AI/tool writes
+    (user HTTP path still works → DB looks user-only).
+    """
+    loop = asyncio.get_running_loop()
+    ctx = contextvars.copy_context()
+    call = functools.partial(ctx.run, fn, *args)
+    return await loop.run_in_executor(_transcript_pool(), call)
+
+
+def _context_get(ctx: Any, key: str) -> Any:
+    """Read dict or LeadAgentRuntimeContext (dataclass with ``.get``)."""
+    if ctx is None:
+        return None
+    if isinstance(ctx, dict):
+        return ctx.get(key)
+    getter = getattr(ctx, "get", None)
+    if callable(getter):
+        try:
+            return getter(key)
+        except Exception:
+            pass
+    return getattr(ctx, key, None)
+
 
 def _thread_id_from_runtime(runtime: Runtime) -> str:
-    ctx = getattr(runtime, "context", None) or {}
-    if isinstance(ctx, dict):
-        tid = ctx.get("thread_id")
+    ctx = getattr(runtime, "context", None)
+    tid = _context_get(ctx, "thread_id")
+    if tid:
+        return str(tid).strip()
+    # mapping helper covers dataclass + nested carriers
+    try:
+        from evoflow.agents.lead_agent.runtime_context import runtime_context_mapping
+
+        mapped = runtime_context_mapping(runtime)
+        tid = mapped.get("thread_id") if isinstance(mapped, dict) else None
         if tid:
             return str(tid).strip()
+    except Exception:
+        pass
     try:
         from langgraph.config import get_config
 
@@ -56,11 +127,19 @@ def _thread_id_from_runtime(runtime: Runtime) -> str:
 def _parent_thread_id_from_runtime(runtime: Runtime | None) -> str | None:
     if runtime is None:
         return None
-    ctx = getattr(runtime, "context", None) or {}
-    if isinstance(ctx, dict):
-        p = ctx.get("parent_thread_id")
+    ctx = getattr(runtime, "context", None)
+    p = _context_get(ctx, "parent_thread_id")
+    if p:
+        return str(p).strip() or None
+    try:
+        from evoflow.agents.lead_agent.runtime_context import runtime_context_mapping
+
+        mapped = runtime_context_mapping(runtime)
+        p = mapped.get("parent_thread_id") if isinstance(mapped, dict) else None
         if p:
             return str(p).strip() or None
+    except Exception:
+        pass
     try:
         from langgraph.config import get_config
 
@@ -113,16 +192,22 @@ def _principal_id_from_runtime(runtime: Runtime | None) -> str | None:
 
 
 def _round_id_from_session_context(session_key: str) -> str | None:
-    """Fallback: session.context.proactive_round_id (latest duty round)."""
+    """Fallback: session.context.proactive_round_id (latest duty round).
+
+    【self-evolution-bot · 2026-11-18 · 第47轮 · 模型:deepseek-v4.1-flash-1017】
+    改用 ``session_repositories.get_proactive_round_id``（单行 SELECT）。
+    旧实现走 ``load_session_map()``：为取**一个字段**全量重建 547 个会话行，
+    实测冷 7673ms / 热 121ms，而单行查询 0.03~0.14ms；它位于
+    ``TranscriptMiddleware.awrap_tool_call`` 返回路径上，直接把工具外层
+    duration_ms 撑到 2~3 秒（同批工具体只有 20~53ms）。
+    """
     sk = str(session_key or "").strip()
     if not sk.startswith("proactive:"):
         return None
     try:
         from evoflow.persistence import session_repositories as sess_repo
 
-        row = sess_repo.load_session_map().get(sk) or {}
-        ctx = row.get("context") if isinstance(row.get("context"), dict) else {}
-        return str(ctx.get("proactive_round_id") or "").strip() or None
+        return sess_repo.get_proactive_round_id(sk)
     except Exception:
         return None
 
@@ -411,7 +496,11 @@ class TranscriptMiddleware(AgentMiddleware[AgentState]):
     ) -> dict[str, Any] | None:
         # Run sync SQLite persistence in a worker thread so the event loop
         # is never blocked by message/artifact INSERTs after each model call.
-        await asyncio.to_thread(self.after_model, state, runtime)
+        # 【self-evolution-bot · 2026-11-17 · 第36轮】改走专用池：原来 asyncio.to_thread 用默认
+        # executor，会和全仓 231 处 to_thread + langchain 同步工具的 run_in_executor(None,…)
+        # 抢同一个池。本轮已证默认池饱和时 4 并发落库墙钟 1893ms（工具体只需 10ms），
+        # 工具 duration_ms 因此被撑到 2s 级——同一根因，一并挪走。
+        await _run_in_transcript_pool(self.after_model, state, runtime)
         return None
 
     @classmethod
@@ -444,6 +533,10 @@ class TranscriptMiddleware(AgentMiddleware[AgentState]):
             return
         thread_id = _thread_id_from_runtime(runtime)
         if not thread_id:
+            logger.warning(
+                "tool transcript persist skipped: empty thread_id (runtime.context=%s)",
+                type(getattr(runtime, "context", None)).__name__,
+            )
             return
         tcid = str(getattr(result, "tool_call_id", None) or "").strip()
         mid_s = str(getattr(result, "id", None) or "").strip()
@@ -453,6 +546,10 @@ class TranscriptMiddleware(AgentMiddleware[AgentState]):
             return
         session_key = _session_key_for_thread(thread_id)
         if not session_key:
+            logger.warning(
+                "tool transcript persist skipped: no session_key for thread=%s",
+                thread_id,
+            )
             return
         msg_dict = self._message_to_dict(result)
         if mid_s:
@@ -489,7 +586,10 @@ class TranscriptMiddleware(AgentMiddleware[AgentState]):
         handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Any]],
     ) -> ToolMessage | Any:
         result = await handler(request)
-        await asyncio.to_thread(self._persist_tool_result_now, request, result)
+        # 【self-evolution-bot · 2026-11-17 · 第36轮】原来这里是 asyncio.to_thread（默认 executor）。
+        # 默认池被全仓 231 处 to_thread + langchain run_in_executor(None,…) 共用，并发工具调用时
+        # 落库排队 1.9~2.1s，把 tool 的 duration_ms 撑到 2 秒以上（工具体实测只有 10~22ms）。
+        await _run_in_transcript_pool(self._persist_tool_result_now, request, result)
         return result
 
     # ------------------------------------------------------------------
@@ -675,10 +775,14 @@ class TranscriptMiddleware(AgentMiddleware[AgentState]):
         session_key = _session_key_for_thread(thread_id)
         if not session_key:
             return
-        rid = _run_id_for_transcript(thread_id, session_key)
-        if not rid:
-            return
+        # Entire body must soft-fail: ``_run_id_for_transcript`` → ``get_db`` on the
+        # LangGraph asyncio bg-loop can raise ``db_process_lock_timeout`` (0.5s).
+        # That used to abort the run after a successful tool hop; serde then showed
+        # the user a fake 「模型服务临时内部错误」.
         try:
+            rid = _run_id_for_transcript(thread_id, session_key)
+            if not rid:
+                return
             from evoflow.persistence.session_run_state import peek_current_run_id
             from evoflow.session_execution.lifecycle import start_session_turn
 
@@ -690,7 +794,11 @@ class TranscriptMiddleware(AgentMiddleware[AgentState]):
                 rid = existing
             start_session_turn(session_key=session_key, thread_id=thread_id, run_id=rid, source="model_step")
         except Exception:
-            logger.debug("mark run active before model failed thread=%s", thread_id, exc_info=True)
+            logger.warning(
+                "mark run active before model failed thread=%s (continuing model call)",
+                thread_id,
+                exc_info=True,
+            )
 
     # ------------------------------------------------------------------
     # Messages
@@ -746,14 +854,28 @@ class TranscriptMiddleware(AgentMiddleware[AgentState]):
                 principal_id=pid,
             )
         except Exception:
-            logger.debug("transcript batch persist failed thread=%s", thread_id, exc_info=True)
+            logger.warning(
+                "transcript batch persist failed thread=%s session=%s n=%s",
+                thread_id,
+                session_key,
+                len(messages),
+                exc_info=True,
+            )
 
     def _persist_messages(self, state: AgentState, runtime: Runtime) -> None:
         thread_id = _thread_id_from_runtime(runtime)
         if not thread_id:
+            logger.warning(
+                "transcript persist skipped: empty thread_id (runtime.context=%s)",
+                type(getattr(runtime, "context", None)).__name__,
+            )
             return
         session_key = _session_key_for_thread(thread_id)
         if not session_key:
+            logger.warning(
+                "transcript persist skipped: no session_key for thread=%s",
+                thread_id,
+            )
             return
         parent_thread_id = _parent_thread_id_from_runtime(runtime)
 
@@ -804,6 +926,51 @@ class TranscriptMiddleware(AgentMiddleware[AgentState]):
             round_id=_round_id_from_runtime(runtime),
             principal_id=_principal_id_from_runtime(runtime),
         )
+        # 【self-evolution-bot · 2026-11-20 · 第88轮 · 模型:deepseek-v4.1-flash-1017】部门群回复镜像：
+        # 员工工作会话的回复同步写进群时间线，使「前端断线/关页面时回复不上墙」不再发生。
+        # 默认开启，EVOFLOW_DEPT_GROUP_REPLY_MIRROR=0 可关（关掉即退化为改造前行为）；
+        # 任何异常静默降级，绝不能拖垮正常的会话落库。
+        self._mirror_to_dept_group(session_key, new_msgs, thread_id=thread_id)
+
+    @staticmethod
+    def _mirror_to_dept_group(
+        session_key: str,
+        new_msgs: list[dict[str, Any]],
+        *,
+        thread_id: str,
+    ) -> None:
+        """把本批 AI 回复镜像进部门群时间线（best-effort，绝不抛错）。"""
+        try:
+            from evoflow.proactive.dept_group_reply_mirror import (
+                mirror_enabled,
+                mirror_reply_to_dept_group,
+                normalize_reply_text,
+            )
+
+            if not mirror_enabled():
+                return
+            run_id = _run_id_for_transcript(thread_id, session_key) or ""
+            for item in new_msgs:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("role") or "").strip().lower() not in ("assistant", "ai"):
+                    continue
+                text = normalize_reply_text(item.get("content"))
+                if not text:
+                    continue
+                mirror_reply_to_dept_group(
+                    session_key=session_key,
+                    content=item.get("content"),
+                    run_id=run_id,
+                    # _message_to_dict 的键是 "id"（不是 message_id）；
+                    # 取错键会让同一 run 内多轮回复塌成同一个镜像键。
+                    turn_key=str(item.get("id") or item.get("message_id") or ""),
+                    message_id="",
+                )
+        except Exception:
+            logger.debug(
+                "dept group reply mirror skipped session=%s", session_key, exc_info=True
+            )
 
     @staticmethod
     def _record_usage_for_skipped_ai_message(

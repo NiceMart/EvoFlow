@@ -18,6 +18,7 @@
  * 任一环卡住超过阈值 → `first_token_stall` / `first_token_dead` 写入异常环 + 生命周期日志。
  */
 import { logChatRuntimeTurn, logChatRuntimeUserClick } from './chat-runtime-log.js'
+import { persistViewportTap } from '../v4/v4-viewport-tap-persist.js'
 
 const PREFIX = '[回合计时]'
 const LC_PREFIX = '[turn-lifecycle]'
@@ -294,6 +295,525 @@ export function listChatTurnAnomalies(): ChatTurnAnomaly[] {
   return anomalyRing.slice()
 }
 
+/** 浮层「计时」表：发送 → 出泡 → 上线 → 首字 → 结束 */
+export type ChatTurnTimingRow = {
+  id: string
+  sessionKey: string
+  runId: string
+  textPreview: string
+  /** 点击发送 */
+  sendAt: number
+  /** 乐观用户气泡挂上时间线（≈上屏） */
+  userBubbleAt: number | null
+  wireAt: number | null
+  runStartedAt: number | null
+  firstResponseAt: number | null
+  firstKind: string | null
+  firstPreview: string
+  streamEndAt: number | null
+  outcome: string | null
+  /** 收口人话：谁停的 / 怎么结束的（来自 stream-stop whoZh） */
+  endWhoZh: string | null
+  /** 收口 trigger（composer_stop_button / sse_aborted / client_attach …） */
+  endTrigger: string | null
+  /**
+   * 流错误 / RUN_ERROR 的人话原因（toUserFacingError）。
+   * 例：「本轮生成失败：模型服务临时内部错误，直接再发一次通常就能过」
+   */
+  endErrMsg: string | null
+}
+
+/** 水位线旁路：同会话近期停止归因（避免 timing ↔ stream-stop 循环 import） */
+export type ChatTurnWaterlineStopHint = {
+  atMs: number
+  whoZh: string
+  trigger: string
+  kind: string
+  sessionKey?: string
+  runId?: string
+  fromUiStopButton?: boolean
+  /** 流错误人话原因（detail.errMsg）；诊断「莫名其妙停」主字段 */
+  errMsg?: string | null
+}
+
+export type ChatTurnTimingVerdictLevel = 'ok' | 'pending' | 'warn' | 'error'
+
+export type ChatTurnTimingVerdict = {
+  level: ChatTurnTimingVerdictLevel
+  /** 短中文：正常 / 进行中 / 偏慢首字 / 久等无首字 … */
+  zh: string
+}
+
+/** 复制诊断 / 水位线旁路：把同一时间窗内的接口成败挂到异常回合上 */
+export type ChatTurnWaterlineApiHint = {
+  at: number
+  path: string
+  ok: boolean
+  ms: number | null
+  status?: number | null
+  error?: string | null
+}
+
+const TIMING_RING_MAX = 40
+/** 正常收口的回合只保留最近若干条；异常/进行中全留（直到环满） */
+const TIMING_OK_KEEP = 8
+const timingRing: ChatTurnTimingRow[] = []
+const timingListeners = new Set<() => void>()
+let activeTimingId: string | null = null
+
+/**
+ * 水位线判定：页面出泡 / 上线 / 首字 / 收口是否正常。
+ * 正常 → 诊断里一行摘要，环内会收紧；异常 → 留阶段差 + 前后接口。
+ */
+export function classifyChatTurnTimingVerdict(
+  row: ChatTurnTimingRow,
+  nowMs: number = Date.now(),
+): ChatTurnTimingVerdict {
+  const age = Math.max(0, nowMs - row.sendAt)
+  const firstMs =
+    row.firstResponseAt != null ? Math.max(0, row.firstResponseAt - row.sendAt) : null
+
+  if (row.outcome === 'stream_error') {
+    return { level: 'error', zh: '流错误' }
+  }
+  if (row.outcome === 'sse_aborted') {
+    return { level: 'error', zh: '断流' }
+  }
+  if (row.outcome === 'sse_final' || row.outcome === 'ui_stop' || row.outcome === 'other') {
+    if (row.firstResponseAt == null) {
+      return { level: 'warn', zh: '收口但无首字' }
+    }
+    if (firstMs != null && firstMs >= 30_000) {
+      return { level: 'warn', zh: `慢首字 ${firstMs}ms` }
+    }
+    if (firstMs != null && firstMs >= SLOW_FIRST_MS) {
+      return { level: 'warn', zh: `偏慢首字 ${firstMs}ms` }
+    }
+    if (row.outcome === 'ui_stop') {
+      const who = String(row.endWhoZh || '').trim()
+      // 点停 / 打断重发都会走 ui_stop；有 whoZh 时别一律写「用户停止」
+      if (who && !/用户停止|用户点击|用户按 Esc/.test(who)) {
+        return { level: 'ok', zh: who.slice(0, 18) }
+      }
+      return { level: 'ok', zh: who.includes('用户') ? '用户停止' : '已停止' }
+    }
+    if (row.outcome === 'other') {
+      return { level: 'warn', zh: '其它结束' }
+    }
+    return { level: 'ok', zh: '正常' }
+  }
+
+  // 未收口：按卡住阶段升级
+  if (row.wireAt == null && age >= 5_000) {
+    return { level: 'error', zh: '未上线' }
+  }
+  if (row.firstResponseAt == null && age >= 30_000) {
+    return { level: 'error', zh: '久等无首字' }
+  }
+  if (row.firstResponseAt == null && age >= 12_000) {
+    return { level: 'warn', zh: '等首字中' }
+  }
+  if (
+    row.firstResponseAt != null &&
+    row.streamEndAt == null &&
+    age >= STREAM_END_DEAD_MS
+  ) {
+    return { level: 'error', zh: '久等无收口' }
+  }
+  if (row.firstResponseAt != null) {
+    return { level: 'pending', zh: '流式中' }
+  }
+  return { level: 'pending', zh: '进行中' }
+}
+
+function pruneTimingRingKeepAbnormal(): void {
+  const now = Date.now()
+  const okIds: string[] = []
+  const mustKeep = new Set<string>()
+  for (const r of timingRing) {
+    const v = classifyChatTurnTimingVerdict(r, now)
+    if (v.level === 'ok') okIds.push(r.id)
+    else mustKeep.add(r.id)
+  }
+  const okKeep = new Set(okIds.slice(-TIMING_OK_KEEP))
+  const next = timingRing.filter((r) => mustKeep.has(r.id) || okKeep.has(r.id))
+  if (next.length === timingRing.length) return
+  timingRing.length = 0
+  timingRing.push(...next)
+  notifyTiming()
+}
+
+function fmtClock(at: number): string {
+  try {
+    return new Date(at).toLocaleTimeString('zh-CN', {
+      hour12: false,
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    })
+  } catch {
+    return String(at)
+  }
+}
+
+function fmtDelta(at: number | null, sendAt: number): string {
+  if (at == null) return '—'
+  return `+${Math.max(0, at - sendAt)}ms`
+}
+
+/**
+ * 运维「发送水位线」：发了几次、何时上屏、接口/首字/收口是否正常。
+ * 正常回合一行摘要；异常回合展开阶段差 + 时间窗内接口。
+ */
+export function formatChatTurnWaterlineForDiag(opts?: {
+  sessionKey?: string | null
+  limit?: number
+  apiHints?: ChatTurnWaterlineApiHint[]
+  anomalies?: ChatTurnAnomaly[]
+  /** 近期停止归因（点停/Esc/client_attach/断流…）；来自 getStreamStopRing */
+  stopHints?: ChatTurnWaterlineStopHint[]
+}): string[] {
+  const rows = listChatTurnTimingRows({
+    sessionKey: opts?.sessionKey,
+    limit: opts?.limit ?? TIMING_RING_MAX,
+  })
+  const lines: string[] = []
+  const now = Date.now()
+  const skFilter = String(opts?.sessionKey || '').trim()
+  const stopHints = (opts?.stopHints || []).filter((s) => {
+    if (!skFilter) return true
+    if (!s.sessionKey) return true
+    return s.sessionKey === skFilter
+  })
+  const verdicts = rows.map((r) => ({
+    row: r,
+    v: classifyChatTurnTimingVerdict(r, now),
+  }))
+  const abnormal = verdicts.filter(
+    (x) => x.v.level === 'warn' || x.v.level === 'error',
+  )
+  const pending = verdicts.filter((x) => x.v.level === 'pending')
+  lines.push(
+    `### 发送水位线（本会话 ${rows.length} 发 · 异常 ${abnormal.length} · 进行中 ${pending.length}）`,
+  )
+  lines.push(
+    '- 策略：正常收口只留摘要；异常保留阶段差 + 前后接口 + 停止归因，方便下次诊断「发了几次 / 卡在哪 / 谁停的」',
+  )
+  if (rows.length === 0) {
+    lines.push('- （尚无发送记录；点发送后会出现：发送时刻 → 出泡上屏 → 上线 → 首字 → 收口）')
+  } else {
+  // 倒序：最近发送在上
+  const ordered = [...verdicts].reverse()
+  for (let i = 0; i < ordered.length; i++) {
+    const { row, v } = ordered[i]!
+    const n = ordered.length - i
+    const preview = (row.textPreview || '（空）').slice(0, 40)
+    const tag =
+      v.level === 'ok'
+        ? '正常'
+        : v.level === 'pending'
+          ? '进行中'
+          : v.level === 'warn'
+            ? `异常·${v.zh}`
+            : `异常·${v.zh}`
+    const whoBit = row.endWhoZh ? ` 谁=${row.endWhoZh}` : ''
+    const base =
+      `${n}. [${tag}] ${fmtClock(row.sendAt)} 「${preview}」` +
+      ` 出泡${fmtDelta(row.userBubbleAt, row.sendAt)}` +
+      ` 上线${fmtDelta(row.wireAt, row.sendAt)}` +
+      ` 开跑${fmtDelta(row.runStartedAt, row.sendAt)}` +
+      ` 首字${fmtDelta(row.firstResponseAt, row.sendAt)}` +
+      ` 结束${fmtDelta(row.streamEndAt, row.sendAt)}` +
+      whoBit
+    lines.push(`- ${base}`)
+
+    if (v.level === 'ok') continue
+
+    // 异常 / 进行中：展开阶段 + 时间窗接口
+    const stageBits: string[] = []
+    if (row.userBubbleAt == null) stageBits.push('页面未出用户泡')
+    else if (row.wireAt == null) stageBits.push('已出泡、未上线(chatSend)')
+    else if (row.runStartedAt == null) stageBits.push('已上线、等 RUN_STARTED')
+    else if (row.firstResponseAt == null) stageBits.push('已开跑、等首字')
+    else if (row.streamEndAt == null) stageBits.push('已有首字、等收口')
+    if (row.outcome) stageBits.push(`outcome=${row.outcome}`)
+    if (row.endTrigger) stageBits.push(`trigger=${row.endTrigger}`)
+    if (row.endWhoZh) stageBits.push(`谁=${row.endWhoZh}`)
+    if (stageBits.length) {
+      lines.push(`  卡点: ${stageBits.join(' · ')}`)
+    }
+    // 流错误人话原因：工具卡中间停往往是 RUN_ERROR，不是工具本身失败
+    const endErr = String(row.endErrMsg || '').trim()
+    if (endErr) {
+      lines.push(`  原因: ${endErr.slice(0, 160)}`)
+    }
+
+    const winStart = row.sendAt - 2_000
+    const winEnd = (row.streamEndAt ?? now) + 2_000
+    const apis = (opts?.apiHints || []).filter(
+      (a) => a.at >= winStart && a.at <= winEnd,
+    )
+    const signalApis = apis
+      .filter((a) => {
+        const p = a.path.toLowerCase()
+        return (
+          !a.ok ||
+          p.includes('subscribe') ||
+          p.includes('chatsend') ||
+          p.includes('/chat') ||
+          p.includes('run')
+        )
+      })
+      .slice(-8)
+    if (signalApis.length > 0) {
+      lines.push(
+        `  前后接口: ${signalApis
+          .map((a) => {
+            const ms = a.ms != null ? `${a.ms}ms` : '?'
+            const st = a.status != null ? ` ${a.status}` : ''
+            const err = a.error ? ` ${String(a.error).slice(0, 40)}` : ''
+            return `${a.path} ${a.ok ? '✓' : '✗'}${st} ${ms}${err}`
+          })
+          .join('；')}`,
+      )
+    }
+
+    const turns = (opts?.anomalies || []).filter((a) => {
+      if (a.sessionKey && row.sessionKey && a.sessionKey !== row.sessionKey) {
+        return false
+      }
+      return a.at >= winStart && a.at <= winEnd
+    })
+    if (turns.length > 0) {
+      lines.push(
+        `  回合异常: ${turns
+          .slice(-4)
+          .map((a) => `${a.event}@${a.sinceSendMs}ms(${a.stage})`)
+          .join('；')}`,
+      )
+    }
+
+    const nearStops = stopHints.filter((s) => s.atMs >= winStart && s.atMs <= winEnd)
+    if (nearStops.length > 0) {
+      lines.push(
+        `  停止归因: ${nearStops
+          .slice(-4)
+          .map((s) => {
+            const reason = String(s.errMsg || '').trim()
+            const base = `${s.whoZh}(${s.trigger}/${s.kind})`
+            return reason ? `${base} · ${reason.slice(0, 80)}` : base
+          })
+          .join('；')}`,
+      )
+    }
+  }
+  } // end rows.length > 0
+
+  lines.push('')
+  lines.push('### 停止归因（谁停的 / 用户操作）')
+  lines.push(
+    '- 点停、Esc、打断重发、client_attach、断流都会落这里；「用户停止」只该出现在真点停/Esc；流错误带「原因=」',
+  )
+  if (stopHints.length === 0) {
+    lines.push('- （尚无停止记录；点停止或断流后会出现 whoZh）')
+  } else {
+    for (const s of stopHints.slice(-12).reverse()) {
+      const sk = s.sessionKey ? ` sk=${s.sessionKey.slice(0, 28)}` : ''
+      const ui = s.fromUiStopButton ? ' uiStop' : ''
+      const reason = String(s.errMsg || '').trim()
+      const reasonBit = reason ? ` · 原因=${reason.slice(0, 120)}` : ''
+      lines.push(
+        `- ${fmtClock(s.atMs)} [${s.kind}] ${s.whoZh} · trigger=${s.trigger}${ui}${sk}${reasonBit}`,
+      )
+    }
+  }
+  return lines
+}
+
+function notifyTiming(): void {
+  for (const fn of timingListeners) {
+    try {
+      fn()
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+function persistTimingRow(row: ChatTurnTimingRow): void {
+  const sid = row.sessionKey || ''
+  if (!sid) return
+  persistViewportTap(sid, 'timing', {
+    id: row.id,
+    sessionKey: row.sessionKey,
+    runId: row.runId || undefined,
+    textPreview: row.textPreview || undefined,
+    sendAt: row.sendAt,
+    userBubbleAt: row.userBubbleAt,
+    wireAt: row.wireAt,
+    runStartedAt: row.runStartedAt,
+    firstResponseAt: row.firstResponseAt,
+    firstKind: row.firstKind || undefined,
+    firstPreview: row.firstPreview || undefined,
+    streamEndAt: row.streamEndAt,
+    outcome: row.outcome || undefined,
+    endWhoZh: row.endWhoZh || undefined,
+    endTrigger: row.endTrigger || undefined,
+    endErrMsg: row.endErrMsg || undefined,
+    wireMs: row.wireAt != null ? row.wireAt - row.sendAt : null,
+    bubbleMs: row.userBubbleAt != null ? row.userBubbleAt - row.sendAt : null,
+    firstMs: row.firstResponseAt != null ? row.firstResponseAt - row.sendAt : null,
+    endMs: row.streamEndAt != null ? row.streamEndAt - row.sendAt : null,
+  })
+}
+
+/**
+ * 收口/首字要绑「真正开跑的那一行」，不能只信 activeTimingId：
+ * 连点/卡住重发会顶掉 active，导致 sse_final 落在空行上，诊断里仍显示「久等无收口」。
+ */
+function resolveTimingRowId(opts?: {
+  id?: string | null
+  sessionKey?: string | null
+  runId?: string | null
+  preferOpen?: boolean
+}): string | null {
+  const explicit = String(opts?.id || '').trim()
+  if (explicit && timingRing.some((r) => r.id === explicit)) return explicit
+
+  const runId = String(opts?.runId || '').trim()
+  if (runId) {
+    for (let i = timingRing.length - 1; i >= 0; i--) {
+      const r = timingRing[i]!
+      if (r.runId && r.runId === runId) return r.id
+    }
+  }
+
+  const sk = String(opts?.sessionKey || '').trim()
+  if (sk && opts?.preferOpen) {
+    for (let i = timingRing.length - 1; i >= 0; i--) {
+      const r = timingRing[i]!
+      if (r.sessionKey !== sk) continue
+      if (r.streamEndAt != null) continue
+      // 优先已上线/已有首字的行，跳过连点留下的空壳
+      if (r.wireAt != null || r.firstResponseAt != null || r.runStartedAt != null) {
+        return r.id
+      }
+    }
+  }
+
+  if (activeTimingId && timingRing.some((r) => r.id === activeTimingId)) {
+    return activeTimingId
+  }
+  return null
+}
+
+function upsertTimingRow(
+  patch: Partial<ChatTurnTimingRow> & {
+    id?: string
+    /** 按 runId / 同会话未收口行回绑（stream_end / first_response） */
+    rebind?: boolean
+  },
+): ChatTurnTimingRow | null {
+  const id = resolveTimingRowId({
+    id: patch.id,
+    sessionKey: patch.sessionKey,
+    runId: patch.runId,
+    preferOpen: !!patch.rebind,
+  })
+  if (!id) return null
+  const idx = timingRing.findIndex((r) => r.id === id)
+  if (idx < 0) return null
+  const { rebind: _rebind, ...rest } = patch
+  const next = { ...timingRing[idx], ...rest, id }
+  timingRing[idx] = next
+  // 收口绑回真实行时，同步 active，避免后续补丁再落到空壳
+  if (patch.rebind) activeTimingId = id
+  notifyTiming()
+  persistTimingRow(next)
+  return next
+}
+
+function beginTimingRow(opts: {
+  sessionKey: string
+  textPreview: string
+  sendAt: number
+}): ChatTurnTimingRow {
+  // 同毫秒/同文案连点：复用已有空壳，避免诊断「4 发」里混进未上线幽灵行
+  const sk = opts.sessionKey
+  const preview = opts.textPreview
+  for (let i = timingRing.length - 1; i >= 0; i--) {
+    const r = timingRing[i]!
+    if (r.sessionKey !== sk) continue
+    if (r.textPreview !== preview) continue
+    if (r.wireAt != null || r.streamEndAt != null) continue
+    if (Math.abs(r.sendAt - opts.sendAt) > 1500) continue
+    activeTimingId = r.id
+    notifyTiming()
+    return r
+  }
+  const id = `t-${opts.sendAt}-${Math.random().toString(36).slice(2, 7)}`
+  const row: ChatTurnTimingRow = {
+    id,
+    sessionKey: opts.sessionKey,
+    runId: '',
+    textPreview: opts.textPreview,
+    sendAt: opts.sendAt,
+    userBubbleAt: null,
+    wireAt: null,
+    runStartedAt: null,
+    firstResponseAt: null,
+    firstKind: null,
+    firstPreview: '',
+    streamEndAt: null,
+    outcome: null,
+    endWhoZh: null,
+    endTrigger: null,
+    endErrMsg: null,
+  }
+  timingRing.push(row)
+  while (timingRing.length > TIMING_RING_MAX) timingRing.shift()
+  activeTimingId = id
+  notifyTiming()
+  persistTimingRow(row)
+  return row
+}
+
+export function listChatTurnTimingRows(opts?: {
+  sessionKey?: string | null
+  limit?: number
+}): ChatTurnTimingRow[] {
+  const limit = Math.max(1, Math.min(TIMING_RING_MAX, opts?.limit ?? TIMING_RING_MAX))
+  const sk = String(opts?.sessionKey || '').trim()
+  const source = sk
+    ? timingRing.filter((r) => !r.sessionKey || r.sessionKey === sk)
+    : timingRing
+  return source.slice(-limit)
+}
+
+export function subscribeChatTurnTiming(listener: () => void): () => void {
+  timingListeners.add(listener)
+  return () => {
+    timingListeners.delete(listener)
+  }
+}
+
+/** 乐观用户气泡已挂上时间线（上屏）。同一轮只记首次。 */
+export function logChatTurnUserBubbleVisible(opts?: {
+  sessionKey?: string | null
+}): void {
+  const sessionKey = String(opts?.sessionKey || '').trim()
+  const row =
+    (activeTimingId && timingRing.find((r) => r.id === activeTimingId)) ||
+    timingRing.slice().reverse().find((r) => {
+      if (r.userBubbleAt != null) return false
+      if (!sessionKey) return true
+      return !r.sessionKey || r.sessionKey === sessionKey
+    })
+  if (!row || row.userBubbleAt != null) return
+  if (sessionKey && row.sessionKey && sessionKey !== row.sessionKey) return
+  upsertTimingRow({ id: row.id, userBubbleAt: Date.now() })
+}
+
 export function getLatestChatTurnAnomaly(
   sessionKey?: string | null,
 ): ChatTurnAnomaly | null {
@@ -495,12 +1015,17 @@ export function bindChatTurnSendSession(opts: {
       textPreview: textPreview || sendTrace.textPreview,
       attachmentCount: attachmentCount || sendTrace.attachmentCount,
     }
+    upsertTimingRow({
+      sessionKey: sessionKey || sendTrace.sessionKey,
+      textPreview: textPreview || sendTrace.textPreview,
+    })
     return { sendClickAlreadyLogged: !!sendTrace.sendClickLogged }
   }
   archiveUnansweredSendTrace()
+  const startedAt = Date.now()
   sendTrace = {
     sessionKey,
-    startedAt: Date.now(),
+    startedAt,
     textPreview,
     attachmentCount,
     sendClickLogged: false,
@@ -508,6 +1033,7 @@ export function bindChatTurnSendSession(opts: {
     wireLogged: false,
     runStartedLogged: false,
   }
+  beginTimingRow({ sessionKey, textPreview, sendAt: startedAt })
   return { sendClickAlreadyLogged: false }
 }
 
@@ -598,9 +1124,10 @@ export function logChatTurnSendClick(opts: {
   const attachmentCount = Math.max(0, Number(opts.attachmentCount) || 0)
   const sessionKey = String(opts.sessionKey || '').trim()
   archiveUnansweredSendTrace()
+  const startedAt = Date.now()
   sendTrace = {
     sessionKey: sessionKey || sendTrace?.sessionKey || '',
-    startedAt: Date.now(),
+    startedAt,
     textPreview,
     attachmentCount,
     sendClickLogged: true,
@@ -610,6 +1137,11 @@ export function logChatTurnSendClick(opts: {
     streamEndLogged: false,
     runId: undefined,
   }
+  beginTimingRow({
+    sessionKey: sessionKey || sendTrace.sessionKey || '',
+    textPreview,
+    sendAt: startedAt,
+  })
   const contentDesc = textPreview
     ? `内容「${textPreview}」`
     : attachmentCount > 0
@@ -657,12 +1189,19 @@ export function logChatTurnSendWire(opts: {
   const since = chatTurnSinceSendMs(sessionKey || sendTrace.sessionKey)
   const sinceDesc = since != null ? `距点击 ${since}ms` : '无点击锚点'
   const level = since != null && since >= SLOW_FIRST_MS ? 'warn' : 'info'
+  const runId = String(opts.runId || '').trim()
+  if (runId) sendTrace.runId = runId
+  upsertTimingRow({
+    wireAt: Date.now(),
+    ...(runId ? { runId } : {}),
+    ...(sessionKey ? { sessionKey } : {}),
+  })
   emit(
     `消息已上线（chatSend）：${sinceDesc}${since != null && since >= SLOW_FIRST_MS ? ' —— 发送准备偏慢（paint/context/abort/beforeWire）' : ''}`,
     {
       event: 'send_wire',
       sessionKey: sessionKey || sendTrace.sessionKey || undefined,
-      runId: String(opts.runId || '').trim() || undefined,
+      runId: runId || undefined,
       ...(since != null ? { sinceSendMs: since } : {}),
     },
     level,
@@ -686,6 +1225,12 @@ export function logChatTurnRunStarted(opts: {
   sendTrace.runStartedLogged = true
   const runId = String(opts.runId || '').trim()
   if (runId) sendTrace.runId = runId
+  upsertTimingRow({
+    runStartedAt: Date.now(),
+    rebind: true,
+    ...(runId ? { runId } : {}),
+    ...(sessionKey ? { sessionKey } : {}),
+  })
   const since = chatTurnSinceSendMs(sessionKey || sendTrace.sessionKey)
   const sinceDesc = since != null ? `距点击 ${since}ms` : '无点击锚点'
   const level = since != null && since >= SLOW_FIRST_MS ? 'warn' : 'info'
@@ -819,6 +1364,14 @@ export function logChatTurnFirstResponse(opts: {
       : ''
   const level = since != null && since >= SLOW_FIRST_MS ? 'warn' : 'info'
   if (runId && sendTrace && !sendTrace.runId) sendTrace.runId = runId
+  upsertTimingRow({
+    firstResponseAt: Date.now(),
+    firstKind: opts.kind,
+    firstPreview: preview,
+    rebind: true,
+    ...(runId ? { runId } : {}),
+    ...(sessionKey ? { sessionKey } : {}),
+  })
   emit(`首帧响应：类型=${kindLabel}${sinceDesc}${previewDesc}${gateDesc}${slow}`, {
     event: 'first_response',
     sessionKey: sessionKey || sendTrace?.sessionKey || undefined,
@@ -839,6 +1392,16 @@ export type ChatTurnStreamEndOutcome =
   | 'stream_error'
   | 'ui_stop'
   | 'other'
+
+/** 从 stream-stop detail 抽出人话 errMsg（或 rawErr 兜底）。 */
+function extractEndErrMsg(detail?: Record<string, unknown> | null): string | null {
+  if (!detail || typeof detail !== 'object') return null
+  for (const key of ['errMsg', 'errorMessage', 'message', 'rawErr'] as const) {
+    const v = detail[key]
+    if (typeof v === 'string' && v.trim()) return v.trim().slice(0, 200)
+  }
+  return null
+}
 
 /**
  * ④ 流式结束：正常 final / 异常断流 / 用户点停。
@@ -879,8 +1442,20 @@ export function logChatTurnStreamEnd(opts: {
             : '其它结束'
   const who = String(opts.whoZh || '').trim() || outcomeZh
   const trigger = String(opts.trigger || outcome).trim()
+  const endErrMsg = extractEndErrMsg(opts.detail)
   const level =
     outcome === 'sse_final' ? 'info' : outcome === 'ui_stop' ? 'info' : 'warn'
+  const endRunId = String(opts.runId || sendTrace?.runId || '').trim()
+  upsertTimingRow({
+    streamEndAt: Date.now(),
+    outcome,
+    endWhoZh: who,
+    endTrigger: trigger,
+    ...(endErrMsg ? { endErrMsg } : {}),
+    rebind: true,
+    ...(endRunId ? { runId: endRunId } : {}),
+    ...(sessionKey ? { sessionKey } : {}),
+  })
   emit(`流式结束：${who}${sinceDesc}`, {
     event: 'stream_end',
     outcome,
@@ -888,16 +1463,20 @@ export function logChatTurnStreamEnd(opts: {
     whoZh: who,
     hasEndMarker: !!opts.hasEndMarker,
     sessionKey: sessionKey || sendTrace?.sessionKey || undefined,
-    runId: String(opts.runId || sendTrace?.runId || '').trim() || undefined,
+    runId: endRunId || undefined,
     textPreview: sendTrace?.textPreview || undefined,
     ...(since != null ? { sinceSendMs: since } : {}),
+    ...(endErrMsg ? { errMsg: endErrMsg } : {}),
     ...(opts.detail || {}),
   }, level)
   stopFirstTokenWatch()
   stopStreamEndWatch()
+  // 正常收口 → 收紧旧「正常」行；异常全留，下次诊断还能看到发了几次、卡在哪
+  pruneTimingRingKeepAbnormal()
   // 结束后清本轮锚点，避免下一轮误绑 sinceSendMs
   if (sendTrace && sendTrace.streamEndLogged) {
     sendTrace = null
   }
+  activeTimingId = null
   clearUnansweredIfMatched(sessionKey)
 }

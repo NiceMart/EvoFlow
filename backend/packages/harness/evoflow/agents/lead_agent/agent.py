@@ -871,17 +871,23 @@ def _build_middlewares(config: RunnableConfig, model_name: str | None, agent_nam
     from evoflow.agents.middlewares.session_budget_middleware import SessionBudgetMiddleware
 
     middlewares.append(SessionBudgetMiddleware())
+    # 思维导图 soft hint 已默认关闭（soft_hints=False）：勿再挂
+    # MindMapEvidenceHintMiddleware——会把「本批未并发 mind_map…」缝进
+    # search_code_index / read / rg 正文尾，V4 卡面当成检索结果展示。
     try:
-        from evoflow.exploration_graph.config import is_exploration_graph_enabled
+        from evoflow.exploration_graph.config import (
+            get_exploration_graph_config,
+            is_exploration_graph_enabled,
+        )
 
-        if is_exploration_graph_enabled():
-            from evoflow.agents.middlewares.mind_map_evidence_hint_middleware import MindMapEvidenceHintMiddleware
+        if is_exploration_graph_enabled() and get_exploration_graph_config().soft_hints:
+            from evoflow.agents.middlewares.mind_map_evidence_hint_middleware import (
+                MindMapEvidenceHintMiddleware,
+            )
 
             middlewares.append(MindMapEvidenceHintMiddleware())
     except Exception:
-        from evoflow.agents.middlewares.mind_map_evidence_hint_middleware import MindMapEvidenceHintMiddleware
-
-        middlewares.append(MindMapEvidenceHintMiddleware())
+        pass
 
     # Inject custom middlewares before ClarificationMiddleware
     if custom_middlewares:
@@ -914,6 +920,19 @@ def _build_middlewares(config: RunnableConfig, model_name: str | None, agent_nam
     # tokens match the wire payload (active tools + final system prompt).
     if compaction_middleware is not None:
         middlewares.append(compaction_middleware)
+        # 【self-evolution-bot · 2026-11-20 · 第94轮 · 模型:deepseek-v4.1-flash-1017】
+        # 改了什么：紧随压缩中间件挂 context-usage 自省提示。
+        # 为什么：`sessions.compact` 现在支持 agent 自带摘要，但「何时该压」此前没有输入
+        # —— 占用率只发给前端 UI，模型自己看不到。要让模型自我判断，先把判据给它。
+        # 只在 ≥35% 时注入一行，低占用不占 token。
+        try:
+            from evoflow.agents.middlewares.context_usage_hint_middleware import (
+                ContextUsageHintMiddleware,
+            )
+
+            middlewares.append(ContextUsageHintMiddleware())
+        except Exception:  # pragma: no cover - 提示缺失不该拦住主链路
+            logger.warning("context usage hint middleware unavailable", exc_info=True)
         # AFTER compaction fold (inner wrap): re-sanitize tool pairs. Early
         # Dangling/PreCall in build_lead_runtime_middlewares run *before* fold and
         # cannot see summary-Human gaps / dropped ToolMessages. Closest-to-model
@@ -1631,8 +1650,7 @@ def make_lead_agent(config: RunnableConfig, runtime: ServerRuntime | None = None
     ]
 
     # Apply tool whitelist filter: configurable tools only; session spine always kept.
-    # 小V：白名单是 bash 等显式项，但 mcp_servers=None 时仍保留全部 MCP 工具。
-    # 其它角色：保留 mcp_servers 绑定到的 MCP（或 None=全部），与 mount 语义一致。
+    # 小V默认 mcp_servers=[]（不挂 MCP）；其它角色 None=全部 / list=白名单，与 mount 语义一致。
     # Host plugin kernels (mcp__node_repl__js) follow plugin enable, not mcp_servers.
     if _tool_whitelist is not None:
         from evoflow.tools.tool_aliases import canonical_tool_name

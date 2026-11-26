@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from evoflow.plans.volc_agent_plan_models import (
+    AGENT_PLAN_CAPABILITIES,
     AGENT_PLAN_CHAT_MODELS,
+    media_capability_items,
     sync_agent_plan_vision_from_catalog,
 )
 
@@ -19,6 +21,26 @@ def test_deepseek_v41_flash_supports_vision_by_default():
     assert catalog["ark-code-latest"]["vision"] is True
     # Legacy V4 Flash remains text-only on Ark Agent Plan.
     assert catalog["deepseek-v4-flash"]["vision"] is False
+
+
+def test_agent_plan_media_catalog_includes_2026_11_23_models():
+    """官方套餐概览新增 Seedream 5.5 / Seedance 2.5 Flash；Kimi-K3 标注即将下线。"""
+    image_ids = {str(r["id"]) for r in media_capability_items("image")}
+    video_ids = {str(r["id"]) for r in media_capability_items("video")}
+    assert "doubao-seedream-5.5" in image_ids
+    assert "doubao-seedance-2.5-flash" in video_ids
+    assert "doubao-seedance-2.5" in video_ids
+    kimi_k3 = next(m for m in AGENT_PLAN_CHAT_MODELS if m["id"] == "kimi-k3")
+    assert "即将下线" in str(kimi_k3.get("notes") or "")
+    assert any(c.get("id") == "image" for c in AGENT_PLAN_CAPABILITIES)
+
+
+def test_agent_plan_chat_includes_glm_54():
+    """官方 Agent Plan 模型上线公告 2026-11-23：glm-5.4。"""
+    row = next(m for m in AGENT_PLAN_CHAT_MODELS if m["id"] == "glm-5.4")
+    assert row["context_window"] == 1024000
+    assert row["max_output"] == 128000
+    assert row["min_tier"] == "small"
 
 
 def test_sync_agent_plan_vision_heals_stale_rows(monkeypatch):

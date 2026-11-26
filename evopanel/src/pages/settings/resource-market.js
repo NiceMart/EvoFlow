@@ -145,10 +145,11 @@ function shellHtml(embedded) {
             <button type="button" class="sr-btn" data-rm-act="refresh-catalog">刷新</button>
           </div>
         </div>
+        <div class="sr-catalog-banner" data-rm-catalog-banner hidden></div>
         <div class="sr-list" data-rm-catalog>
-          <div class="sr-empty">加载中…</div>
+          <div class="sr-empty">正在读取本地缓存…</div>
         </div>
-        <p class="sr-footnote">市场与 catalog 中的资源包为第三方内容,遵循其自带许可证;一键安装不代表官方背书。带 <code>zip_url</code> 的条目走直链安装（内网/CDN）；官方包仍可走 GitHub。</p>
+        <p class="sr-footnote">市场与 catalog 中的资源包为第三方内容,遵循其自带许可证;一键安装不代表官方背书。带 <code>zip_url</code> 的条目走直链安装（内网/CDN）；官方包仍可走 GitHub。GitHub 不通时会先显示缓存，不阻塞本机导入与内网市场。</p>
       </section>
     </div>
   `
@@ -278,6 +279,23 @@ async function onInstall() {
   }
 }
 
+function catalogStatusBanner(data) {
+  if (!data) return ''
+  if (data.offline) {
+    const errs = Array.isArray(data.errors) && data.errors.length
+      ? data.errors.map((e) => `${e.sourceId}: ${e.error}`).join('；')
+      : '官方 GitHub 市场暂不可达'
+    return `<div class="sr-banner sr-banner--warn">官方市场暂不可达（${esc(errs)}）。仍可导入本地包，或添加内网市场源；有缓存时下方为上次目录。</div>`
+  }
+  if (data.refreshing) {
+    return `<div class="sr-banner sr-banner--info">正在后台同步市场目录…下方先显示缓存。</div>`
+  }
+  if (data.stale) {
+    return `<div class="sr-banner sr-banner--info">显示的是缓存目录；点「刷新」可强制重拉。</div>`
+  }
+  return ''
+}
+
 function renderCatalog(data) {
   const list = _root?.querySelector('[data-rm-catalog]')
   const meta = _root?.querySelector('[data-rm-catalog-meta]')
@@ -285,28 +303,50 @@ function renderCatalog(data) {
   const packs = Array.isArray(data?.packs) ? data.packs : []
   reportCount(packs.length)
   const srcN = Array.isArray(data?.sources) ? data.sources.length : 0
-  if (meta) {
-    meta.textContent = `${packs.length} 个包 · ${srcN || 1} 个源`
-  }
+  const banner = catalogStatusBanner(data)
   if (!packs.length) {
+    if (meta) meta.textContent = data?.offline ? '离线' : '0 个包'
+
     const errs = Array.isArray(data?.errors) && data.errors.length
       ? `<p class="sr-muted">${esc(data.errors.map((e) => `${e.sourceId}: ${e.error}`).join('；'))}</p>`
       : ''
     list.innerHTML = `
+      ${banner}
       <div class="sr-empty">
-        <b>还没有可安装的资源包</b>
-        <p>可添加内网市场源，或到「打包分享」发布到本机市场；也可导入本地 zip。</p>
+        <b>${data?.offline ? '官方市场暂时不可用' : '还没有可安装的资源包'}</b>
+        <p>可添加内网市场源，或到「打包分享」发布到本机市场；也可导入本地 zip。官方 GitHub 不通时不必干等。</p>
         ${errs}
       </div>`
     return
   }
-  list.innerHTML = packs
-    .map((p, idx) => {
-      const path = esc(p.path || '')
-      const zipUrl = String(p._zipUrl || p.zip_url || p.download?.url || '').trim()
-      const srcName = esc(p._sourceName || p._sourceId || '')
-      const tags = (p.tags || []).map((t) => `<span class="sr-tag">${esc(t)}</span>`).join('')
-      return `
+  const updateN = Array.isArray(data?.updates) ? data.updates.length : packs.filter((p) => p._updateAvailable).length
+  if (meta) {
+    const bits = [`${packs.length} 个包`, `${srcN || 1} 个源`]
+    if (updateN) bits.push(`${updateN} 个可更新`)
+    if (data?.offline) bits.push('离线缓存')
+    else if (data?.refreshing) bits.push('同步中')
+    else if (data?.stale) bits.push('缓存')
+    meta.textContent = bits.join(' · ')
+  }
+  list.innerHTML =
+    banner +
+    packs
+      .map((p, idx) => {
+        const path = esc(p.path || '')
+        const zipUrl = String(p._zipUrl || p.zip_url || p.download?.url || '').trim()
+        const srcName = esc(p._sourceName || p._sourceId || '')
+        const isOfficial = String(p._sourceId || '') === 'official'
+        const tags = (p.tags || []).map((t) => `<span class="sr-tag">${esc(t)}</span>`).join('')
+        const installed = !!p._installed
+        const canUpdate = !!p._updateAvailable
+        const sameVer = !!p._sameVersion
+        let actionBtn = `<button type="button" class="sr-btn sr-btn--primary" data-rm-act="install-market" data-pack-idx="${idx}">安装</button>`
+        if (canUpdate) {
+          actionBtn = `<button type="button" class="sr-btn sr-btn--primary" data-rm-act="upgrade-market" data-pack-idx="${idx}">升级到 v${esc(p.version)}</button>`
+        } else if (sameVer || (installed && !canUpdate)) {
+          actionBtn = `<button type="button" class="sr-btn" disabled title="已安装 v${esc(p._installedVersion || p.version)}">已安装</button>`
+        }
+        return `
       <article class="sr-card sr-catalog-card">
         <span class="sr-type-icon" title="资源包">${ICONS.box}</span>
         <div class="sr-card-main">
@@ -314,8 +354,11 @@ function renderCatalog(data) {
             <span>${esc(p.name || p.id)}</span>
             <span class="sr-badge">${esc(kindLabel(p.kind))}</span>
             <span class="sr-badge sr-badge--muted">v${esc(p.version)}</span>
+            ${canUpdate ? `<span class="sr-badge sr-badge--update">可更新</span>` : ''}
+            ${installed && !canUpdate ? `<span class="sr-badge sr-badge--muted">已装 v${esc(p._installedVersion || p.version)}</span>` : ''}
+            ${zipUrl ? `<span class="sr-badge sr-badge--portable" title="可通过直链 zip 安装，适合分享">可分享</span>` : ''}
+            ${isOfficial && !zipUrl ? `<span class="sr-badge sr-badge--muted" title="走 GitHub 目录安装；网络不通时可能失败">GitHub</span>` : ''}
             ${srcName ? `<span class="sr-badge sr-badge--muted">${srcName}</span>` : ''}
-            ${zipUrl ? `<span class="sr-badge">直链</span>` : ''}
           </div>
           ${p.description ? `<div class="sr-card-meta">${esc(p.description)}</div>` : ''}
           <div class="sr-card-meta sr-card-meta--tags">
@@ -324,19 +367,27 @@ function renderCatalog(data) {
           </div>
         </div>
         <div class="sr-card-actions">
-          <button type="button" class="sr-btn sr-btn--primary" data-rm-act="install-market" data-pack-idx="${idx}">安装</button>
+          ${actionBtn}
         </div>
       </article>`
-    })
-    .join('')
+      })
+      .join('')
   list._rmPacks = packs
 }
 
-async function refreshCatalog() {
+async function refreshCatalog(force = false) {
   const list = _root?.querySelector('[data-rm-catalog]')
-  if (list) list.innerHTML = `<div class="sr-empty">加载中…</div>`
+  const meta = _root?.querySelector('[data-rm-catalog-meta]')
+  // 非强制刷新：保留现有内容，只在空白时显示加载；避免 GitHub 慢时整页被「加载中」盖住
+  if (list && (force || !list._rmPacks?.length)) {
+    list.innerHTML = `<div class="sr-empty">${force ? '正在强制刷新市场…' : '加载市场目录…'}</div>`
+  } else if (meta && !force) {
+    meta.textContent = '同步中…'
+  }
   try {
-    const data = await api.orgMarketCatalog(true)
+    // force=true 绕过后端缓存、逐源拉外网——只在用户点「刷新」时用；
+    // 挂载走缓存秒回，后台再刷。
+    const data = await api.orgMarketCatalog(force)
     renderCatalog(data)
   } catch (e) {
     if (list) {
@@ -344,6 +395,7 @@ async function refreshCatalog() {
         <div class="sr-empty sr-empty--error">
           <b>市场目录加载失败</b>
           <p>${esc(e?.message || e)}</p>
+          <p class="sr-muted">可改用「导入本地」或内网市场源；不必等 GitHub。</p>
         </div>`
     }
   }
@@ -446,32 +498,76 @@ async function refreshHost() {
   }
 }
 
+function marketSourceForPack(p) {
+  const zipUrl = String(p?._zipUrl || p?.zip_url || p?.download?.url || '').trim()
+  const path = String(p?.path || '').trim()
+  if (zipUrl) return { type: 'zip_url', url: zipUrl }
+  if (path) return { type: 'market_path', path }
+  return null
+}
+
 async function onInstallMarket(idx) {
   const list = _root?.querySelector('[data-rm-catalog]')
   const packs = list?._rmPacks
   const p = Array.isArray(packs) ? packs[Number(idx)] : null
   if (!p) return
-  const zipUrl = String(p._zipUrl || p.zip_url || p.download?.url || '').trim()
-  const path = String(p.path || '').trim()
-  const label = p.name || p.id || path || zipUrl
-  const mode = zipUrl ? '直链 zip' : 'GitHub 市场目录'
+  const source = marketSourceForPack(p)
+  const label = p.name || p.id || ''
+  const mode = source?.type === 'zip_url' ? '直链 zip' : 'GitHub 市场目录'
   const ok = await showConfirm(`安装「${label}」？\n方式：${mode}`)
   if (!ok) return
+  if (!source) {
+    toast.error('该条目缺少 path / zip_url')
+    return
+  }
   try {
     toast('正在从市场下载并安装…')
-    const source = zipUrl
-      ? { type: 'zip_url', url: zipUrl }
-      : { type: 'market_path', path }
-    if (!zipUrl && !path) {
-      toast.error('该条目缺少 path / zip_url')
-      return
-    }
     const res = await api.orgInstall({
       source,
       workspace_path: workspaceValue() || null,
       options: { conflict_policy: 'fail' },
     })
     await afterInstalled(res)
+  } catch (e) {
+    const detail = e?.detail
+    const msg =
+      (detail && typeof detail === 'object' && (detail.error || detail.detail)) ||
+      e?.message ||
+      e
+    toast.error(String(msg))
+    setLog(detail || String(msg))
+  }
+}
+
+async function onUpgradeMarket(idx) {
+  const list = _root?.querySelector('[data-rm-catalog]')
+  const packs = list?._rmPacks
+  const p = Array.isArray(packs) ? packs[Number(idx)] : null
+  if (!p) return
+  const packId = String(p.id || '').trim()
+  if (!packId) {
+    toast.error('缺少 pack id')
+    return
+  }
+  const label = p.name || packId
+  const from = p._installedVersion || '?'
+  const to = p.version || '?'
+  const ok = await showConfirm(
+    `升级「${label}」？\n${from} → ${to}\n将用新包覆盖同名 BOT / Agent应用（保留工作区与知识库数据）。`,
+  )
+  if (!ok) return
+  try {
+    toast('正在升级…')
+    const source = marketSourceForPack(p)
+    const res = await api.orgUpgrade({
+      pack_id: packId,
+      source: source || undefined,
+      workspace_path: workspaceValue() || null,
+    })
+    setLog(res)
+    toast.success(`已升级到 v${res?.pack_version || to}`)
+    // 升级内部已 force 刷新过各源缓存，这里走缓存即可拿到新目录。
+    await refreshCatalog(false)
   } catch (e) {
     const detail = e?.detail
     const msg =
@@ -525,7 +621,8 @@ function onClick(e) {
   if (act === 'preflight') void onPreflight()
   if (act === 'install') void onInstall()
   if (act === 'install-market') void onInstallMarket(btn.getAttribute('data-pack-idx') || '')
-  if (act === 'refresh-catalog') void refreshCatalog()
+  if (act === 'upgrade-market') void onUpgradeMarket(btn.getAttribute('data-pack-idx') || '')
+  if (act === 'refresh-catalog') void refreshCatalog(true)
   if (act === 'refresh-sources') void refreshSources()
   if (act === 'refresh-host') void refreshHost()
   if (act === 'add-source') void onAddSource()
@@ -617,7 +714,10 @@ export async function mountResourceMarketInto(container, opts = {}) {
   _isZip = false
   container.innerHTML = shellHtml(!!opts.embedded)
   container.addEventListener('click', onClick)
-  await Promise.all([refreshSources(), refreshHost(), refreshCatalog()])
+  // 本机源/Host 与市场目录并行；目录走缓存秒回，不堵导入区
+  void refreshSources()
+  void refreshHost()
+  void refreshCatalog(false)
 }
 
 export function cleanup() {

@@ -9,11 +9,22 @@
 .SYNOPSIS
   一键：（可选）构建 setup.exe → 登记看门狗 → 本进程立刻退出。
 .EXAMPLE
-  # 只登记（安装包已存在，自动取 bundle\nsis 下最新一个）
-  .\dev-self-verify.ps1 -TaskId Task_xxx -Goal "验证 1.3.28 会话标题不再截断"
+  # 常规「装完自己接着验」：只安装+拉起，不唤醒任何人（**本岗默认用法**）
+  .\dev-self-verify.ps1 -SkipWake
 .EXAMPLE
-  # 先构建再登记（构建耗时数分钟，Agent 侧请后台跑）
-  .\dev-self-verify.ps1 -Build -TaskId Task_xxx
+  # 先构建再安装，同样不唤醒
+  .\dev-self-verify.ps1 -Build -SkipWake
+.EXAMPLE
+  # 只有发版流水线这类跨进程接力才用 -TaskId，且必须同时显式 -AllowWake
+  .\dev-self-verify.ps1 -TaskId Task_xxx -AllowWake -Goal "验证 1.3.28 会话标题不再截断"
+.NOTES
+  【self-evolution-bot · 2026-11-20 · 第99轮 · 模型:deepseek-v4.1-flash-1017】
+  用户 2026-11-20 当面定的硬禁令：**验证不许「新开一单 + 唤醒自己」**。
+  原话：「不是让你在新开一个任务，然后让他去唤醒，然后去继续去验证……当前哪个对话处理的
+  需要去验证的，还是在这个对话上面去推。我不想要唤醒这个方式。」
+  所以：需要重启/重装的，用 `-SkipWake`（装完拉起就收工，我自己在当前对话里接着验），
+  不要再为了「装完回来复验」去建锚点单再 wake。`-TaskId` 仅保留给发版流水线等
+  确有「跨进程接力」需求的场景，不要拿它做本轮验收。
 #>
 [CmdletBinding()]
 param(
@@ -27,6 +38,13 @@ param(
   [string] $AgentCode = "self-evolution-bot",
   [string] $TaskId = "",
   [string] $RoundId = "",
+  # 【self-evolution-bot · 2026-11-17 · 第28轮】把唤醒投回「用户正看着的那一屏」。
+  #   为什么加：原来 wake 只能在 task/duty 两个桶里落会话（resolve_work_session_key 只产这两支），
+  #   装完机叫醒我只会另起一个值班对话，用户那句「续不上当前对话」就是这个。
+  #   后端第17轮已把 pinned_session_key 接进 engine/runner，本轮补齐接口/wake/CLI 三处接线；
+  #   本参数把键从登记端一路落到看门狗的 wake 命令里，闭环才算真能回到同一屏。
+  #   取值形如 proactive:<agent_code>:chat:<stamp>；空 = 原行为（自动分桶），不传零影响。
+  [string] $SessionKey = "",
   [string] $Goal = "",
   [string] $CliExe = "",
   # 【fullstack-dev · 2026-11-15 · 第13轮】新增：拉起时指回仓库源码后端。不这么做，重装后跑的是
@@ -46,6 +64,18 @@ param(
   # 用途：用户只要「重建+重启」、不想被 Agent 插一轮对话时用。
   # 注意这不是自检模式 —— 安装与拉起照常做，只跳过最后一步 wake。
   [switch] $SkipWake,
+  # 【self-evolution-bot · 2026-11-20 · 第99轮 · 模型:deepseek-v4.1-flash-1017】
+  # 改了什么：新增显式放行开关；传 -TaskId 但没同时传它，脚本直接 throw，不再默默走 wake。
+  # 为什么：用户当面否掉「新开一单 + 唤醒自己」这条验证方式（见 .NOTES）。
+  #   光在文档里写禁令不够——本脚本的默认用法就是建锚点单再 wake，光是"存在这条路"，
+  #   下一轮我又会照着 EXAMPLE 走回去。把默认改成拦、要接力得显式说明理由。
+  [switch] $AllowWake,
+  # 【self-evolution-bot · 2026-11-20 · 第99轮 · 模型:deepseek-v4.1-flash-1017】
+  # 改了什么：新增「允许装比源码旧的安装包」显式开关。
+  # 为什么：默认闸门是「安装包时间 ≥ 最新前端/壳源文件时间」，防止装旧包白跑一轮重启
+  # （本轮实测：1.3.40 已构建，却因排序属性名写错装了 1.3.39）。仅当确知无需重打包
+  # （比如只改后端、后端走 EVOFLOW_BACKEND_DIR 源码直载）时才传它。
+  [switch] $AllowStaleSetup,
   [switch] $DryRun
 )
 
@@ -71,6 +101,16 @@ function Resolve-Cli {
 }
 
 # ── 0. 构建前先验 wake 锚点单未结案（这一步必须排在 -Build 之前）────────────
+# 【self-evolution-bot · 2026-11-20 · 第99轮 · 模型:deepseek-v4.1-flash-1017】
+# 改了什么：在下面的锚点校验之前加一道默认拦截 —— 传了 -TaskId 但没传 -AllowWake 就 throw。
+# 为什么：用户 2026-11-20 当面否掉「新开一单 + 唤醒自己」的验证方式。本脚本原来的默认用法
+#   恰恰就是那条路（.EXAMPLE 第一条即 -TaskId），只在资产里写禁令拦不住下一轮的我。
+#   判据：默认拒绝 > 文档提醒。真要跨进程接力（发版流水线）必须显式 -AllowWake 并写明理由。
+if ($TaskId -and -not $AllowWake) {
+  throw ("-TaskId 已弃用于本岗验收。用户 2026-11-20 定：验证必须在**当前正在处理的对话**里继续做，" +
+         "不许新开一单再靠 wake 把自己叫回来。要「装完自己接着验」请用：.\dev-self-verify.ps1 -Build -SkipWake。" +
+         "只有确有跨进程接力需求（如发版流水线）才同时传 -AllowWake -TaskId，并在调用处写明为什么不能在本轮验完。")
+}
 # 【self-evolution-bot · 2026-11-16 · 第20轮】改了什么：登记前用 tasks get 查锚点单状态，
 # 已结案/查不到就当场 throw，既不构建也不注册计划任务。
 # 为什么：`wake --task-id` 指向已结案单时，看门狗第 4 步 done-guard 返回 skipped=true、exit=0
@@ -97,13 +137,26 @@ if ($TaskId) {
   }
   Say "wake 锚点单 $TaskId 状态=$taskStatus（未结案，可投递）" "Green"
 } elseif (-not $SkipWake) {
-  Say "未传 -TaskId：看门狗只做普通叫醒，续不上本轮上下文（要续轮请传未结案单号）" "Yellow"
+  # 【self-evolution-bot · 2026-11-20 · 第99轮 · 模型:deepseek-v4.1-flash-1017】
+  # 改了什么：这句原来写「要续轮请传未结案单号」，等于把用户否掉的路径当默认推荐。
+  # 改成提示本岗该用的用法，不再怂恿去建锚点单。
+  Say "未传 -TaskId：本岗默认就是这种用法（装完拉起即返回，验在当前对话里自己继续）。若只装机不拉起，再加 -SkipWake" "Green"
 }
 
 Ensure-Dir $OutDir
 
 if (-not (Test-Path -LiteralPath $Watchdog)) { throw "看门狗脚本缺失: $Watchdog" }
 if (-not (Test-Path -LiteralPath $InstallDir)) { throw "安装目录不存在: $InstallDir（-InstallDir 可覆盖）" }
+
+# 【self-evolution-bot · 2026-11-16 · 第28轮】修：-DryRun 的提前返回原本写在状态组装之后
+#   （本文件后面的 `if ($DryRun) { ... return }`），而构建在下面第 1 段就真跑了 —— 也就是说
+#   「空跑」照样跑满十分钟 npm/Rust 构建。本轮我连做三次空跑，叠出 3 个并发 build:desktop:win
+#   进程互相覆写 target 目录（进程表实测 68064/95800/71096 三条同时存在），才发现这个副作用。
+#   空跑的定义是"看清将要发生什么"，不该产生任何副作用 —— 故把 Build 在构建段之前摘掉。
+if ($DryRun -and $Build) {
+  Say "[dryrun] -Build 已跳过：空跑不产生副作用（真要构建请去掉 -DryRun）" "Yellow"
+  $Build = $false
+}
 
 # ── 1. 可选构建 ────────────────────────────────────────────────────────────
 if ($Build) {
@@ -124,12 +177,43 @@ if ($Build) {
 
 # ── 2. 定位安装包 ──────────────────────────────────────────────────────────
 if ([string]::IsNullOrWhiteSpace($SetupExe)) {
+  # 【self-evolution-bot · 2026-11-20 · 第99轮 · 模型:deepseek-v4.1-flash-1017】
+  # 改了什么：`Sort-Object LastWriteTimeDescending` → `Sort-Object -Property LastWriteTime -Descending`。
+  # 为什么（本轮现网取证）：`LastWriteTimeDescending` 不是属性名，PowerShell 把它当**不存在的
+  # 属性**处理——所有项该属性为 $null，排序空转、按目录枚举原序返回，于是选中字典序在前的旧包。
+  # 实测代价：23:11:57 已构建出 1.3.40，23:23 的自验证却装了 **1.3.39**（看门狗日志第 537 行），
+  # 用户当场质问「你不重新构建有啥用」——这正是系统本可以不让我绕的那一步。
   $hit = Get-ChildItem -LiteralPath $NsisDir -Filter "*_x64-setup.exe" -File -ErrorAction SilentlyContinue |
-         Sort-Object LastWriteTimeDescending | Select-Object -First 1
+         Sort-Object -Property LastWriteTime -Descending | Select-Object -First 1
   if (-not $hit) { throw "未找到安装包（$NsisDir）。先加 -Build，或手动指定 -SetupExe。" }
   $SetupExe = $hit.FullName
+  Say "选定安装包（按修改时间倒序取最新）: $(Split-Path -Leaf $SetupExe)" "Gray"
 }
 if (-not (Test-Path -LiteralPath $SetupExe)) { throw "安装包不存在: $SetupExe" }
+
+# 【self-evolution-bot · 2026-11-20 · 第99轮 · 模型:deepseek-v4.1-flash-1017】
+# 改了什么：新增「安装包比前端源码旧就拒绝」闸门（-Build 时自动通过，-AllowStaleSetup 可绕过）。
+# 为什么：上面那个排序缺陷让我装过一次旧包，白跑一整轮重启；更早一轮也是「装的是 17:33 的包，
+# 而 5 个前端文件是 18:01~18:25 才改的」。判据必须是**安装包时间 vs 最新前端/壳源文件时间**，
+# 不是「安装器 exit=0」——exit=0 只证明装完了，不证明装的是新东西。
+if (-not $Build -and -not $AllowStaleSetup) {
+  $SetupTime = (Get-Item -LiteralPath $SetupExe).LastWriteTime
+  $srcRoots = @((Join-Path $RepoRoot "evopanel\src"), (Join-Path $RepoRoot "evopanel\src-tauri\src"))
+  $newestSrc = $null
+  foreach ($root in $srcRoots) {
+    if (-not (Test-Path -LiteralPath $root)) { continue }
+    $f = Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue |
+         Where-Object { $_.FullName -notmatch '\\node_modules\\|\\target\\|\\dist\\' } |
+         Sort-Object -Property LastWriteTime -Descending | Select-Object -First 1
+    if ($f -and (-not $newestSrc -or $f.LastWriteTime -gt $newestSrc.LastWriteTime)) { $newestSrc = $f }
+  }
+  if ($newestSrc -and $newestSrc.LastWriteTime -gt $SetupTime) {
+    throw ("安装包比源码旧，拒绝安装：安装包 $($SetupTime.ToString('yyyy-MM-dd HH:mm:ss')) < 源文件 " +
+           "$($newestSrc.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'))（$($newestSrc.FullName)）。" +
+           "加 -Build 重新构建，或确认无需重打包时加 -AllowStaleSetup。")
+  }
+  Say "安装包新鲜度检查通过（包 $($SetupTime.ToString('HH:mm:ss')) ≥ 最新源文件 $($newestSrc.LastWriteTime.ToString('HH:mm:ss'))）" "Green"
+}
 Say "安装包: $SetupExe  修改时间 $((Get-Item -LiteralPath $SetupExe).LastWriteTime)"
 
 # ── 3. 解析 CLI（看门狗要用它 wake 岗位）───────────────────────────────────
@@ -223,6 +307,8 @@ $state = [ordered]@{
   agentCode         = $AgentCode
   taskId            = $TaskId
   roundId           = $RoundId
+  # 【第28轮】透传给看门狗：wake 时带上 --session-key，投回用户正看着的那一屏
+  sessionKey        = $SessionKey
   goal              = $Goal
   cliExe            = $CliExe
   evoflowHome       = $runtimeHome
@@ -264,6 +350,13 @@ Say "===== 接下来会发生什么（重要）=====" "Yellow"
 Say "1) $DelaySec 秒后看门狗启动，静默安装 $SetupExe"
 Say "2) 安装器会强制结束 EvoFlow 桌面 + Gateway + 本仓相关 python/bash/node —— 也就是**我会当场断线**，本轮回复到此为止"
 Say "3) 装完自动拉起 $(Join-Path $InstallDir 'evoflow.exe')，等 backend-runtime.json 换代且 /health 通过"
-Say "4) 用 '$CliExe employees wake $AgentCode$(if($TaskId){" --task-id $TaskId"}) --resume-round' 把我叫醒，续同一轮工作脉络做验收"
+# 【self-evolution-bot · 2026-11-20 · 第99轮 · 模型:deepseek-v4.1-flash-1017】第4步原来无条件
+# 声称「把我叫醒」，可 -SkipWake / 未传 -TaskId 时根本不 wake —— 文案与行为不一致会让下一轮的
+# 我照这句话去等一次不会到来的唤醒。改成按实际分支打印。
+if ($SkipWake -or -not $TaskId -or -not $AllowWake) {
+  Say "4) 不唤醒任何人（本轮验证由我在当前对话里继续做）：装完拉起即收工"
+} else {
+  Say "4) 用 '$CliExe employees wake $AgentCode --task-id $TaskId --resume-round' 叫醒岗位续轮"
+}
 Say "日志: $OutDir\watchdog.log    结果: $OutDir\watchdog-result.json"
 Say "取消（在安装开始前）: Unregister-ScheduledTask -TaskName $TaskName -Confirm:`$false"

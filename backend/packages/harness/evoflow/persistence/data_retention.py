@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -35,10 +36,14 @@ class RetentionRunResult:
     obs_rows_deleted: int = 0
     obs_gateway_stripped: int = 0
     obs_size_cap_deleted: int = 0
+    usage_events_deleted: int = 0
+    usage_meta_stripped: int = 0
+    v4_event_log_deleted: int = 0
     task_stream_deleted: int = 0
     task_status_deleted: int = 0
     automation_runs_deleted: int = 0
     soft_deleted_messages: int = 0
+    right_stage_trail_deleted: int = 0
     checkpoint_threads_purged: int = 0
     checkpoint_rows_deleted: int = 0
     checkpoint_history_rows_deleted: int = 0
@@ -63,6 +68,56 @@ def prune_gateway_logs(log_dir: Path, *, days: int) -> int:
     from evoflow.runtime.log_policy import prune_all_daily_logs
 
     return prune_all_daily_logs(log_dir, days=days)
+
+
+def prune_usage_events(*, days: int) -> int:
+    """Delete ``evoflow_usage_events`` older than *days* (high-volume ledger)."""
+    keep_days = max(1, int(days))
+    # Date-only prefix compares cleanly for both ``...Z`` and ``...+08:00`` ISO rows.
+    cutoff_day = (datetime.now(UTC) - timedelta(days=keep_days)).strftime("%Y-%m-%d")
+    try:
+        path = resolve_evolflow_db_path()
+        if not path.is_file():
+            return 0
+        conn = sqlite3.connect(str(path), timeout=120.0)
+        try:
+            cur = conn.execute(
+                "DELETE FROM evoflow_usage_events WHERE occurred_at < ?",
+                (cutoff_day,),
+            )
+            conn.commit()
+            return int(cur.rowcount or 0)
+        finally:
+            conn.close()
+    except Exception:
+        logger.debug("usage_events prune failed days=%s", keep_days, exc_info=True)
+        return 0
+
+
+def strip_usage_events_heavy_meta(*, json_limit: int) -> int:
+    """Replace oversized ``meta_json`` with ``{}`` (column is NOT NULL; keeps ledger totals)."""
+    limit = max(1024, int(json_limit))
+    try:
+        path = resolve_evolflow_db_path()
+        if not path.is_file():
+            return 0
+        conn = sqlite3.connect(str(path), timeout=120.0)
+        try:
+            cur = conn.execute(
+                """
+                UPDATE evoflow_usage_events
+                SET meta_json = '{}'
+                WHERE length(meta_json) > ?
+                """,
+                (limit,),
+            )
+            conn.commit()
+            return int(cur.rowcount or 0)
+        finally:
+            conn.close()
+    except Exception:
+        logger.debug("usage_events meta strip failed", exc_info=True)
+        return 0
 
 
 def _observability_db_bytes(obs_path: Path) -> int:
@@ -110,18 +165,48 @@ def strip_gateway_request_heavy_columns(conn: sqlite3.Connection, *, json_limit:
     return int(cur.rowcount or 0)
 
 
-def _delete_oldest_rows(conn: sqlite3.Connection, table: str, *, batch: int, time_col: str = "occurred_at") -> int:
-    cur = conn.execute(
-        f"""
-        DELETE FROM {table}
-        WHERE rowid IN (
-            SELECT rowid FROM {table}
-            ORDER BY {time_col} ASC
-            LIMIT ?
+def _delete_oldest_rows(
+    conn: sqlite3.Connection,
+    table: str,
+    *,
+    batch: int,
+    time_col: str = "occurred_at",
+    older_than: str | None = None,
+) -> int:
+    """Delete the oldest ``batch`` rows; ``older_than`` makes that a hard floor.
+
+    【self-evolution-bot · 2026-11-19 · 第68轮 · 模型:deepseek-v4.1-flash-1017】
+    ``older_than`` 新增：体积上限压缩时必须能给"保留天数"留一条硬底线，
+    否则 2GB 上限会把 7 天接口历史削成 13 小时（11-19 实测：235,970 行全在同一天）。
+
+    时间比较用 ``julianday()`` 而不是字符串排序：``occurred_at`` 存的是
+    ``+08:00`` 偏移，而 ``_cutoff_iso`` 产出 ``Z`` 后缀，同一天内直接比字符串会错 8 小时。
+    """
+    if older_than:
+        cur = conn.execute(
+            f"""
+            DELETE FROM {table}
+            WHERE rowid IN (
+                SELECT rowid FROM {table}
+                WHERE julianday({time_col}) < julianday(?)
+                ORDER BY {time_col} ASC
+                LIMIT ?
+            )
+            """,
+            (older_than, max(1, int(batch))),
         )
-        """,
-        (max(1, int(batch)),),
-    )
+    else:
+        cur = conn.execute(
+            f"""
+            DELETE FROM {table}
+            WHERE rowid IN (
+                SELECT rowid FROM {table}
+                ORDER BY {time_col} ASC
+                LIMIT ?
+            )
+            """,
+            (max(1, int(batch)),),
+        )
     conn.commit()
     return int(cur.rowcount or 0)
 
@@ -151,37 +236,166 @@ def strip_model_invocation_heavy_columns(conn: sqlite3.Connection, *, json_limit
     return int(cur.rowcount or 0)
 
 
+def _vacuum_max_bytes() -> int:
+    """Max SQLite file size allowed for in-process VACUUM (0 = unlimited).
+
+    Multi-GB VACUUM holds an exclusive lock for minutes and stalls every Gateway
+    REST that touches the DB (2026-11-19 15:03: proactive/approvals 86s while
+    evoflow.db / observability.db were vacuumed). Override with
+    ``EVOFLOW_VACUUM_MAX_BYTES`` (bytes).
+    """
+    raw = (os.getenv("EVOFLOW_VACUUM_MAX_BYTES") or "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    return 256 * 1024 * 1024
+
+
+def _skip_vacuum_due_to_size(path: Path) -> bool:
+    """True when *path* is too large for safe in-process VACUUM."""
+    max_b = _vacuum_max_bytes()
+    if max_b <= 0:
+        return False
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return False
+    if size <= max_b:
+        return False
+    logger.warning(
+        "skip in-process VACUUM for %s (size=%.2f GB > limit %.2f GB); "
+        "set EVOFLOW_VACUUM_MAX_BYTES=0 to force, or compact offline",
+        path,
+        size / (1024**3),
+        max_b / (1024**3),
+    )
+    return True
+
+
+def _observability_freelist_bytes(obs_path: Path) -> int:
+    """Bytes held in SQLite freelist (deleted but not yet reclaimed by VACUUM)."""
+    if not obs_path.is_file():
+        return 0
+    try:
+        conn = sqlite3.connect(f"file:{obs_path.as_posix()}?mode=ro", uri=True, timeout=30.0)
+        try:
+            page_size = int(conn.execute("PRAGMA page_size").fetchone()[0] or 0)
+            freelist = int(conn.execute("PRAGMA freelist_count").fetchone()[0] or 0)
+            return max(0, page_size * freelist)
+        finally:
+            conn.close()
+    except Exception:
+        logger.debug("observability freelist probe failed", exc_info=True)
+        return 0
+
+
+def _replace_sqlite_file(src: Path, dest: Path, *, attempts: int = 12) -> None:
+    """Replace *dest* with *src* (Windows-safe retries when antivirus/handles lag)."""
+    import time
+
+    last_exc: OSError | None = None
+    for i in range(max(1, attempts)):
+        try:
+            os.replace(str(src), str(dest))
+            return
+        except OSError as exc:
+            last_exc = exc
+            # WinError 32 / 5: file still mapped; brief backoff + re-quiesce store.
+            try:
+                from evoflow.observability.recorder import reset_observability_store
+
+                reset_observability_store()
+            except Exception:
+                pass
+            time.sleep(min(2.0, 0.15 * (i + 1)))
+    assert last_exc is not None
+    raise last_exc
+
+
 def _vacuum_observability_rebuild(obs_path: Path) -> bool:
     """Rebuild observability.db via ``VACUUM INTO`` (compact file, drop WAL).
 
-    Requires no other connections holding the DB. Returns True when the rebuilt
-    file replaced the original.
+    This is the supported compact path for **multi-GB** obs DBs. Do **not** gate on
+    ``EVOFLOW_VACUUM_MAX_BYTES`` — that guard is only for in-place ``VACUUM``
+    (2026-11-23 non-dev: ~1GB freelist unreclaimed because rebuild wrongly skipped
+    when the file was already over the in-process VACUUM size limit).
+
+    Holds the in-process store quiesce lock for the whole swap so writers cannot
+    reopen mid-rename (2026-11-24: VACUUM INTO ok then WinError 32 on replace).
     """
     if not obs_path.is_file():
         return False
+    before = _observability_db_bytes(obs_path)
+    freelist_b = _observability_freelist_bytes(obs_path)
     rebuilt = obs_path.with_suffix(".db.rebuild")
     backup = obs_path.with_suffix(".db.bak")
     try:
+        from evoflow.observability.recorder import observability_store_quiesced
+    except Exception:
+        observability_store_quiesced = None  # type: ignore[assignment]
+        logger.debug("observability store quiesce import failed", exc_info=True)
+
+    def _do_rebuild() -> bool:
         if rebuilt.exists():
             rebuilt.unlink()
+        logger.info(
+            "observability VACUUM INTO rebuild starting size=%.2f GB freelist=%.2f GB path=%s",
+            before / (1024**3),
+            freelist_b / (1024**3),
+            obs_path,
+        )
         conn = sqlite3.connect(str(obs_path), timeout=300.0)
-        conn.execute("PRAGMA busy_timeout=300000")
-        # Forward slashes work on Windows for SQLite path args.
-        conn.execute(f"VACUUM INTO '{rebuilt.as_posix()}'")
-        conn.close()
+        try:
+            conn.execute("PRAGMA busy_timeout=300000")
+            # Forward slashes work on Windows for SQLite path args.
+            conn.execute(f"VACUUM INTO '{rebuilt.as_posix()}'")
+        finally:
+            conn.close()
         if not rebuilt.is_file() or rebuilt.stat().st_size <= 0:
             return False
         if backup.exists():
-            backup.unlink()
-        obs_path.rename(backup)
-        rebuilt.rename(obs_path)
+            try:
+                backup.unlink()
+            except OSError:
+                pass
+        # Move live → bak, then rebuilt → live (retries for WinError 32).
+        _replace_sqlite_file(obs_path, backup)
+        try:
+            _replace_sqlite_file(rebuilt, obs_path)
+        except OSError:
+            # Roll back if we cannot install the compacted file.
+            try:
+                _replace_sqlite_file(backup, obs_path)
+            except OSError:
+                pass
+            raise
         for suffix in ("-wal", "-shm"):
             side = Path(f"{obs_path}{suffix}")
             if side.is_file():
-                side.unlink()
+                try:
+                    side.unlink()
+                except OSError:
+                    pass
         if backup.is_file():
-            backup.unlink()
+            try:
+                backup.unlink()
+            except OSError:
+                pass
+        after = _observability_db_bytes(obs_path)
+        logger.info(
+            "observability VACUUM INTO rebuild done %.2f GB -> %.2f GB",
+            before / (1024**3),
+            after / (1024**3),
+        )
         return True
+
+    try:
+        if observability_store_quiesced is not None:
+            with observability_store_quiesced():
+                return _do_rebuild()
+        return _do_rebuild()
     except Exception as exc:
         logger.warning("observability VACUUM INTO rebuild failed: %s", exc)
         if rebuilt.is_file():
@@ -198,13 +412,34 @@ def enforce_observability_db_size_cap(
     max_bytes: int,
     min_gateway_days: int = 3,
     model_json_limit: int = 32 * 1024,
+    min_model_days: int = 3,
+    vacuum_path_guard: Callable[[], bool] | None = None,
 ) -> tuple[int, int, bool]:
-    """Shrink observability.db when it exceeds *max_bytes*. Returns (stripped, deleted, vacuumed)."""
-    _ = min_gateway_days  # reserved for future soft-retention tuning
+    """Shrink observability.db when it exceeds *max_bytes*. Returns (stripped, deleted, vacuumed).
+
+    【self-evolution-bot · 2026-11-19 · 第68轮 · 模型:deepseek-v4.1-flash-1017】
+    ``min_gateway_days`` / ``min_model_days`` 从"保留参数（空实现）"变成**真硬底线**。
+
+    缺陷（现网实证 2026-11-19）：配置里 ``gateway_requests_days=7``，实际
+    ``evoflow_obs_gateway_requests`` 只剩当天 13 小时（235,970 行全在 11-19）。
+    根因是本函数按 ``target_ratio`` 等比删最旧行、且**先删网关请求再删模型 JSON**，
+    2GB 上限打满时把「最能说明接口问题的表」删成 0，却保住了 912MB 的模型请求体。
+
+    修复口径：
+    ① 先剥大字段（模型 request/response JSON）——这是体积大头，不丢耗时数字；
+    ② 删行只在「超过底线天数」的行里删，绝不碰底线内的数据；
+    ③ 若守住底线后仍超上限，**明确 warning 报超出多少**，由人决定调高
+       ``observability_max_size_gb`` 或缩短保留天数，而不是静默削掉近期历史；
+    ④ 回收磁盘必须走 ``VACUUM INTO``（多 GB 也允许）；忙时由 ``vacuum_path_guard`` 让路。
+    """
     if not obs_path.is_file() or max_bytes <= 0:
         return (0, 0, False)
     before = _observability_db_bytes(obs_path)
-    if before <= max_bytes:
+    freelist_before = _observability_freelist_bytes(obs_path)
+    # Also reclaim when freelist bloat alone is huge (DELETE already ran; file still fat).
+    freelist_reclaim_min = 256 * 1024 * 1024
+    needs_compact = before > max_bytes or freelist_before >= freelist_reclaim_min
+    if not needs_compact:
         return (0, 0, False)
 
     stripped = 0
@@ -213,8 +448,9 @@ def enforce_observability_db_size_cap(
     conn = sqlite3.connect(str(obs_path), timeout=120.0)
     try:
         logger.warning(
-            "observability.db size %.2f GB exceeds cap %.2f GB; compacting",
+            "observability.db size %.2f GB (freelist %.2f GB) exceeds cap %.2f GB or freelist reclaim; compacting",
             before / (1024**3),
+            freelist_before / (1024**3),
             max_bytes / (1024**3),
         )
         stripped = strip_gateway_request_heavy_columns(conn)
@@ -223,82 +459,95 @@ def enforce_observability_db_size_cap(
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         conn.commit()
 
-        gw_count_row = conn.execute(f"SELECT COUNT(*) FROM {ObservabilityTable.GATEWAY_REQUESTS}").fetchone()
-        gw_count = int(gw_count_row[0] or 0) if gw_count_row else 0
-        # SQLite file size barely drops until VACUUM — estimate rows to delete from ratio.
-        target_ratio = max(0.05, min(1.0, max_bytes / before))
-        keep_gateway = max(1, int(gw_count * target_ratio * 0.85))
-        if gw_count > 10_000:
-            keep_gateway = max(5_000, keep_gateway)
-        keep_gateway = min(gw_count, keep_gateway)
-        to_delete = max(0, gw_count - keep_gateway)
-        batch = 50_000
-        while to_delete > 0:
-            n = _delete_oldest_rows(
-                conn,
-                ObservabilityTable.GATEWAY_REQUESTS,
-                batch=min(batch, to_delete),
-            )
-            if n <= 0:
-                break
-            deleted += n
-            to_delete -= n
-
-        if before > max_bytes * 1.2:
-            model_count_row = conn.execute(f"SELECT COUNT(*) FROM {ObservabilityTable.MODEL_INVOCATIONS}").fetchone()
-            model_count = int(model_count_row[0] or 0) if model_count_row else 0
-            keep_model = max(1_000, int(model_count * target_ratio * 0.85))
-            if model_count > 5_000:
-                keep_model = max(2_000, keep_model)
-            keep_model = min(model_count, keep_model)
-            model_to_delete = max(0, model_count - keep_model)
-            while model_to_delete > 0:
+        if before > max_bytes:
+            gw_count_row = conn.execute(f"SELECT COUNT(*) FROM {ObservabilityTable.GATEWAY_REQUESTS}").fetchone()
+            gw_count = int(gw_count_row[0] or 0) if gw_count_row else 0
+            # SQLite file size barely drops until VACUUM — estimate rows to delete from ratio.
+            target_ratio = max(0.05, min(1.0, max_bytes / before))
+            keep_gateway = max(1, int(gw_count * target_ratio * 0.85))
+            if gw_count > 10_000:
+                keep_gateway = max(5_000, keep_gateway)
+            keep_gateway = min(gw_count, keep_gateway)
+            to_delete = max(0, gw_count - keep_gateway)
+            # 硬底线：底线天数内的行一条都不许删（2026-11-19 实测 7 天被削成 13 小时）。
+            gw_floor = _cutoff_iso(max(1, int(min_gateway_days))) if min_gateway_days > 0 else None
+            batch = 50_000
+            while to_delete > 0:
                 n = _delete_oldest_rows(
                     conn,
-                    ObservabilityTable.MODEL_INVOCATIONS,
-                    batch=min(batch, model_to_delete),
-                    time_col="requested_at",
+                    ObservabilityTable.GATEWAY_REQUESTS,
+                    batch=min(batch, to_delete),
+                    older_than=gw_floor,
                 )
                 if n <= 0:
                     break
                 deleted += n
-                model_to_delete -= n
+                to_delete -= n
 
-        if before > max_bytes * 1.5:
-            trace_count_row = conn.execute(f"SELECT COUNT(*) FROM {ObservabilityTable.TRACE_EVENTS}").fetchone()
-            trace_count = int(trace_count_row[0] or 0) if trace_count_row else 0
-            keep_trace = max(10_000, int(trace_count * target_ratio * 0.85))
-            trace_to_delete = max(0, trace_count - keep_trace)
-            while trace_to_delete > 0:
-                n = _delete_oldest_rows(
-                    conn,
-                    ObservabilityTable.TRACE_EVENTS,
-                    batch=min(batch, trace_to_delete),
-                )
-                if n <= 0:
-                    break
-                deleted += n
-                trace_to_delete -= n
+            if before > max_bytes * 1.2:
+                model_count_row = conn.execute(f"SELECT COUNT(*) FROM {ObservabilityTable.MODEL_INVOCATIONS}").fetchone()
+                model_count = int(model_count_row[0] or 0) if model_count_row else 0
+                keep_model = max(1_000, int(model_count * target_ratio * 0.85))
+                if model_count > 5_000:
+                    keep_model = max(2_000, keep_model)
+                keep_model = min(model_count, keep_model)
+                model_to_delete = max(0, model_count - keep_model)
+                model_floor = _cutoff_iso(max(1, int(min_model_days))) if min_model_days > 0 else None
+                while model_to_delete > 0:
+                    n = _delete_oldest_rows(
+                        conn,
+                        ObservabilityTable.MODEL_INVOCATIONS,
+                        batch=min(batch, model_to_delete),
+                        time_col="requested_at",
+                        older_than=model_floor,
+                    )
+                    if n <= 0:
+                        break
+                    deleted += n
+                    model_to_delete -= n
+
+            if before > max_bytes * 1.5:
+                trace_count_row = conn.execute(f"SELECT COUNT(*) FROM {ObservabilityTable.TRACE_EVENTS}").fetchone()
+                trace_count = int(trace_count_row[0] or 0) if trace_count_row else 0
+                keep_trace = max(10_000, int(trace_count * target_ratio * 0.85))
+                trace_to_delete = max(0, trace_count - keep_trace)
+                trace_floor = _cutoff_iso(max(1, int(min_gateway_days))) if min_gateway_days > 0 else None
+                while trace_to_delete > 0:
+                    n = _delete_oldest_rows(
+                        conn,
+                        ObservabilityTable.TRACE_EVENTS,
+                        batch=min(batch, trace_to_delete),
+                        older_than=trace_floor,
+                    )
+                    if n <= 0:
+                        break
+                    deleted += n
+                    trace_to_delete -= n
 
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         conn.commit()
     finally:
         conn.close()
 
-    if stripped > 0 or deleted > 0:
-        vacuumed = _vacuum_observability_rebuild(obs_path)
-        if not vacuumed:
-            try:
-                conn = sqlite3.connect(str(obs_path), timeout=300.0)
-                conn.execute("PRAGMA busy_timeout=300000")
-                conn.execute("VACUUM")
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                conn.close()
-                vacuumed = True
-            except Exception as exc:
-                logger.warning("observability size-cap VACUUM failed: %s", exc)
-    elif before > max_bytes:
-        vacuumed = _vacuum_observability_rebuild(obs_path)
+    # Disk reclaim: VACUUM INTO works for multi-GB; skip only when chat/REST is busy.
+    should_rebuild = stripped > 0 or deleted > 0 or before > max_bytes or freelist_before >= freelist_reclaim_min
+    if should_rebuild:
+        if vacuum_path_guard is not None and not vacuum_path_guard():
+            logger.info(
+                "observability size-cap: skip VACUUM INTO (busy guard); will retry while over cap"
+            )
+        else:
+            vacuumed = _vacuum_observability_rebuild(obs_path)
+            if not vacuumed and not _skip_vacuum_due_to_size(obs_path):
+                try:
+                    conn = sqlite3.connect(str(obs_path), timeout=300.0)
+                    conn.execute("PRAGMA busy_timeout=300000")
+                    conn.execute("VACUUM")
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    conn.close()
+                    vacuumed = True
+                except Exception as exc:
+                    logger.warning("observability size-cap VACUUM failed: %s", exc)
 
     after = _observability_db_bytes(obs_path)
     logger.info(
@@ -309,6 +558,19 @@ def enforce_observability_db_size_cap(
         before / (1024**3),
         after / (1024**3),
     )
+    # 【self-evolution-bot · 2026-11-19 · 第68轮】守住底线仍超上限 → 必须**明确报出来**。
+    # 旧行为是默默把近期历史削到 0 行，运维看面板只看到"统计没了"，查不到原因。
+    if after > max_bytes:
+        logger.warning(
+            "observability.db still %.2f GB over cap %.2f GB after compaction; "
+            "recent history preserved by floor (gateway>=%dd, model>=%dd). "
+            "Raise data_retention.observability_max_size_gb or lower retention days — "
+            "NOT silently dropping recent rows.",
+            after / (1024**3),
+            max_bytes / (1024**3),
+            int(min_gateway_days),
+            int(min_model_days),
+        )
     return (stripped, deleted, vacuumed)
 
 
@@ -615,6 +877,11 @@ def prune_checkpoint_history_per_thread(
                     [tid, *kept_ids],
                 )
                 writes_deleted += int(cur_w2.rowcount or 0)
+            # 逐线程提交，收缩 checkpoints.db 写锁窗口：LG 运行时进程每 superstep
+            # 都要 put（busy_timeout 5s），长事务会让活跃 run 报 database is locked。
+            # 单线程的 checkpoints+writes 删除自洽，分批提交不破坏一致性。
+            if not own_conn:
+                conn.commit()
         if own_conn:
             writes_deleted += prune_orphan_writes(conn)
             conn.commit()
@@ -639,6 +906,7 @@ def run_checkpoint_db_retention(
     if not cp_path.is_file():
         return 0, 0, 0, 0, 0
     conn = sqlite3.connect(str(cp_path), timeout=120.0)
+    conn.execute("PRAGMA busy_timeout=10000")
     threads_purged = 0
     cp_deleted = 0
     writes_deleted = 0
@@ -655,6 +923,9 @@ def run_checkpoint_db_retention(
             writes_deleted += int(cur_w.rowcount or 0)
             cp_deleted += int(cur_c.rowcount or 0)
             threads_purged += 1
+            # 逐线程提交：LG 运行时进程每个 superstep 都会 put（busy_timeout 只有 5s），
+            # 单一长写事务覆盖整轮 purge 会让活跃 run 直接 OperationalError 失败。
+            conn.commit()
         hist_cp, hist_writes = prune_checkpoint_history_per_thread(
             cp_path,
             keep_per_thread=keep_per_thread,
@@ -700,10 +971,160 @@ def purge_orphan_checkpoints(
         conn.close()
 
 
+def apply_pending_sqlite_rebuild(db_path: Path) -> bool:
+    """Install ``{db}.rebuild`` over *db_path* when a prior VACUUM INTO could not rename.
+
+    Call before opening the live DB (Gateway startup). Returns True when swapped.
+    """
+    rebuilt = db_path.with_suffix(db_path.suffix + ".rebuild")
+    if not rebuilt.is_file() or rebuilt.stat().st_size <= 0:
+        return False
+    if db_path.is_file() and rebuilt.stat().st_size >= db_path.stat().st_size:
+        # Rebuild not smaller — likely stale; drop it.
+        try:
+            rebuilt.unlink()
+        except OSError:
+            pass
+        return False
+    backup = db_path.with_suffix(db_path.suffix + ".bak")
+    try:
+        if backup.exists():
+            backup.unlink()
+        if db_path.is_file():
+            _replace_sqlite_file(db_path, backup)
+        _replace_sqlite_file(rebuilt, db_path)
+        for suffix in ("-wal", "-shm"):
+            side = Path(f"{db_path}{suffix}")
+            if side.is_file():
+                try:
+                    side.unlink()
+                except OSError:
+                    pass
+        if backup.is_file():
+            try:
+                backup.unlink()
+            except OSError:
+                pass
+        logger.info(
+            "applied pending sqlite rebuild %s -> %s (%.2f GB)",
+            rebuilt.name,
+            db_path.name,
+            db_path.stat().st_size / (1024**3),
+        )
+        return True
+    except Exception as exc:
+        logger.warning("apply pending sqlite rebuild failed for %s: %s", db_path, exc)
+        # Roll back live file if we moved it aside.
+        if backup.is_file() and not db_path.is_file():
+            try:
+                _replace_sqlite_file(backup, db_path)
+            except OSError:
+                pass
+        return False
+
+
+def _vacuum_sqlite_rebuild_file(db_path: Path, *, label: str) -> bool:
+    """``VACUUM INTO`` + replace for any SQLite file too large for in-place VACUUM."""
+    if not db_path.is_file():
+        return False
+    before = db_path.stat().st_size
+    rebuilt = db_path.with_suffix(db_path.suffix + ".rebuild")
+    backup = db_path.with_suffix(db_path.suffix + ".bak")
+    try:
+        if rebuilt.exists():
+            rebuilt.unlink()
+        logger.info(
+            "%s VACUUM INTO rebuild starting size=%.2f GB path=%s",
+            label,
+            before / (1024**3),
+            db_path,
+        )
+        conn = sqlite3.connect(str(db_path), timeout=300.0)
+        try:
+            conn.execute("PRAGMA busy_timeout=300000")
+            conn.execute(f"VACUUM INTO '{rebuilt.as_posix()}'")
+        finally:
+            conn.close()
+        if not rebuilt.is_file() or rebuilt.stat().st_size <= 0:
+            return False
+        if backup.exists():
+            try:
+                backup.unlink()
+            except OSError:
+                pass
+        try:
+            _replace_sqlite_file(db_path, backup)
+            try:
+                _replace_sqlite_file(rebuilt, db_path)
+            except OSError:
+                try:
+                    _replace_sqlite_file(backup, db_path)
+                except OSError:
+                    pass
+                raise
+        except OSError as exc:
+            # Keep .rebuild for apply_pending_sqlite_rebuild on next free window /
+            # Gateway cold start (WinError 32 while panel respawns sidecar).
+            logger.warning(
+                "%s VACUUM INTO wrote %s (%.2f GB) but replace failed (%s); "
+                "leaving rebuild for pending apply",
+                label,
+                rebuilt.name,
+                rebuilt.stat().st_size / (1024**3),
+                exc,
+            )
+            return False
+        for suffix in ("-wal", "-shm"):
+            side = Path(f"{db_path}{suffix}")
+            if side.is_file():
+                try:
+                    side.unlink()
+                except OSError:
+                    pass
+        if backup.is_file():
+            try:
+                backup.unlink()
+            except OSError:
+                pass
+        after = db_path.stat().st_size if db_path.is_file() else 0
+        logger.info(
+            "%s VACUUM INTO rebuild done %.2f GB -> %.2f GB",
+            label,
+            before / (1024**3),
+            after / (1024**3),
+        )
+        return True
+    except Exception as exc:
+        logger.warning("%s VACUUM INTO rebuild failed: %s", label, exc)
+        # Only delete rebuild when VACUUM INTO itself failed mid-way / empty.
+        if rebuilt.is_file() and (not db_path.is_file() or rebuilt.stat().st_size >= before):
+            try:
+                rebuilt.unlink()
+            except OSError:
+                pass
+        return False
+
+
 def _vacuum_paths(paths: list[Path]) -> list[str]:
     done: list[str] = []
     for p in paths:
         if not p.is_file():
+            continue
+        if _skip_vacuum_due_to_size(p):
+            # Multi-GB DBs: reclaim via VACUUM INTO (in-place VACUUM is gated).
+            if "observability" in p.name.lower():
+                ok = _vacuum_observability_rebuild(p)
+            else:
+                try:
+                    from evoflow.persistence.db import reset_db_for_tests, resolve_evolflow_db_path
+
+                    if p.resolve() == resolve_evolflow_db_path().resolve():
+                        reset_db_for_tests()
+                except Exception:
+                    logger.debug("app db quiesce before rebuild failed", exc_info=True)
+                ok = _vacuum_sqlite_rebuild_file(p, label=p.name)
+            if ok:
+                done.append(str(p))
             continue
         try:
             conn = sqlite3.connect(str(p), timeout=120.0)
@@ -800,6 +1221,7 @@ def run_data_retention(
                 max_bytes=max_bytes,
                 min_gateway_days=min(cfg.gateway_requests_days, 3),
                 model_json_limit=int(cfg.observability_model_json_limit_bytes),
+                vacuum_path_guard=vacuum_path_guard,
             )
             result.obs_gateway_stripped = stripped
             result.obs_size_cap_deleted = cap_deleted
@@ -810,6 +1232,30 @@ def run_data_retention(
         result.errors.append(f"observability: {exc}")
         logger.warning("retention: observability prune failed", exc_info=True)
 
+    try:
+        result.usage_meta_stripped = strip_usage_events_heavy_meta(
+            json_limit=int(cfg.usage_meta_json_limit_bytes),
+        )
+        result.usage_events_deleted = prune_usage_events(days=int(cfg.usage_events_days))
+    except Exception as exc:
+        result.errors.append(f"app_db:usage_events: {exc}")
+        logger.warning("retention: usage_events prune failed", exc_info=True)
+    try:
+        from evoflow.persistence.v4_event_log_repositories import prune_v4_event_log
+
+        result.v4_event_log_deleted = int(prune_v4_event_log(int(cfg.v4_event_log_days)) or 0)
+    except Exception as exc:
+        result.errors.append(f"app_db:v4_event_log: {exc}")
+        logger.warning("retention: v4_event_log prune failed", exc_info=True)
+    try:
+        from evoflow.persistence.right_stage_tables import prune_right_stage_trail
+
+        result.right_stage_trail_deleted = int(
+            prune_right_stage_trail(days=int(cfg.right_stage_trail_days)) or 0
+        )
+    except Exception as exc:
+        result.errors.append(f"app_db:right_stage_trail: {exc}")
+        logger.warning("retention: right_stage_trail prune failed", exc_info=True)
     try:
         result.task_stream_deleted = prune_task_stream_events(days=cfg.task_stream_days)
     except Exception as exc:
@@ -834,12 +1280,18 @@ def run_data_retention(
     try:
 
         def _load_checkpoint_context() -> tuple[set[str], set[str], set[str], set[str]]:
-            app_conn = get_db()
-            protected = _protected_thread_ids(app_conn)
-            any_sessions = _all_session_thread_ids(app_conn)
-            stale_threads = _stale_deleted_session_threads(app_conn, days=cfg.checkpoint_orphan_days)
-            inactive_threads = _inactive_session_threads(app_conn, days=cfg.checkpoint_inactive_session_days)
-            return protected, any_sessions, stale_threads, inactive_threads
+            # 4 次全表扫描改走只读池：原实现持**写锁**跑扫描，retention 期间把全部
+            # 写路径挡 0.1-1s（WAL 下读不阻塞写，读池即可）。
+            from evoflow.persistence.db import run_db_read
+
+            def _read(conn):
+                protected = _protected_thread_ids(conn)
+                any_sessions = _all_session_thread_ids(conn)
+                stale_threads = _stale_deleted_session_threads(conn, days=cfg.checkpoint_orphan_days)
+                inactive_threads = _inactive_session_threads(conn, days=cfg.checkpoint_inactive_session_days)
+                return protected, any_sessions, stale_threads, inactive_threads
+
+            return run_db_read(_read)
 
         protected, any_sessions, stale_threads, inactive_threads = run_db_with_retry(_load_checkpoint_context)
         cp_raw = ""
@@ -894,6 +1346,9 @@ def run_data_retention(
     deleted_total = (
         result.logs_removed
         + result.obs_rows_deleted
+        + result.usage_events_deleted
+        + result.usage_meta_stripped
+        + result.v4_event_log_deleted
         + result.task_stream_deleted
         + result.task_status_deleted
         + result.automation_runs_deleted
@@ -917,9 +1372,12 @@ def run_data_retention(
         result.errors.append(f"vacuum: {exc}")
 
     logger.info(
-        "data retention: logs=%d obs=%d stream=%d status=%d automation=%d msgs=%d cp_threads=%d cp_rows=%d cp_history=%d writes=%d vacuum=%s errors=%d",
+        "data retention: logs=%d obs=%d usage=%d usage_meta=%d v4log=%d stream=%d status=%d automation=%d msgs=%d cp_threads=%d cp_rows=%d cp_history=%d writes=%d vacuum=%s errors=%d",
         result.logs_removed,
         result.obs_rows_deleted,
+        result.usage_events_deleted,
+        result.usage_meta_stripped,
+        result.v4_event_log_deleted,
         result.task_stream_deleted,
         result.task_status_deleted,
         result.automation_runs_deleted,

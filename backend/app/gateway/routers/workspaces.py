@@ -44,6 +44,15 @@ _RESOLVE_TARGET_HEAL_MAX_SCAN = 1_500
 _RESOLVE_TARGET_HEAL_MAX_KEYS = 2
 _RESOLVE_TARGET_HEAL_BUDGET_S = 2.5
 
+# Settings code-index search (2026-11-23): q=class against EvoFlow + personal roots sat
+# on DATA for 100s+ (SQLite busy + semantic import). Isolate like resolve-target.
+_CODE_INDEX_SEARCH_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=2, thread_name_prefix="evoflow-code-index-search"
+)
+_CODE_INDEX_SEARCH_SLOT: asyncio.Semaphore | None = None
+_CODE_INDEX_SEARCH_WALL_S = 8.0
+_CODE_INDEX_SEARCH_ACQUIRE_S = 1.0
+
 
 def _git_slot() -> asyncio.Semaphore:
     """Lazy semaphore bound to the running loop (avoid import-time loop binding)."""
@@ -66,6 +75,13 @@ def _resolve_target_slot() -> asyncio.Semaphore:
     if _RESOLVE_TARGET_SLOT is None:
         _RESOLVE_TARGET_SLOT = asyncio.Semaphore(2)
     return _RESOLVE_TARGET_SLOT
+
+
+def _code_index_search_slot() -> asyncio.Semaphore:
+    global _CODE_INDEX_SEARCH_SLOT
+    if _CODE_INDEX_SEARCH_SLOT is None:
+        _CODE_INDEX_SEARCH_SLOT = asyncio.Semaphore(2)
+    return _CODE_INDEX_SEARCH_SLOT
 
 from evoflow.authz.http_guard import require_workspace_path_visible, require_workspace_root_access
 from evoflow.authz.resource_visibility import stamp_kwargs_from_request
@@ -179,6 +195,13 @@ class IndexBuildResponse(BaseModel):
     build_progress_pct: float | None = None
     build_phase: str | None = None
     updated_at: str | None = None
+    # 【self-evolution-bot · 2026-11-17 · 第31轮】补回被响应模型吞掉的两个诊断字段。
+    # 为什么：store.index_status() 早就算出了 stale_reasons（第26轮加的），
+    # 但 IndexBuildResponse 没声明它，FastAPI 序列化时静默丢弃。
+    # 实测代价：库里 vec=7 / files=9044，/index-status 返回 ready=false 却
+    # stale_reasons=null —— 对外说不出「为什么不 ready」，只能回去读 SQL 反推。
+    stale_reasons: list[str] | None = None
+    vector_available: bool | None = None
 
 
 class IndexSearchHit(BaseModel):
@@ -327,8 +350,43 @@ def _is_host_absolute(path: str) -> bool:
         return False
 
 
+_ORG_PLACEHOLDER_SEGMENT = re.compile(r"^\$\{[A-Za-z0-9_.]+\}$")
+
+
+def _strip_org_placeholder_tokens(path: str) -> str:
+    """Drop literal ``${ORG_WORKSPACE}`` style segments from a cited path.
+
+    【self-evolution-bot · 2026-11-23 · 第129轮 · 模型:deepseek-v4.1-flash】
+    为什么：场景包安装后占位符未展开时，员工卡片/会话工作区带着字面 ``${ORG_WORKSPACE}``，
+    模型照着写进回复，前端点文件卡片就把 ``root=${ORG_WORKSPACE}`` +
+    ``path=${ORG_WORKSPACE}/outputs/x.docx`` 原样发到网关 → ``resolve_index_root``
+    抛 ValueError → HTTP 400（现网 gateway-2026-11-23.log 09:11/09:49 多条实证）。
+    改了什么：读路径入口统一剥掉占位符段，让 ``outputs/x.docx`` 按 thread/host 根回退解析，
+    已发出去的历史消息也能点开。
+    """
+    raw = str(path or "")
+    if "${" not in raw:
+        return raw
+    parts = raw.replace("\\", "/").split("/")
+    kept = [p for p in parts if p and not _ORG_PLACEHOLDER_SEGMENT.match(p.strip())]
+    return "/".join(kept)
+
+
+def _normalize_root_hint(root: str | None) -> str | None:
+    """Normalize a ``root`` query arg; empty-after-strip means "no bound root".
+
+    【self-evolution-bot · 2026-11-23 · 第130轮 · 模型:qwen3.8-flash】
+    为什么：前端把 ``root=${ORG_WORKSPACE}`` 原样发到网关，``resolve_index_root`` 对
+    非绝对路径抛 ValueError → 400。日志实证 400 出在 root 这一侧（同请求的 path 也带
+    占位符，但先被 root 卡住）。
+    改了什么：剥掉占位符段后若为空，就当没绑根，落到 thread/host 根回退解析
+    （``resolve_host_workspace_root_for_files`` 兜到 EVOFLOW_HOME，实测正是 ``outputs/`` 的父目录）。
+    """
+    return _strip_org_placeholder_tokens(str(root or "").strip()).strip() or None
+
+
 def _normalize_rel_path(path: str) -> str:
-    rel = str(path or "").strip().replace("\\", "/")
+    rel = _strip_org_placeholder_tokens(str(path or "").strip()).replace("\\", "/")
     while rel.startswith("./"):
         rel = rel[2:]
     if _is_host_absolute(rel):
@@ -445,7 +503,15 @@ def _fuzzy_locate_under_workspace(
     max_scan: int = 4_000,
     budget_s: float | None = None,
 ) -> Path | None:
-    """Cite omitted ``projects/<ep>/`` prefix: locate unique ``**/rel`` (or basename) under root."""
+    """Cite omitted ``projects/<ep>/`` prefix: locate unique ``**/rel`` (or basename) under root.
+
+    【self-evolution-bot · 2026-11-23 · 第130轮 · 模型:qwen3.8-flash】
+    为什么：本机 ``profiles/default`` 共 7398 个文件，``outputs/_view/taiben-compare.html``
+    在整根遍历中排第 5850 位，而 ``max_scan`` 默认只给 4000 → 命中被预算吃掉，
+    卡片引 ``outputs/taiben-compare.html``（少 ``_view/`` 一层）就永远 heal 不到。
+    改了什么：先扫引用路径首段所在子树（``outputs/`` 仅 306 个文件，实测 0.1s 级命中），
+    子树未命中再回落整根遍历；扫描预算与 deadline 跨两段累计，不放大开销。
+    """
     import time
 
     norm = str(rel_or_name or "").replace("\\", "/").strip().strip("/")
@@ -453,33 +519,61 @@ def _fuzzy_locate_under_workspace(
         return None
     suffix = "/" + norm
     name = Path(norm).name
-    suffix_hits: list[Path] = []
-    name_hits: list[Path] = []
-    scanned = 0
     deadline = (time.monotonic() + float(budget_s)) if budget_s and budget_s > 0 else None
-    for dirpath, dirnames, filenames in os.walk(root, topdown=True):
-        if deadline is not None and time.monotonic() >= deadline:
-            break
-        dirnames[:] = [
-            d
-            for d in dirnames
-            if d not in _FUZZY_LOCATE_IGNORE_DIRS and not d.startswith(".")
-        ]
-        for fn in filenames:
-            scanned += 1
+    scanned = 0
+
+    def _walk(start: Path) -> tuple[list[Path], list[Path]]:
+        nonlocal scanned
+        suffix_hits: list[Path] = []
+        name_hits: list[Path] = []
+        for dirpath, dirnames, filenames in os.walk(start, topdown=True):
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            dirnames[:] = [
+                d
+                for d in dirnames
+                if d not in _FUZZY_LOCATE_IGNORE_DIRS and not d.startswith(".")
+            ]
+            for fn in filenames:
+                scanned += 1
+                if scanned > max_scan:
+                    break
+                if deadline is not None and scanned % 64 == 0 and time.monotonic() >= deadline:
+                    break
+                p = Path(dirpath) / fn
+                rel_p = _rel_under_root(root, p)
+                if not rel_p:
+                    continue
+                rel_l = rel_p.replace("\\", "/")
+                if rel_l == norm or rel_l.endswith(suffix):
+                    suffix_hits.append(p)
+                elif name and len(name) >= 3 and fn.lower() == name.lower():
+                    name_hits.append(p)
             if scanned > max_scan:
                 break
-            if deadline is not None and scanned % 64 == 0 and time.monotonic() >= deadline:
+            if deadline is not None and time.monotonic() >= deadline:
                 break
-            p = Path(dirpath) / fn
-            rel_p = _rel_under_root(root, p)
-            if not rel_p:
-                continue
-            rel_l = rel_p.replace("\\", "/")
-            if rel_l == norm or rel_l.endswith(suffix):
-                suffix_hits.append(p)
-            elif name and len(name) >= 3 and fn.lower() == name.lower():
-                name_hits.append(p)
+        return suffix_hits, name_hits
+
+    # Narrow first: the cited path's leading segment is usually an existing subtree.
+    lead = norm.split("/", 1)[0] if "/" in norm else ""
+    start_dirs: list[Path] = []
+    if lead:
+        sub = root / lead
+        try:
+            if sub.is_dir():
+                start_dirs.append(sub)
+        except OSError:
+            pass
+    start_dirs.append(root)
+
+    suffix_hits: list[Path] = []
+    name_hits: list[Path] = []
+    for start in start_dirs:
+        s_hits, n_hits = _walk(start)
+        if s_hits or n_hits:
+            suffix_hits, name_hits = s_hits, n_hits
+            break
         if scanned > max_scan:
             break
         if deadline is not None and time.monotonic() >= deadline:
@@ -576,13 +670,16 @@ def _heal_missing_workspace_file_target(
     if root_s:
         root_path = Path(root_s).expanduser()
         locate_keys = list(candidates)
-        # basename fallback after collapse
+        # 【self-evolution-bot · 2026-11-23 · 第130轮 · 模型:qwen3.8-flash】
+        # 为什么：原来只塞 basename，整根扫 4000 个文件就耗尽预算（本机第 5850 位命中），
+        # 带 ``outputs/`` 前缀的相对路径根本没进候选，卡片少一层目录永远打不开。
+        # 改了什么：先放引用路径本身（窄扫首段子树即可命中），再放 collapsed，最后才是 basename。
+        if cited_norm and cited_norm not in locate_keys:
+            locate_keys.insert(0, cited_norm)
         for cand in list(locate_keys):
             leaf = Path(cand).name
             if leaf and leaf not in locate_keys:
                 locate_keys.append(leaf)
-        if cited_norm and Path(cited_norm).name not in locate_keys:
-            locate_keys.append(Path(cited_norm).name)
         if max_locate_keys is not None and max_locate_keys > 0:
             locate_keys = locate_keys[: int(max_locate_keys)]
         for key in locate_keys:
@@ -663,9 +760,13 @@ def _resolve_workspace_root(root: str | None, thread_id: str | None) -> str:
     """Same resolution as code index (validated absolute workspace directory)."""
     from evoflow.code_index.store import resolve_index_root
 
-    root_s = str(root or "").strip() or None
+    raw_root = str(root or "").strip()
+    root_s = _normalize_root_hint(root)
     tid = str(thread_id or "").strip() or None
-    if not root_s and tid:
+    # 【self-evolution-bot · 2026-11-23 · 第130轮 · 模型:qwen3.8-flash】
+    # 为什么：root 是占位符时被剥成空，若该请求又没带 thread_id，仍会 400
+    # （占位符根 + 无 thread 的调用前端是可能发出的）。真·没给 root 的调用保持原报错口径不变。
+    if not root_s and (tid or "${" in raw_root):
         host = resolve_host_workspace_root_for_files(thread_id=tid)
         if host:
             root_s = host
@@ -697,6 +798,11 @@ def _resolve_workspace_file_target(
     norm = _normalize_rel_path(rel)
     if not norm:
         raise ValueError("path must name a file")
+    raw_root = str(root or "").strip()
+    root = _normalize_root_hint(root)
+    if root is None and "${" in raw_root:
+        # 占位符根视作"未绑根"：落到 host 根，与 thread 是否给全无关（同上条理由）。
+        root = resolve_host_workspace_root_for_files(thread_id=thread_id) or None
 
     # Heal drive-stripped Windows / slash-stripped POSIX *before* absolute handling.
     # Otherwise ``/dev/proj/x`` is treated as POSIX-abs and never restored to ``D:/dev/proj/x``.
@@ -1635,7 +1741,15 @@ async def serve_workspace_file(
         # Hang dumps (2026-10-30): two concurrent mp4 serves @43s/69s while a chat
         # stream ran → event_loop_stall and /health/liveness timeouts. Queue extras.
         slot = _serve_file_large_slot()
-        await slot.acquire()
+        try:
+            # 无超时 acquire + finally 泄漏即永久占死两槽 → 之后所有大文件 serve 永挂
+            # （loop 上无限等）。30s 拿不到槽直接 503，客户端可重试。
+            await asyncio.wait_for(slot.acquire(), timeout=30.0)
+        except asyncio.TimeoutError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="大文件传输通道繁忙，请稍后重试",
+            ) from exc
 
         async def _release_large_slot() -> None:
             slot.release()
@@ -1801,6 +1915,9 @@ def _index_build_response(data: dict) -> IndexBuildResponse:
         build_progress_pct=data.get("build_progress_pct"),
         build_phase=data.get("build_phase"),
         updated_at=data.get("updated_at"),
+        # 【self-evolution-bot · 2026-11-17 · 第31轮】同 IndexBuildResponse 注释
+        stale_reasons=data.get("stale_reasons"),
+        vector_available=data.get("vector_available"),
     )
 
 
@@ -1839,7 +1956,9 @@ async def workspace_index_status(
     try:
         from evoflow.code_index.store import index_status
 
-        data = index_status(root_s, thread_id=tid)
+        # 每次调用都会开 SQLite 连接 + schema 检查 + 全表 COUNT；前端 building 时 2s/稳态 15s
+        # 轮询本端点——禁止同步跑在事件循环上（历史上是网关周期性卡顿来源）。
+        data = await asyncio.to_thread(index_status, root_s, thread_id=tid)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return _index_build_response(data)
@@ -1855,7 +1974,10 @@ async def warm_workspace_index(body: IndexBuildRequest) -> IndexBuildResponse:
     try:
         from evoflow.code_index.store import schedule_build_index
 
-        data = schedule_build_index(root_s, thread_id=thread_id, force=bool(body.force))
+        # 非 force 时 schedule 内部先跑一次 index_status（SQLite COUNT），放线程。
+        data = await asyncio.to_thread(
+            schedule_build_index, root_s, thread_id=thread_id, force=bool(body.force)
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except OSError as e:
@@ -1906,7 +2028,9 @@ async def index_workspace_file(body: IndexFileRequest) -> IndexFileResponse:
     try:
         from evoflow.code_index.store import index_file
 
-        data = index_file(
+        # 单文件解析 + SQLite 写，放 worker 线程。
+        data = await asyncio.to_thread(
+            index_file,
             root_s,
             relative_path=rel,
             thread_id=thread_id,
@@ -2004,6 +2128,34 @@ async def find_workspace_files(
     )
 
 
+def _soft_miss_index_search(query: str, *, message: str) -> IndexSearchResponse:
+    return IndexSearchResponse(
+        query=query,
+        hits=[],
+        symbols=[],
+        related_files=[],
+        ready=None,
+        building=None,
+        message=message,
+    )
+
+
+def _log_code_index_search_slow(*, kind: str, query: str, root: str | None, duration_s: float | None = None) -> None:
+    try:
+        from app.gateway.hang_diagnostics import append_gateway_slow_log
+
+        append_gateway_slow_log(
+            kind=kind,
+            method="GET",
+            path="/api/workspaces/search",
+            query=f"q={query[:80]}&root={(root or '')[:120]}",
+            duration_s=duration_s,
+            status_code=200,
+        )
+    except Exception:
+        pass
+
+
 @router.get("/search", response_model=IndexSearchResponse)
 async def search_workspace_index(
     request: Request,
@@ -2021,16 +2173,68 @@ async def search_workspace_index(
         raise HTTPException(status_code=400, detail="root or thread_id is required")
     if not query:
         raise HTTPException(status_code=400, detail="q is required")
+
+    # Cap fan-out: settings graph can fire personal + monorepo search together.
+    slot = _code_index_search_slot()
+    acquired = False
+    try:
+        await asyncio.wait_for(slot.acquire(), timeout=_CODE_INDEX_SEARCH_ACQUIRE_S)
+        acquired = True
+    except TimeoutError:
+        logger.warning("code-index search slot busy q=%s root=%s", query[:80], (root_s or "")[:160])
+        _log_code_index_search_slow(kind="code_index_search_shed", query=query, root=root_s, duration_s=0.0)
+        return _soft_miss_index_search(query, message="索引搜索繁忙，请稍后重试")
+
     try:
         from evoflow.code_index.store import index_status, search_index
 
-        data = search_index(root_s, query, thread_id=tid, limit=limit)
+        # 全网关最重的同步端点：FTS + 语义 encode + 索引未就绪时 _wait_index_ready 会
+        # time.sleep 轮询（traffic_lanes 记录过 200s+ 占用）+ 30s 一次的全仓 source_drift
+        # 扫描——必须整体放独立线程池，并加墙钟，否则一次搜索冻结全部事件循环。
+        loop = asyncio.get_running_loop()
+        data = await asyncio.wait_for(
+            loop.run_in_executor(
+                _CODE_INDEX_SEARCH_EXECUTOR,
+                lambda: search_index(root_s, query, thread_id=tid, limit=limit),
+            ),
+            timeout=_CODE_INDEX_SEARCH_WALL_S,
+        )
+    except TimeoutError:
+        logger.warning(
+            "code-index search timed out after %.1fs q=%s root=%s",
+            _CODE_INDEX_SEARCH_WALL_S,
+            query[:80],
+            (root_s or "")[:160],
+        )
+        _log_code_index_search_slow(
+            kind="code_index_search_timeout",
+            query=query,
+            root=root_s,
+            duration_s=_CODE_INDEX_SEARCH_WALL_S,
+        )
+        return _soft_miss_index_search(
+            query,
+            message=f"索引搜索超时（{_CODE_INDEX_SEARCH_WALL_S:.0f}s），请缩小范围或稍后重试",
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+    finally:
+        if acquired:
+            slot.release()
+
     hits = [IndexSearchHit(**h) for h in (data.get("hits") or [])]
     symbols = [IndexSymbolHit(**s) for s in (data.get("symbols") or [])]
     related = [IndexSearchHit(**h) for h in (data.get("related_files") or []) if isinstance(h, dict)]
-    st = index_status(workspace_root=root_s, thread_id=tid)
+    try:
+        st = await asyncio.wait_for(
+            asyncio.get_running_loop().run_in_executor(
+                _CODE_INDEX_SEARCH_EXECUTOR,
+                lambda: index_status(workspace_root=root_s, thread_id=tid),
+            ),
+            timeout=2.0,
+        )
+    except TimeoutError:
+        st = {}
     ready = bool(data.get("ready")) if data.get("ready") is not None else bool(st.get("ready"))
     building = bool(data.get("building")) if data.get("building") is not None else bool(st.get("building"))
     rebuild_in_progress = bool(data.get("rebuild_in_progress"))
@@ -2069,7 +2273,7 @@ async def put_user_workspace_history(request: Request, body: UserWorkspaceHistor
         ps = str(p or "").strip()
         if ps:
             require_workspace_path_visible(request, ps)
-    ws_repo.set_global_workspace_paths(body.paths or [], stamp=stamp or None)
+    await asyncio.to_thread(ws_repo.set_global_workspace_paths, body.paths or [], stamp=stamp or None)
     return UserWorkspaceHistoryResponse(paths=_visible_history_paths(request))
 
 
@@ -2078,7 +2282,7 @@ async def remove_user_workspace_path(request: Request, body: RemoveWorkspacePath
     path = str(body.path or "").strip()
     if path:
         require_workspace_path_visible(request, path)
-        ws_repo.remove_workspace_path_everywhere(path)
+        await asyncio.to_thread(ws_repo.remove_workspace_path_everywhere, path)
     return UserWorkspaceHistoryResponse(paths=_visible_history_paths(request))
 
 

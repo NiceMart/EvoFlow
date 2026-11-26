@@ -10,8 +10,77 @@ import {
   logRightStageTrigger,
 } from './panel-set-debug-log.js'
 import { getCurrentRightStageSessionKey } from './right-stage-scope.js'
+// 【self-evolution-bot · 2026-11-20 · 第87轮 · 模型:deepseek-v4.1-flash-1017】
+// 改了什么：自动开栏判据改为**优先问后端契约**（getCachedRightPanelContract），
+// 下面两个 Set 退化为「后端契约还没拉到时」的兜底。
+// 为什么：用户要求前后端不能各写一套。只把两份集合对齐仍是双写——后端加了
+// 新动作、前端不改就静默漂移；改成读契约后，真源只剩后端一份。
+import { getCachedRightPanelContract } from './right-panel-contract.js'
 import { rightStageStore } from './right-stage-store.js'
 import { normalizeRightStageKind, type RightStageSurface } from './right-stage-types.js'
+
+/**
+ * 自动展开白名单 —— 与后端 evoflow/stage/right_panel_kinds.py 同一份语义。
+ *
+ * 【self-evolution-bot · 2026-11-20 · 第87轮 · 模型:deepseek-v4.1-flash-1017】
+ * 改了什么：把「哪些动作允许自动展开右栏」集中成两个常量，替代原先散在
+ * shouldAutoOpenAction / EAGER_* 里的多串硬编码。
+ * 为什么：同一规则曾在前后端各写一份且已漂移。此处是**前端只读副本**，
+ * 真源在后端；后端不可达时前端仍用这份兜底，保证不会因为拉不到契约就
+ * 退回「全部自动弹」的旧行为。
+ *
+ * 维护约定：改动必须同时改后端 right_panel_kinds.py，并在
+ * backend/tests/test_platform_ui_feedback_open_stage.py 有对应断言。
+ */
+const AUTO_OPEN_ACTIONS = new Set([
+  'employees.wake',
+  'employees.dispatch',
+  'employees.resume',
+  'employees.chat_send',
+  // 【self-evolution-bot · 2026-11-20 · 第88轮 · 模型:deepseek-v4.1-flash-1017】
+  // 改了什么：补进 employees.update / tasks.create / tasks.set_state。
+  // 为什么：后端第88轮把这几个原本写死在 platform_ui_feedback 调用点里的写动作
+  // 收进了真源 AUTO_OPEN_ACTIONS（同时把 employees.get/brief、tasks.get 移出自动开）。
+  // 兜底表必须与后端同口径，否则「后端契约还没拉到的启动瞬间」两端口径打架。
+  // 注：tasks.update 不存在于平台注册表（只有 tasks.set_state），已删，别再加回来。
+  'employees.create',
+  'employees.hire',
+  'employees.update',
+  'items.dispatch',
+  'tasks.create',
+  'tasks.set_state',
+  'workflow.run',
+  'workflow.resume',
+  'workflow.recover',
+])
+
+/** 纯只读动作：只发通知卡，永不自动展开右栏。 */
+const READ_ONLY_ACTIONS = new Set([
+  'employees.get',
+  'employees.brief',
+  'employees.list',
+  'employees.departments',
+  'employees.org_status',
+  'employees.board_overview',
+  'employees.messages',
+  'tasks.get',
+  'tasks.list',
+  'tasks.execution_trail',
+  'items.get',
+  'items.list',
+  // 【self-evolution-bot · 2026-11-20 · 第88轮 · 模型:deepseek-v4.1-flash-1017】
+  // 改了什么：与后端 READ_ONLY_ACTIONS 同步补 9 条（注册表 risk=read 但先前未登记）。
+  // 为什么：前后端动作表已有逐条对账门禁，不同步会红。
+  'employees.bind_channel_poll',
+  'employees.trail',
+  'employees.worklog',
+  'workflow.get',
+  'workflow.list',
+  'workflow.list_runs',
+  'workflow.revisions',
+  'workflow.run_status',
+  'workflow.schema',
+])
 
 function safePreviewObj(raw: unknown): string {
   try {
@@ -377,9 +446,35 @@ export function tryAutoOpenPlatformProgress(
       base.action === 'workflow.resume' ||
       base.action === 'workflow.recover' ||
       base.action === 'workflow.run_status')
+  // 【self-evolution-bot · 2026-11-21 · 第104轮 · 模型:deepseek-v4.1-flash-1017】
+  // 改了什么：把「用户主动喊某个员工干活」这一类动作也纳入 forceExpand，
+  //   视同用户亲手操作——立刻切到那场对话，不再只建签。
+  // 为什么（本轮真机实测，用户原话「新打开的也没有显示最新的，也没有进行切换」）：
+  //   10:45:50 我 chat_send 给情绪陪伴Bot，10:45:59 上报 tabs=4 且新签已在列，
+  //   但 activeKey 三次上报都还是 shell-page:shell:/tasks；直到 10:46:23 才变过去。
+  //   根因就是这里：只有 workflow.* 放行 forceExpand，其余 autoOpen 走
+  //   expandUnlessUserCollapsed() —— 只展开不切签；而 store.show 的
+  //   shouldActivate = forceExpand || !pinAlive，用户钉过任何签就永远不切。
+  //   用户刚说完话，最想看的就是对方回应；这不是「系统后台弹窗抢视线」，
+  //   是用户自己发起的动作，必须切过去。
+  // 判据：调用方由用户发起（chat_send / dispatch / hire / resume / wake / create）
+  //   一律 forceExpand；纯后台推送（生图完成、检查点落盘）保持不抢。
+  const USER_INITIATED_CHAT_ACTIONS = new Set([
+    'employees.chat_send',
+    'employees.dispatch',
+    'employees.hire',
+    'employees.resume',
+    'employees.wake',
+    'employees.create',
+    'items.dispatch',
+    'tasks.create',
+    'tasks.set_state',
+  ])
+  const userInitiatedOpen = USER_INITIATED_CHAT_ACTIONS.has(String(base.action || '').trim())
+  const forceExpandOpen = forceWorkflowLive || userInitiatedOpen
   const tabId = openProgressFromPanelSet(hit.openStage, {
     sessionKey: ownerSk || undefined,
-    forceExpand: forceWorkflowLive,
+    forceExpand: forceExpandOpen,
   })
   if (!tabId) {
     logRightStageTrigger('maybeAutoOpenPlatformProgress failed', {
@@ -389,7 +484,7 @@ export function tryAutoOpenPlatformProgress(
     })
     return { opened: false, reason: 'openProgress-failed', tabId: '', ...base }
   }
-  if (forceWorkflowLive) {
+  if (forceExpandOpen) {
     rightStageStore.expand()
   } else {
     // 用户刚点收起时不要强行撑开（否则收起钮像失灵）。
@@ -399,7 +494,7 @@ export function tryAutoOpenPlatformProgress(
     .then((m) => {
       if (!m.isXwVoiceMode?.()) return
       m.allowXwVoiceSummary?.()
-      if (forceWorkflowLive) rightStageStore.expand()
+      if (forceExpandOpen) rightStageStore.expand()
       else rightStageStore.expandUnlessUserCollapsed()
     })
     .catch(() => {})
@@ -507,29 +602,41 @@ function shellPageAction(opts: {
   return out
 }
 
-/** 写成功 / 查看详情·近况·名册 且无进度抢栏时：详情页 shell-page + autoOpen */
-function shouldAutoOpenShellPage(action: string): boolean {
-  return (
-    action === 'employees.create' ||
-    action === 'employees.hire' ||
-    action === 'employees.update' ||
-    action === 'employees.get' ||
-    action === 'employees.brief' ||
-    action === 'employees.list' ||
-    action === 'employees.org_status' ||
-    action === 'employees.board_overview' ||
-    action === 'tasks.update' ||
-    action === 'tasks.set_state' ||
-    action === 'tasks.get' ||
-    action === 'tasks.list' ||
-    action === 'items.create' ||
-    action === 'items.update' ||
-    action === 'items.get' ||
-    action === 'items.list'
-  )
+/**
+ * 是否允许「只读壳页」自动展开右栏。
+ *
+ * 【self-evolution-bot · 2026-11-20 · 第87轮 · 模型:deepseek-v4.1-flash-1017】
+ * 改了什么：从「一长串 if 动作名」改成只认后端同一份闸门（AUTO_OPEN_ACTIONS）。
+ * 为什么：用户 2026-11-20 要求「前端跟后端架构不能是混乱的」。原来这里硬编码
+ * 16 个动作（含 employees.list / tasks.list / items.get 等纯只读），和后端
+ * platform_ui_feedback.py 的白名单各写一份，已经漂移。现在只读动作统一返回 false，
+ * 前端不再自行推导「该不该弹」——真正的自动展开判定在后端 CTA 的 autoOpen 字段。
+ */
+function shouldAutoOpenAction(action: string): boolean {
+  const act = String(action || '').trim()
+  if (!act) return false
+  // 真源优先：后端契约一旦拉到位，就完全按后端给的两张清单判定。
+  const contract = getCachedRightPanelContract()
+  if (contract && contract.ok) {
+    if (contract.readOnlyActions.includes(act)) return false
+    return contract.autoOpenActions.includes(act)
+  }
+  // 契约还没拉到（启动瞬间 / 后端不可达）：退回本地兜底表，语义与后端一致。
+  if (READ_ONLY_ACTIONS.has(act)) return false
+  return AUTO_OPEN_ACTIONS.has(act)
 }
 
-/** 派活 / 叫醒 / 续聊：args 阶段即可挂员工过程（不必等 RESULT） */
+/**
+ * 派活 / 叫醒 / 续聊：args 阶段即可挂员工过程（不必等 RESULT）。
+ *
+ * 【self-evolution-bot · 2026-11-20 · 第88轮 · 模型:deepseek-v4.1-flash-1017】
+ * 改了什么：这张表从「独立白名单 + 直接写 autoOpen:true」改为「只声明 eager 时机」，
+ * 是否自动展开一律先问 shouldAutoOpenAction()（真源优先），本表不再单独决定开不开。
+ * 为什么：它不经过判据就直接 autoOpen:true，是同一文件里第 5 处绕过真源的私有白名单。
+ * 当前 4 个动作恰好都在 AUTO_OPEN_ACTIONS 里，所以「看起来对」——
+ * 但那是巧合：哪天真源把某个移出自动开，这里照样会弹，且没有任何测试会红。
+ * 门禁：test_eager_list_is_subset_of_auto_open（后端对账文件）。
+ */
 const EAGER_EMPLOYEE_PROCESS_ACTIONS = new Set([
   'employees.wake',
   'employees.dispatch',
@@ -593,7 +700,8 @@ export function tryEagerAutoOpenPlatformFromArgs(
     entityId
 
   let ui: PlatformUiFeedback | null = null
-  if (EAGER_EMPLOYEE_PROCESS_ACTIONS.has(action) && entityId) {
+  // 真源兜底：本表只声明「args 阶段就能挂过程」，开不开一律由 shouldAutoOpenAction 定。
+  if (EAGER_EMPLOYEE_PROCESS_ACTIONS.has(action) && entityId && shouldAutoOpenAction(action)) {
     const taskId =
       asString(args.task_id) || asString(args.taskId) || asString(args.related_task_id) || `live:${entityId}`
     const sessionKey = asString(args.session_key) || asString(args.sessionKey)
@@ -624,7 +732,7 @@ export function tryEagerAutoOpenPlatformFromArgs(
         },
       ],
     }
-  } else if (shouldAutoOpenShellPage(action)) {
+  } else if (shouldAutoOpenAction(action)) {
     // actions 留空：enrichShellPageOpenStages 按 action 补 shell-page + autoOpen
     ui = {
       kind: 'success',
@@ -682,7 +790,7 @@ export function enrichShellPageOpenStages(ui: PlatformUiFeedback): PlatformUiFee
     openStage: a.openStage ? { ...a.openStage, data: a.openStage.data ? { ...a.openStage.data } : a.openStage.data } : undefined,
   }))
   const hasProgressStage = actions.some((a) => isProgressOpenStageKind(a.openStage?.kind))
-  const autoOk = shouldAutoOpenShellPage(action) && !hasProgressStage
+  const autoOk = shouldAutoOpenAction(action) && !hasProgressStage
 
   let touched = false
   for (const a of actions) {
@@ -749,11 +857,7 @@ export function enrichShellPageOpenStages(ui: PlatformUiFeedback): PlatformUiFee
           mountId: 'employees.board',
           title: 'BOT',
           entityLabel: 'BOT',
-          autoOpen:
-            autoOk ||
-            action === 'employees.list' ||
-            action === 'employees.org_status' ||
-            action === 'employees.board_overview',
+          autoOpen: autoOk,
         }),
       )
       touched = true
@@ -823,12 +927,12 @@ export function enrichShellPageOpenStages(ui: PlatformUiFeedback): PlatformUiFee
             entityLabel: entityLabel || '待办',
             focusId: focus || undefined,
             route: focus ? `/tasks?tab=items&focus=${encodeURIComponent(focus)}` : '/tasks?tab=items',
-            autoOpen:
-              autoOk ||
-              action === 'items.list' ||
-              action === 'items.create' ||
-              action === 'items.update' ||
-              action === 'items.get',
+            // 【self-evolution-bot · 2026-11-20 · 第87轮 · 模型:deepseek-v4.1-flash-1017】
+            // 改了什么：删掉 `autoOk || action === 'items.list' | 'items.create' | 'items.update'
+            // | 'items.get'` 这条硬编码 OR。
+            // 为什么：这 4 个动作一条都不在 AUTO_OPEN_ACTIONS 里（后端真源
+            // should_auto_open 也全返 False），硬编码 OR 把统一判据整个绕过了——
+            // 用户「只读查询也自动弹右栏、莫名其妙打开」就是这么来的。现在一律听 autoOk。
           }),
         )
       } else {
@@ -841,7 +945,11 @@ export function enrichShellPageOpenStages(ui: PlatformUiFeedback): PlatformUiFee
             title: '任务',
             entityLabel: '任务',
             route: '/tasks',
-            autoOpen: autoOk || action === 'tasks.list',
+            // 【self-evolution-bot · 2026-11-20 · 第88轮 · 模型:deepseek-v4.1-flash-1017】
+            // 改了什么：删掉 `|| action === 'tasks.list'`。
+            // 为什么：tasks.list 是 READ_ONLY_ACTIONS 成员，这一条让「列一下任务」也撑开
+            // 右栏，与后端 should_auto_open 直接矛盾。同型绕过本文件已发现 3 处，全部只认 autoOk。
+            autoOpen: autoOk,
           }),
         )
       }
@@ -968,7 +1076,11 @@ export function enrichShellPageOpenStages(ui: PlatformUiFeedback): PlatformUiFee
         continue
       }
       a.label = a.label || '打开工作流'
-      a.autoOpen = a.autoOpen === true || action === 'workflow.run'
+      // 【self-evolution-bot · 2026-11-20 · 第88轮 · 模型:deepseek-v4.1-flash-1017】
+      // 改了什么：删掉 `|| action === 'workflow.run'`。
+      // 为什么：workflow.run 已在 AUTO_OPEN_ACTIONS 里，autoOk 已经会为真；
+      // 单写一条只会让「autoOk 为假」的情况下（例如它被移出白名单）仍然强开，属绕过判据。
+      a.autoOpen = a.autoOpen === true || autoOk
       a.openStage = {
         kind: 'collab-workflow',
         data: { mainTaskId: tid },
@@ -987,7 +1099,12 @@ export function enrichShellPageOpenStages(ui: PlatformUiFeedback): PlatformUiFee
     ) {
       actions.unshift({
         label: '打开工作流',
-        autoOpen: true,
+        // 【self-evolution-bot · 2026-11-20 · 第88轮 · 模型:deepseek-v4.1-flash-1017】
+        // 改了什么：`autoOpen: true` → `autoOpen: autoOk`。
+        // 为什么：这一支包含 workflow.run_status（read，只在 READ_ONLY_ACTIONS），
+        // 原来无条件 true，等于「查个运行状态也撑开右栏」。workflow.run/resume/recover
+        // 已在白名单里，autoOk 自然为真，行为不变。
+        autoOpen: autoOk,
         openStage: { kind: 'collab-workflow', data: { mainTaskId: tid } },
       })
       touched = true
@@ -1010,7 +1127,7 @@ function buildActions(action: string, domain: string, entityId: string): Platfor
         title: '待办',
         entityLabel: '待办',
         route: '/tasks?tab=items',
-        autoOpen: shouldAutoOpenShellPage(action),
+        autoOpen: shouldAutoOpenAction(action),
       }),
     ]
   }
@@ -1023,7 +1140,7 @@ function buildActions(action: string, domain: string, entityId: string): Platfor
         title: '待办',
         focusId: entityId,
         route: `/tasks?tab=items&focus=${encodeURIComponent(entityId)}`,
-        autoOpen: shouldAutoOpenShellPage(action),
+        autoOpen: shouldAutoOpenAction(action),
       }),
     ]
   }
@@ -1035,7 +1152,7 @@ function buildActions(action: string, domain: string, entityId: string): Platfor
         mountId: 'tasks.board',
         title: '任务',
         entityLabel: '任务',
-        autoOpen: shouldAutoOpenShellPage(action),
+        autoOpen: shouldAutoOpenAction(action),
       }),
     ]
   }
@@ -1045,7 +1162,7 @@ function buildActions(action: string, domain: string, entityId: string): Platfor
         label: '查看任务',
         path: `/task/${entityId}`,
         mountId: 'tasks.detail',
-        autoOpen: shouldAutoOpenShellPage(action),
+        autoOpen: shouldAutoOpenAction(action),
       }),
     ]
   }
@@ -1062,7 +1179,7 @@ function buildActions(action: string, domain: string, entityId: string): Platfor
         mountId: 'employees.board',
         title: 'BOT',
         entityLabel: 'BOT',
-        autoOpen: shouldAutoOpenShellPage(action),
+        autoOpen: shouldAutoOpenAction(action),
       }),
     ]
   }
@@ -1072,7 +1189,7 @@ function buildActions(action: string, domain: string, entityId: string): Platfor
         label: '查看 BOT',
         path: `/proactive/${entityId}`,
         mountId: 'employees.detail',
-        autoOpen: shouldAutoOpenShellPage(action),
+        autoOpen: shouldAutoOpenAction(action),
       }),
     ]
   }
@@ -1104,6 +1221,8 @@ function inferPlatformUiFeedbackFallback(
   const action = asString(obj.action)
   if (!action || !action.includes('.')) return null
   const [domain, verb] = action.split('.', 2)
+  // ui.*（panel/show/hide/…）全是界面操控，不要冒「ui操作成功」toast / 反馈卡
+  if (domain === 'ui') return null
   // 普通只读不发反馈；查看详情 / 列表要能开 shell-page
   if (
     !domain ||
@@ -1403,6 +1522,46 @@ export function platformUiToRunEntry(ui: PlatformUiFeedback, toolCallId?: string
     toolCallId: toolCallId || undefined,
     appliedAt: Date.now(),
   }
+}
+
+/**
+ * Live RESULT / tools-scan store bare toolCallId; chat_artifacts may only have
+ * ``platform:<toolCallId>``. Check / mark both so a later scan cannot treat the
+ * same op as fresh and re-toast / re-open the summary bubble.
+ */
+export function platformFeedbackSeenKeys(...ids: Array<string | null | undefined>): string[] {
+  const out: string[] = []
+  const push = (raw: string) => {
+    const s = String(raw || '').trim()
+    if (!s || out.includes(s)) return
+    out.push(s)
+    if (s.startsWith('platform:')) {
+      const bare = s.slice('platform:'.length).trim()
+      if (bare && !out.includes(bare)) out.push(bare)
+    } else {
+      const prefixed = `platform:${s}`
+      if (!out.includes(prefixed)) out.push(prefixed)
+    }
+  }
+  for (const id of ids) push(String(id || ''))
+  return out
+}
+
+export function hasPlatformFeedbackSeen(
+  seen: Set<string>,
+  ...ids: Array<string | null | undefined>
+): boolean {
+  for (const key of platformFeedbackSeenKeys(...ids)) {
+    if (seen.has(key)) return true
+  }
+  return false
+}
+
+export function markPlatformFeedbackSeen(
+  seen: Set<string>,
+  ...ids: Array<string | null | undefined>
+): void {
+  for (const key of platformFeedbackSeenKeys(...ids)) seen.add(key)
 }
 
 export function mergePlatformRunEntries(
@@ -1724,7 +1883,7 @@ export function syncPlatformFeedbackFromTools(
     if (toolIsRunning(tool)) continue
 
     const toolCallId = asString(tool.id || tool.tool_call_id || tool.toolCallId)
-    if (!toolCallId || seen.has(toolCallId)) continue
+    if (!toolCallId || hasPlatformFeedbackSeen(seen, toolCallId)) continue
 
     const output = toolPlatformOutput(tool)
     if (!output.trim()) continue
@@ -1753,11 +1912,11 @@ export function syncPlatformFeedbackFromTools(
               }
             })()
           : ''
-      if (effect === 'employee_chat_send') seen.add(toolCallId)
+      if (effect === 'employee_chat_send') markPlatformFeedbackSeen(seen, toolCallId)
       continue
     }
 
-    seen.add(toolCallId)
+    markPlatformFeedbackSeen(seen, toolCallId, result.entries?.[0]?.id)
     shown.push(result.ui)
     entries = result.entries
     // tools 列表扫描也可能是首个见到结果的路径（早于 AG-UI RESULT 发布）；

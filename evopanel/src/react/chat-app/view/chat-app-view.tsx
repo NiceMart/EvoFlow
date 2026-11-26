@@ -5,17 +5,24 @@
 import {
   useState,
   useEffect,
+  useSyncExternalStore,
   type ReactNode,
   type MouseEvent as ReactMouseEvent,
 } from 'react'
+import {
+  getChatHostVisible,
+  subscribeChatHostVisible,
+} from '../../../lib/chat-host-visibility.js'
 import type { DisplayRow } from '../../chat-types.js'
 import { ModelCatalogMenu } from '../../components/ModelCatalogMenu.js'
 import { ShellSessionListHost } from '../../components/ShellSessionListHost.js'
 import { ChatMessageStreamPane } from '../../components/ChatMessageStreamPane.js'
-import { V4StreamRowsBridge, retryEvoflowV4Session } from '../../v4/V4StreamRowsBridge.js'
+import { retryEvoflowV4Session } from '../../v4/V4StreamRowsBridge.js'
+import { V4ChatHostStack } from '../../v4/V4ChatHostStack.js'
+import { V4ViewportDebugOverlay } from '../../v4/V4ViewportDebugOverlay.js'
 import { V4ZCodeTimeline } from '../../v4/V4ZCodeTimeline.js'
 import { ConversationCompactTipBanner } from '../../v4/ConversationCompactTipBanner.js'
-import { resolveSessionBusyFromControl } from '../../v4/control-busy.js'
+import { resolveHostTimelineBusy } from '../../v4/control-busy.js'
 import { getV4TimelineBusy, setV4TimelineBusy } from '../../v4/v4-timeline-busy-store.js'
 import { isSessionRecoveryCooldownActive } from '../../lib/stream-reattach-cooldown.js'
 import { XiaomiVoiceStage } from '../../right-stage/kinds/XiaomiVoiceStage.js'
@@ -28,7 +35,7 @@ import {
 } from '../../../lib/right-stage/open-right-stage-file.js'
 import { showRightStageBrowserUrl } from '../../../lib/right-stage/open-right-stage-browser.js'
 import { isEvoflowChatV4Enabled } from '../../v4/v4Gate.js'
-import { v4WindowHasUserText } from '../../v4/optimisticUserInput.js'
+import { getPendingOptimisticMessageId, v4WindowHasUserText } from '../../v4/optimisticUserInput.js'
 import { resolveChatPaneMode } from '../../lib/chat-pane-mode.js'
 import { logV4Life } from '../../lib/v4-lifecycle-log.js'
 import { noteStreamStopUiIdle } from '../../lib/stream-stop-log.js'
@@ -66,22 +73,46 @@ import { MemoryRecallChip } from '../../components/MemoryRecallChip.js'
 import { ImagePreviewModal, type ImagePreviewItem } from '../../components/ImagePreviewModal.js'
 import { TauriWindowControls } from '../../components/TauriWindowControls.js'
 import { HoverBubble, HoverBubbleProvider } from '../../components/HoverBubble.js'
-import { ChatHeaderHelpMenu, renderSessionHistoryRefreshButton } from './header-chrome.js'
+import { ChatHeaderHelpMenu } from './header-chrome.js'
 
 export type ChatAppViewCtx = Record<string, any>
+
+/**
+ * Chat 工作台可见时才挂 RightStagePanel；功能页由 GlobalRightStageHost 接手，避免双挂载。
+ */
+function ChatOwnedRightStage(props: {
+  open: boolean
+  panel: ReactNode
+  resizeHandle?: ReactNode
+}) {
+  const chatVisible = useSyncExternalStore(
+    subscribeChatHostVisible,
+    getChatHostVisible,
+    () => true,
+  )
+  if (!props.open || !chatVisible) return null
+  return (
+    <>
+      {props.resizeHandle || null}
+      {props.panel}
+    </>
+  )
+}
 
 /** V4 权威窗口已出现同文案 userInput 时清掉 pending，避免乐观气泡叠第二次。 */
 function ClearPendingOptimisticOnV4Echo(props: {
   pendingText: string
-  windowRows: ReadonlyArray<{ kind?: string; text?: string }> | null | undefined
+  /** 在途发送的稳定消息 id：entityId 精确认领优先，文本匹配兜底。 */
+  pendingMessageId?: string | null
+  windowRows: ReadonlyArray<{ kind?: string; text?: string; entityId?: string }> | null | undefined
   onClear: (() => void) | undefined
 }) {
-  const { pendingText, windowRows, onClear } = props
+  const { pendingText, pendingMessageId, windowRows, onClear } = props
   useEffect(() => {
     const needle = String(pendingText || '').trim()
     if (!needle || typeof onClear !== 'function') return
-    if (v4WindowHasUserText(windowRows, needle)) onClear()
-  }, [pendingText, windowRows, onClear])
+    if (v4WindowHasUserText(windowRows, needle, pendingMessageId)) onClear()
+  }, [pendingText, pendingMessageId, windowRows, onClear])
   return null
 }
 
@@ -109,7 +140,6 @@ let _v4PrevTurnLive = false
 export function renderChatAppView(ctx: ChatAppViewCtx): ReactNode {
   /* 语音全屏模式：html[data-xw-voice='1'] 时由 CSS 接管整窗（左语音域/右标签区） */
   const [xwVoiceOn, setXwVoiceOn] = useState(() => isXwVoiceMode())
-  const [historyRefreshBusy, setHistoryRefreshBusy] = useState(false)
   useEffect(() => subscribeXwVoiceMode(setXwVoiceOn), [])
   const {
     activateRightStageTab,
@@ -201,6 +231,7 @@ export function renderChatAppView(ctx: ChatAppViewCtx): ReactNode {
     headerTokenTotals,
     historyError,
     historyHasMore,
+    historyBoundSessionKey = '',
     historyInstantPaint,
     historyLoading,
     historyLoadingOlder,
@@ -298,6 +329,10 @@ export function renderChatAppView(ctx: ChatAppViewCtx): ReactNode {
     selectedSessionKey,
     selectedSessionLive,
     selectedThreadId,
+    v4KeepAliveHosts = [],
+    v4SplitSecondary = null,
+    openV4SplitSession,
+    closeV4SplitSecondary,
     selectedSkills,
     selectedStreamPriorTurnStrip,
     selectedTurnBusy,
@@ -434,22 +469,6 @@ export function renderChatAppView(ctx: ChatAppViewCtx): ReactNode {
     wsClient,
   ])
 
-  const sessionHistoryRefreshButton =
-    !isHomeSurface && !isDeptChatSurface && String(selectedSessionKey || '').trim()
-      ? renderSessionHistoryRefreshButton({
-          busy: historyRefreshBusy,
-          disabled: !String(selectedSessionKey || '').trim(),
-          onRefresh: () => {
-            const sk = String(selectedSessionKey || '').trim()
-            if (!sk || historyRefreshBusy) return
-            setHistoryRefreshBusy(true)
-            void Promise.resolve(onShellRefreshSession(sk))
-              .catch(() => {})
-              .finally(() => setHistoryRefreshBusy(false))
-          },
-        })
-      : null
-
   return (
     <HoverBubbleProvider>
     <div
@@ -518,7 +537,6 @@ export function renderChatAppView(ctx: ChatAppViewCtx): ReactNode {
                   </span>
                 </div>
                 <div className="react-chat-header-right react-chat-header-right--mobile">
-                  {sessionHistoryRefreshButton}
                   {isDesktopTauriRuntime() ? (
                     <>
                       <span className="react-chat-header-win-sep" aria-hidden="true" />
@@ -568,7 +586,6 @@ export function renderChatAppView(ctx: ChatAppViewCtx): ReactNode {
                     {workspaceFolderGroup}
                     <span className="react-chat-header-action-sep" aria-hidden />
                     <div className="react-chat-header-action-group react-chat-header-action-group--global">
-                      {sessionHistoryRefreshButton}
                       {browserToggleButton}
                       {infoRailHeaderToggle}
                       <ChatHeaderHelpMenu />
@@ -633,7 +650,6 @@ export function renderChatAppView(ctx: ChatAppViewCtx): ReactNode {
                   </div>
                   <span className="react-chat-header-action-sep" aria-hidden />
                   <div className="react-chat-header-action-group react-chat-header-action-group--global">
-                  {sessionHistoryRefreshButton}
                   {browserToggleButton}
                   {workspaceFolderToggleButton}
                   <ChatHeaderHelpMenu />
@@ -703,217 +719,262 @@ export function renderChatAppView(ctx: ChatAppViewCtx): ReactNode {
                   sessionKey={String(selectedSessionKey || '')}
                 />
               ) : null}
-              {/* V4：对话恒用 ConversationTimeline。ChatMessageStreamPane 仅工作台首页壳。 */}
+              {/* V4：KeepAlive 多 host（对齐 ZCode 隐藏但挂载）。ChatMessageStreamPane 仅工作台首页壳。
+                  单栏时 HostStack 包在 flex-1 里，composer 稳定槽做兄弟，避免 h-full 把输入挤出。 */}
               {!isDeptChatSurface ? (
-              <V4StreamRowsBridge
-                enabled={isEvoflowChatV4Enabled() && !isHomeSurface}
-                /* 用 controller 钉住的 selectedThreadId，避免 ensure remint 导致 sessionId 连跳拆租约 */
-                sessionId={String(selectedThreadId || '').trim() || null}
+              <div
+                className={
+                  isEvoflowChatV4Enabled() && !isHomeSurface && !v4SplitSecondary
+                    ? 'relative min-h-0 flex-1'
+                    : 'contents'
+                }
               >
-                {(v4Payload, v4Phase) => {
+              <V4ChatHostStack
+                enabled={isEvoflowChatV4Enabled() && !isHomeSurface}
+                activeThreadId={String(selectedThreadId || '').trim() || null}
+                secondaryThreadId={
+                  v4SplitSecondary
+                    ? String(v4SplitSecondary.threadId || '').trim() || null
+                    : null
+                }
+                hosts={v4KeepAliveHosts}
+                onCloseSecondary={closeV4SplitSecondary}
+              >
+                {({
+                  threadId: hostThreadId,
+                  hostSessionKey,
+                  visible: hostVisible,
+                  focused: hostFocused = hostVisible,
+                  payload: v4Payload,
+                  phase: v4Phase,
+                }) => {
                   /* 发送瞬间：在 V4 时间线尾部注入乐观 userInput，绝不整树切老面板。
                      优先用 pendingOptimisticUserText（不经 setRows 全量历史），避免 flushSync 卡主线程。
-                     闲置切历史 turnLive=false 且无 pending，不会 hold，避免字墙。 */
+                     闲置切历史 turnLive=false 且无 pending，不会 hold，避免字墙。
+                     隐藏 host 仍挂载收帧；分屏副栏可见但不抢 composer/乐观。 */
+                  const hostTid = String(hostThreadId || '').trim()
                   const v4RowCount = v4Payload?.snapshot?.rows.totalCount ?? 0
+                  // KeepAlive：隐藏/显示必须是同一棵 V4ZCodeTimeline 树，禁止 early-return
+                  // 换组件（否则切走 remount → 丢滚动/测高，KeepAlive 白做；对齐 ZCode hidden pane）。
                   const v4SessionMatched =
                     !!v4Payload &&
-                    String(v4Payload.sessionId || '').trim() ===
-                      String(selectedThreadId || '').trim()
-                  // 用户刚停：冷却期内投影 canStop / phase=running 常滞后，勿再点亮停止钮与齿轮
-                  const stopRecovering = isSessionRecoveryCooldownActive(
-                    String(selectedSessionKey || '').trim(),
-                  )
+                    String(v4Payload.sessionId || '').trim() === hostTid
+                  const hostSk =
+                    String(hostSessionKey || '').trim() ||
+                    (hostFocused ? String(selectedSessionKey || '').trim() : '')
+                  const stopRecovering = isSessionRecoveryCooldownActive(hostSk)
                   // hostExecuting 只看 wire/turnPhase，禁止用 selectedTurnBusy（其含
                   // getV4TimelineBusy）——否则 SyncV4TimelineBusy 与判定互喂 → #185。
-                  const skForBusy = String(selectedSessionKey || '').trim()
-                  const rtForBusy = skForBusy ? getSessionRuntime(skForBusy) : null
+                  const rtForBusy = hostSk ? getSessionRuntime(hostSk) : null
                   const wireHostExecuting = !!(
                     rtForBusy &&
                     (isTurnBusy(rtForBusy) || isLivePostStreamOpen(rtForBusy))
                   )
-                  const timelineBusy =
-                    !stopRecovering &&
-                    v4SessionMatched &&
-                    resolveSessionBusyFromControl(v4Payload?.snapshot, {
-                      // control-first（Phase A 后 control 与快照同源）：canStop 权威；
-                      // 侧栏已 idle 时 control 终态直接收口，勿被陈旧 running 卡钉死齿轮
-                      hostExecuting: wireHostExecuting,
-                    })
-                  // 齿轮/停止：wire busy ∪ 时间线仍 streaming/工具未收口（防 sse_final 早关）
-                  const uiBusy = !!(
-                    selectedTurnBusy ||
-                    (!stopRecovering && displayTurnBusy) ||
-                    timelineBusy
-                  )
-                  const turnLive = uiBusy || selectedSessionLive
-                  // 对话运行时：右下角停止 vs 左侧列表 executing 分叉时单独落盘
-                  try {
-                    const sk = String(selectedSessionKey || '').trim()
-                    if (sk) {
-                      const sessionRow =
-                        (sessions || []).find(
-                          (s) => String(s?.sessionKey || '').trim() === sk,
-                        ) || null
-                      const rt = getSessionRuntime(sk)
-                      const listExecuting = isSessionExecuting(sk, {
-                        sessionRow,
-                      })
-                      logChatRuntimeBusyFork({
-                        sessionKey: sk,
+                  // 与 Composer 停止钮同源：uiTurnSettled / 点停冷却时，投影里陈旧
+                  // running header/tool 不得再把 sessionBusy 钉成 true，否则会出现
+                  // 「右下角已停、轮尾 ChatLoading 齿轮还在转」。
+                  const timelineBusy = resolveHostTimelineBusy({
+                    sessionMatched: v4SessionMatched,
+                    stopRecovering,
+                    settledIdle: !!rtForBusy?.uiTurnSettled,
+                    snapshot: v4Payload?.snapshot,
+                    hostExecuting: wireHostExecuting,
+                  })
+                  // 焦点栏：wire busy ∪ 时间线；分屏副栏/隐藏 host 只看本会话 control。
+                  const uiBusy = hostFocused
+                    ? !!(
+                        selectedTurnBusy ||
+                        (!stopRecovering && displayTurnBusy) ||
+                        timelineBusy
+                      )
+                    : !!timelineBusy
+                  const turnLive = hostFocused
+                    ? uiBusy || selectedSessionLive
+                    : !!timelineBusy
+                  const pendingOpt = hostFocused
+                    ? String(pendingOptimisticUserText || '').trim()
+                    : ''
+                  // 在途发送的稳定消息 id（entityId 精确认领用；随 pendingOpt 生命周期）
+                  const pendingMessageId = hostFocused
+                    ? getPendingOptimisticMessageId(selectedSessionKey)
+                    : ''
+                  const v4Window = v4Payload?.snapshot?.rows?.window
+                  let optimisticUserText: string | null = null
+                  let draftEmpty = false
+                  let useLegacyPane = false
+                  if (hostFocused) {
+                    // 对话运行时：右下角停止 vs 左侧列表 executing 分叉时单独落盘
+                    try {
+                      const sk = String(selectedSessionKey || '').trim()
+                      if (sk) {
+                        const sessionRow =
+                          (sessions || []).find(
+                            (s) => String(s?.sessionKey || '').trim() === sk,
+                          ) || null
+                        const rt = getSessionRuntime(sk)
+                        const listExecuting = isSessionExecuting(sk, {
+                          sessionRow,
+                        })
+                        logChatRuntimeBusyFork({
+                          sessionKey: sk,
+                          threadId: selectedThreadId || undefined,
+                          title: String(sessionRow?.title || '').trim() || undefined,
+                          busy: {
+                            selectedTurnBusy: !!selectedTurnBusy,
+                            displayTurnBusy: !!displayTurnBusy,
+                            timelineBusy: !!timelineBusy,
+                            uiBusy: !!uiBusy,
+                            listExecuting: !!listExecuting,
+                            v4TimelineBusy: getV4TimelineBusy(sk),
+                            recoveryCooldown: !!stopRecovering,
+                            uiTurnSettled: !!rt.uiTurnSettled,
+                            turnPhase: String(rt.turnPhase || ''),
+                            runStatus: String(sessionRow?.runStatus || ''),
+                          },
+                        })
+                      }
+                    } catch {
+                      /* best-effort */
+                    }
+                    const lastLocal =
+                      Array.isArray(rows) && rows.length > 0 ? rows[rows.length - 1] : null
+                    const lastLocalUserText =
+                      lastLocal && String(lastLocal.role || '') === 'user'
+                        ? String(lastLocal.text || '').trim()
+                        : ''
+                    const optimisticNeedle =
+                      pendingOpt || (turnLive ? lastLocalUserText : '')
+                    const hasV4UserEcho =
+                      !!optimisticNeedle &&
+                      v4WindowHasUserText(v4Window, optimisticNeedle, pendingMessageId)
+                    const awaitingV4UserEcho = !!pendingOpt && !hasV4UserEcho
+                    const localOptimisticHold =
+                      awaitingV4UserEcho &&
+                      (v4Phase === 'ready'
+                        ? v4SessionMatched
+                        : v4Phase === 'connecting' ||
+                          v4Phase === 'no-thread' ||
+                          v4Phase === 'failed')
+                    // V4 切会话不再砸空 host rows：localHasRows 必须绑定当前会话，
+                    // 否则上一会话残留行会把空草稿误判成「有内容」。
+                    const rowsBoundToSelected =
+                      String(historyBoundSessionKey || '').trim() ===
+                      String(selectedSessionKey || '').trim()
+                    const localHasRows =
+                      rowsBoundToSelected &&
+                      ((Array.isArray(rows) && rows.length > 0) || !!pendingOpt)
+                    const v4HasRows = v4SessionMatched && v4RowCount > 0
+                    optimisticUserText = localOptimisticHold ? pendingOpt : null
+                    const v4RenderSig = [
+                      selectedSessionKey,
+                      selectedThreadId,
+                      v4Phase,
+                      v4SessionMatched ? 1 : 0,
+                      v4RowCount,
+                      selectedTurnBusy ? 1 : 0,
+                      uiBusy ? 1 : 0,
+                      timelineBusy ? 1 : 0,
+                      selectedSessionLive ? 1 : 0,
+                      optimisticNeedle ? 1 : 0,
+                      hasV4UserEcho ? 1 : 0,
+                      localOptimisticHold ? 1 : 0,
+                      historyLoading ? 1 : 0,
+                      Array.isArray(rows) ? rows.length : 0,
+                    ].join('|')
+                    const turnLiveKey = String(selectedSessionKey || selectedThreadId || '')
+                    if (
+                      turnLiveKey &&
+                      _v4PrevTurnLiveKey === turnLiveKey &&
+                      _v4PrevTurnLive &&
+                      !turnLive
+                    ) {
+                      noteStreamStopUiIdle({
+                        sessionKey: selectedSessionKey,
                         threadId: selectedThreadId || undefined,
-                        title: String(sessionRow?.title || '').trim() || undefined,
-                        busy: {
-                          selectedTurnBusy: !!selectedTurnBusy,
-                          displayTurnBusy: !!displayTurnBusy,
-                          timelineBusy: !!timelineBusy,
-                          uiBusy: !!uiBusy,
-                          listExecuting: !!listExecuting,
-                          v4TimelineBusy: getV4TimelineBusy(sk),
-                          recoveryCooldown: !!stopRecovering,
-                          uiTurnSettled: !!rt.uiTurnSettled,
-                          turnPhase: String(rt.turnPhase || ''),
-                          runStatus: String(sessionRow?.runStatus || ''),
+                        detail: {
+                          selectedTurnBusy,
+                          displayTurnBusy,
+                          timelineBusy,
+                          uiBusy,
+                          selectedSessionLive,
                         },
                       })
                     }
-                  } catch {
-                    /* best-effort */
-                  }
-                  const pendingOpt = String(pendingOptimisticUserText || '').trim()
-                  const v4Window = v4Payload?.snapshot?.rows?.window
-                  const lastLocal =
-                    Array.isArray(rows) && rows.length > 0 ? rows[rows.length - 1] : null
-                  const lastLocalUserText =
-                    lastLocal && String(lastLocal.role || '') === 'user'
-                      ? String(lastLocal.text || '').trim()
-                      : ''
-                  // pending 优先；turn 进行中才回退 lastLocal——但 lastLocal 仅用于
-                  // echo 判定（清 pending），绝不触发注入：①切回瞬间 rows 还是上个
-                  // 会话的，needle 会跨会话泄漏；②超长流式回合把 userInput 行挤出
-                  // 尾部窗口后 echo 永远失败，乐观行会垫在流式回复下面几十秒
-                  // （2026-11-08 正式版实锤：「已重启了」在 2081 行快照上重复挂 20s+）。
-                  // 历史输入本就在权威流里，投影行到即显示。
-                  const optimisticNeedle =
-                    pendingOpt || (turnLive ? lastLocalUserText : '')
-                  const hasV4UserEcho =
-                    !!optimisticNeedle && v4WindowHasUserText(v4Window, optimisticNeedle)
-                  // 乐观注入只服务「本次刚点发送」的 pending；echo 后由 ClearPending… 清掉。
-                  const awaitingV4UserEcho = !!pendingOpt && !hasV4UserEcho
-                  const localOptimisticHold =
-                    awaitingV4UserEcho &&
-                    (v4Phase === 'ready'
-                      ? v4SessionMatched
-                      : v4Phase === 'connecting' ||
-                        v4Phase === 'no-thread' ||
-                        v4Phase === 'failed')
-                  const localHasRows =
-                    (Array.isArray(rows) && rows.length > 0) || !!pendingOpt
-                  const v4HasRows = v4SessionMatched && v4RowCount > 0
-                  const optimisticUserText = localOptimisticHold ? pendingOpt : null
-                  // 切会话诊断：渲染层四源的绑定状态一次看清——
-                  // ①V4 投影（phase/sessionMatched/行数）②乐观气泡（needle/echo/hold）
-                  // ③本地行（rows/lastLocalUserText）④运行计时（turnLive 绑的是哪个会话）。
-                  // 「输入在回复下面」= optimistic 注入且投影无当前轮 userInput（hasV4UserEcho=0）；
-                  // 「打开空白」= phase 停在 connecting 且 v4RowCount=0。签名变化才打一行，流式不刷屏。
-                  const v4RenderSig = [
-                    selectedSessionKey,
-                    selectedThreadId,
-                    v4Phase,
-                    v4SessionMatched ? 1 : 0,
-                    v4RowCount,
-                    selectedTurnBusy ? 1 : 0,
-                    uiBusy ? 1 : 0,
-                    timelineBusy ? 1 : 0,
-                    selectedSessionLive ? 1 : 0,
-                    optimisticNeedle ? 1 : 0,
-                    hasV4UserEcho ? 1 : 0,
-                    localOptimisticHold ? 1 : 0,
-                    historyLoading ? 1 : 0,
-                    Array.isArray(rows) ? rows.length : 0,
-                  ].join('|')
-                  const turnLiveKey = String(selectedSessionKey || selectedThreadId || '')
-                  if (
-                    turnLiveKey &&
-                    _v4PrevTurnLiveKey === turnLiveKey &&
-                    _v4PrevTurnLive &&
-                    !turnLive
-                  ) {
-                    noteStreamStopUiIdle({
-                      sessionKey: selectedSessionKey,
-                      threadId: selectedThreadId || undefined,
-                      detail: {
-                        selectedTurnBusy,
-                        displayTurnBusy,
-                        timelineBusy,
-                        uiBusy,
-                        selectedSessionLive,
-                      },
+                    if (turnLiveKey) {
+                      _v4PrevTurnLiveKey = turnLiveKey
+                      _v4PrevTurnLive = !!turnLive
+                    }
+                    if (_v4RenderStateSig !== v4RenderSig) {
+                      _v4RenderStateSig = v4RenderSig
+                      logV4Life({
+                        event: 'render_state',
+                        sessionKey: selectedSessionKey,
+                        threadId: selectedThreadId || undefined,
+                        zh: `渲染层绑定：phase=${v4Phase} matched=${v4SessionMatched ? 1 : 0} v4行=${v4RowCount} turnLive=${turnLive ? 1 : 0}(wire=${selectedTurnBusy ? 1 : 0}/ui=${uiBusy ? 1 : 0}/tl=${timelineBusy ? 1 : 0}/live=${selectedSessionLive ? 1 : 0}) 乐观针=${optimisticNeedle ? `「${optimisticNeedle.slice(0, 16)}」` : '∅'} echo=${hasV4UserEcho ? 1 : 0} 乐观挂=${localOptimisticHold ? 1 : 0} 本地行=${Array.isArray(rows) ? rows.length : 0}`,
+                        detail: {
+                          v4Phase,
+                          v4SessionMatched,
+                          v4RowCount,
+                          turnLive,
+                          selectedTurnBusy,
+                          displayTurnBusy,
+                          timelineBusy,
+                          uiBusy,
+                          selectedSessionLive,
+                          optimisticNeedle: optimisticNeedle.slice(0, 40) || null,
+                          hasV4UserEcho,
+                          localOptimisticHold,
+                          historyLoading,
+                          localRows: Array.isArray(rows) ? rows.length : 0,
+                        },
+                        skipDedupe: true,
+                      })
+                    }
+                    let knownEmptyDraft = false
+                    try {
+                      knownEmptyDraft =
+                        sessionStorage.getItem(SS_SHELL_EMPTY_DRAFT) ===
+                        String(selectedSessionKey || '').trim()
+                    } catch {
+                      knownEmptyDraft = false
+                    }
+                    const mode = resolveChatPaneMode({
+                      v4Phase,
+                      localHasRows,
+                      historyLoading,
+                      v4HasRows,
+                      isHomeSurface,
+                      localOptimisticHold,
+                      knownEmptyDraft,
                     })
+                    useLegacyPane = mode.useLegacyPane
+                    draftEmpty = mode.draftEmpty
                   }
-                  if (turnLiveKey) {
-                    _v4PrevTurnLiveKey = turnLiveKey
-                    _v4PrevTurnLive = !!turnLive
-                  }
-                  if (_v4RenderStateSig !== v4RenderSig) {
-                    _v4RenderStateSig = v4RenderSig
-                    logV4Life({
-                      event: 'render_state',
-                      sessionKey: selectedSessionKey,
-                      threadId: selectedThreadId || undefined,
-                      zh: `渲染层绑定：phase=${v4Phase} matched=${v4SessionMatched ? 1 : 0} v4行=${v4RowCount} turnLive=${turnLive ? 1 : 0}(wire=${selectedTurnBusy ? 1 : 0}/ui=${uiBusy ? 1 : 0}/tl=${timelineBusy ? 1 : 0}/live=${selectedSessionLive ? 1 : 0}) 乐观针=${optimisticNeedle ? `「${optimisticNeedle.slice(0, 16)}」` : '∅'} echo=${hasV4UserEcho ? 1 : 0} 乐观挂=${localOptimisticHold ? 1 : 0} 本地行=${Array.isArray(rows) ? rows.length : 0}`,
-                      detail: {
-                        v4Phase,
-                        v4SessionMatched,
-                        v4RowCount,
-                        turnLive,
-                        selectedTurnBusy,
-                        displayTurnBusy,
-                        timelineBusy,
-                        uiBusy,
-                        selectedSessionLive,
-                        optimisticNeedle: optimisticNeedle.slice(0, 40) || null,
-                        hasV4UserEcho,
-                        localOptimisticHold,
-                        historyLoading,
-                        localRows: Array.isArray(rows) ? rows.length : 0,
-                      },
-                      skipDedupe: true,
-                    })
-                  }
-                  let knownEmptyDraft = false
-                  try {
-                    knownEmptyDraft =
-                      sessionStorage.getItem(SS_SHELL_EMPTY_DRAFT) ===
-                      String(selectedSessionKey || '').trim()
-                  } catch {
-                    knownEmptyDraft = false
-                  }
-                  /* 面板选择：对话永不回落 ToolCallList；useLegacyPane 仅首页。 */
-                  const { useLegacyPane, draftEmpty } = resolveChatPaneMode({
-                    v4Phase,
-                    localHasRows,
-                    historyLoading,
-                    v4HasRows,
-                    isHomeSurface,
-                    localOptimisticHold,
-                    knownEmptyDraft,
-                  })
+                  // 后台/副栏 host：同步本会话 timeline busy 到侧栏（勿用 selectedSessionKey）。
+                  const busySessionKey = hostFocused
+                    ? selectedSessionKey
+                    : hostSk || selectedSessionKey
                   return (
                     <>
-                      <SyncV4TimelineBusy
-                        sessionKey={selectedSessionKey}
-                        busy={!!timelineBusy}
-                      />
-                      <ClearPendingOptimisticOnV4Echo
-                        pendingText={pendingOpt}
-                        windowRows={v4Window}
-                        onClear={
-                          typeof setPendingOptimisticUserText === 'function'
-                            ? () => setPendingOptimisticUserText('')
-                            : undefined
-                        }
-                      />
-                      {useLegacyPane ? (
+                      {busySessionKey ? (
+                        <SyncV4TimelineBusy
+                          sessionKey={busySessionKey}
+                          busy={!!timelineBusy}
+                        />
+                      ) : null}
+                      {hostFocused ? (
+                        <ClearPendingOptimisticOnV4Echo
+                          pendingText={pendingOpt}
+                          pendingMessageId={pendingMessageId || null}
+                          windowRows={v4Window}
+                          onClear={
+                            typeof setPendingOptimisticUserText === 'function'
+                              ? () => setPendingOptimisticUserText('')
+                              : undefined
+                          }
+                        />
+                      ) : null}
+                      {hostFocused && useLegacyPane ? (
               /* LEGACY：仅 isHomeSurface — 勿在此恢复主对话 ToolCallList */
               <ChatMessageStreamPane
                 rows={renderRows}
@@ -969,25 +1030,35 @@ export function renderChatAppView(ctx: ChatAppViewCtx): ReactNode {
                     <V4ZCodeTimeline
                       payload={v4Payload}
                       connecting={
-                        // no-thread 不能当永久「加载中」——否则无 tid 时转圈到死；
-                        // 交给 draftEmpty / 空态文案；connecting 只表示「已有 tid、等首帧」。
-                        v4Phase === 'connecting' || v4Phase === 'failed'
+                        hostFocused
+                          ? v4Phase === 'connecting' ||
+                            v4Phase === 'failed' ||
+                            (v4Phase === 'no-thread' && !draftEmpty)
+                          : v4Phase === 'connecting' || v4Phase === 'failed'
                       }
-                      connectionFailed={v4Phase === 'failed'}
+                      connectionFailed={hostFocused && v4Phase === 'failed'}
                       onRetryConnection={
-                        v4Phase === 'failed' && selectedThreadId
+                        hostFocused && v4Phase === 'failed' && selectedThreadId
                           ? () => retryEvoflowV4Session(String(selectedThreadId))
                           : undefined
                       }
-                      draftEmpty={draftEmpty}
-                      optimisticUserText={optimisticUserText}
-                      evoflowSessionKey={selectedSessionKey}
-                      // 左下角齿轮 ↔ 右下角停止：uiBusy（wire ∪ 时间线仍活）
+                      draftEmpty={hostFocused ? draftEmpty : false}
+                      optimisticUserText={
+                        hostFocused ? optimisticUserText : null
+                      }
+                      optimisticUserMessageId={
+                        hostFocused ? pendingMessageId || null : null
+                      }
+                      evoflowSessionKey={
+                        hostSessionKey || hostTid || selectedSessionKey
+                      }
+                      focused={hostFocused}
+                      hostVisible={hostVisible}
                       sessionBusy={uiBusy}
                       topChrome={
+                        hostFocused ? (
                         <ConversationCompactTipBanner
                           sessionKey={selectedSessionKey}
-                          // 优先用后端 context_usage.message_count；未上报时用 V4 行数兜底
                           messageCount={
                             displayContextUsage?.messageCount ??
                             (v4RowCount > 0 ? v4RowCount : undefined)
@@ -997,6 +1068,7 @@ export function renderChatAppView(ctx: ChatAppViewCtx): ReactNode {
                           sessionBusy={uiBusy}
                           onCompact={handleManualContextCompact}
                         />
+                        ) : null
                       }
                       onOpenFileLink={(target) => {
                         // 话术 Markdown 路径 pill → 右侧「文件」预览区（可关、半宽，不盖住对话）
@@ -1056,37 +1128,66 @@ export function renderChatAppView(ctx: ChatAppViewCtx): ReactNode {
                           },
                         })
                       }}
-                      onAutoOpenCodeViewers={(sources) => {
-                        showRightStageCodeViewers(sources, {
-                          sessionKey: selectedSessionKey,
-                          threadId: wsClient?.getSessionThreadId?.(selectedSessionKey || '') || '',
-                        })
-                      }}
-                      onEdit={async (target, newText) => {
-                        // ZCode 行内编辑 UI → 既有 truncate+resend（entityId = message_id）
-                        const mid = String(target?.entityId || '').trim()
-                        if (!mid) return false
-                        try {
-                          await handleEditMessage(String(newText || ''), mid)
-                          return true
-                        } catch {
-                          return false
-                        }
-                      }}
+                      onAutoOpenCodeViewers={
+                        hostFocused
+                          ? (sources) => {
+                              showRightStageCodeViewers(sources, {
+                                sessionKey: selectedSessionKey,
+                                threadId:
+                                  wsClient?.getSessionThreadId?.(
+                                    selectedSessionKey || '',
+                                  ) || '',
+                              })
+                            }
+                          : undefined
+                      }
+                      onEdit={
+                        hostFocused
+                          ? async (target, newText) => {
+                              const mid = String(target?.entityId || '').trim()
+                              if (!mid) return false
+                              try {
+                                await handleEditMessage(String(newText || ''), mid)
+                                return true
+                              } catch {
+                                return false
+                              }
+                            }
+                          : undefined
+                      }
                       toolApprovalUiDisabled={toolApprovalUiDisabled}
                       bottomDock={
-                        <div
-                          ref={setV4ComposerHostEl}
-                          data-v4-evoflow-composer-host="true"
-                          className="w-full min-w-0"
-                        />
+                        /* 分屏才把 composer 粘进 timeline；单栏走 HostStack 外稳定槽，
+                           避免 KeepAlive 切会话时 sticky dock 落在估高压短的文档流顶部。 */
+                        v4SplitSecondary && hostFocused ? (
+                          <div
+                            ref={setV4ComposerHostEl}
+                            data-v4-evoflow-composer-host="true"
+                            className="w-full min-w-0"
+                          />
+                        ) : undefined
                       }
                     />
                       )}
                     </>
                   )
                 }}
-              </V4StreamRowsBridge>
+              </V4ChatHostStack>
+              {isEvoflowChatV4Enabled() && !isHomeSurface ? (
+                <V4ViewportDebugOverlay />
+              ) : null}
+              </div>
+              ) : null}
+              {isEvoflowChatV4Enabled() &&
+              !isHomeSurface &&
+              !isDeptChatSurface &&
+              !v4SplitSecondary ? (
+                <div
+                  ref={setV4ComposerHostEl}
+                  data-v4-evoflow-composer-host="true"
+                  data-v4-evoflow-composer-host-stable="true"
+                  className="relative z-20 w-full shrink-0"
+                />
               ) : null}
             </div>
           </div>
@@ -1113,9 +1214,12 @@ export function renderChatAppView(ctx: ChatAppViewCtx): ReactNode {
                 setSubtaskTranscriptModal(null)
                 return
               }
-              // 侧栏点节点：与工作流画布同口径 → V4 右侧独立进度 tab
+              // 侧栏点节点：与工作流画布同口径 → V4 右侧独立进度 tab（须 forceExpand 才切签）
               void import('../../../lib/right-stage/open-collab-subtask-stage.js').then((m) => {
-                m.openCollabSubtaskInRightStage(next, { sessionKey: selectedSessionKey })
+                m.openCollabSubtaskInRightStage(next, {
+                  sessionKey: selectedSessionKey,
+                  forceExpand: true,
+                })
               })
             }}
             onOpenMessageFile={openMessageFilePreview}
@@ -1778,90 +1882,92 @@ export function renderChatAppView(ctx: ChatAppViewCtx): ReactNode {
             {showChatSummaryFloat
               ? renderChatSummaryPanel(chatPanelMode === 'capsule' ? 'capsule' : 'panel')
               : null}
-            {anyRightPanelOpen && layoutResizeEnabled ? (
-              <PanelResizeHandle
-                direction="vertical"
-                label="拖动调整右侧面板宽度"
-                dragging={rightPanelResizeDragging}
-                onPointerDown={onRightPanelResizePointerDown}
-              />
-            ) : null}
-            {rightStageOpen ? (
-              <RightStagePanel
-                tabs={visibleRightStageTabs}
-                activeKey={rightStageActiveKey}
-                recentClosed={rightStageRecentClosed.filter((entry) =>
-                  filterRightStageTabsForSession(
-                    [entry.tab],
-                    rightStageFilterSessionKey || selectedSessionKey,
-                  ).length > 0,
-                )}
-                onActivateTab={activateRightStageTab}
-                onCloseTab={handleCloseRightStageTab}
-                onCloseOtherTabs={handleCloseOtherRightStageTabs}
-                onCloseAllTabs={handleCloseAllRightStageTabs}
-                onReorderTab={reorderRightStageTab}
-                onReopenClosedTab={reopenRightStageTab}
-                onCollapse={handleCollapseRightStage}
-                launcherItems={rightStageLauncherItems}
-                employeeChatRoles={proactiveRolesDisplay}
-                onPickEmployeeChat={(role) => {
-                  const code = String(role.agent_code || '').trim()
-                  if (!code) return
-                  const roleName =
-                    String(role.agent_name || '').trim() ||
-                    String(role.role_name || '').trim() ||
-                    code
-                  void import('../../../lib/right-stage/open-employee-process-stage.js').then((m) => {
-                    m.openEmployeeProcessInRightStage(
-                      {
-                        taskId: `live:${code}`,
-                        agentCode: code,
-                        roleName,
-                        title: roleName,
-                        busy: false,
-                      },
-                      {
-                        sessionKey: String(selectedSessionKey || '').trim() || undefined,
-                        layout: 'wide',
-                        // 用户从启动器点名：清收起锁，避免折叠态只写签不撑开
-                        forceExpand: true,
-                      },
-                    )
-                  })
-                }}
-                sessionWorkflowTaskId={String(sidebarActiveTaskId || '').trim()}
-                onPickWorkflow={(opt) => {
-                  const tid = String(opt?.taskId || '').trim()
-                  if (!tid) return
-                  void import('../../../lib/right-stage/open-collab-workflow-stage.js').then((m) => {
-                    m.openCollabWorkflowInRightStage(
-                      {
-                        mainTaskId: tid,
-                        leadThreadId: String(opt.leadThreadId || chatThreadIdForSidebar || '').trim(),
-                        title: String(opt.title || '工作流').trim() || '工作流',
-                      },
-                      {
-                        sessionKey: String(selectedSessionKey || '').trim() || undefined,
-                        forceExpand: true,
-                      },
-                    )
-                  })
-                }}
-                onPickAgentApp={(appId) => {
-                  const id = String(appId || '').trim()
-                  if (!id) return
-                  // ctx 是 Record<string, any>，缺 handler 时 TS 不会报错；
-                  // 这里显式兜底，避免点「Agent 应用」时抛 ReferenceError 静默失败。
-                  if (typeof openUiExtensionInStage !== 'function') {
-                    console.error('[chat-app-view] openUiExtensionInStage 未注入')
-                    return
-                  }
-                  openUiExtensionInStage(id)
-                }}
-                renderContent={renderRightStageBody}
-              />
-            ) : null}
+            <ChatOwnedRightStage
+              open={!!rightStageOpen}
+              resizeHandle={
+                anyRightPanelOpen && layoutResizeEnabled ? (
+                  <PanelResizeHandle
+                    direction="vertical"
+                    label="拖动调整右侧面板宽度"
+                    dragging={rightPanelResizeDragging}
+                    onPointerDown={onRightPanelResizePointerDown}
+                  />
+                ) : null
+              }
+              panel={
+                <RightStagePanel
+                  tabs={visibleRightStageTabs}
+                  activeKey={rightStageActiveKey}
+                  recentClosed={rightStageRecentClosed.filter((entry) =>
+                    filterRightStageTabsForSession(
+                      [entry.tab],
+                      rightStageFilterSessionKey || selectedSessionKey,
+                    ).length > 0,
+                  )}
+                  onActivateTab={activateRightStageTab}
+                  onCloseTab={handleCloseRightStageTab}
+                  onCloseOtherTabs={handleCloseOtherRightStageTabs}
+                  onCloseAllTabs={handleCloseAllRightStageTabs}
+                  onReorderTab={reorderRightStageTab}
+                  onReopenClosedTab={reopenRightStageTab}
+                  onCollapse={handleCollapseRightStage}
+                  launcherItems={rightStageLauncherItems}
+                  employeeChatRoles={proactiveRolesDisplay}
+                  onPickEmployeeChat={(role) => {
+                    const code = String(role.agent_code || '').trim()
+                    if (!code) return
+                    const roleName =
+                      String(role.agent_name || '').trim() ||
+                      String(role.role_name || '').trim() ||
+                      code
+                    void import('../../../lib/right-stage/open-employee-process-stage.js').then((m) => {
+                      m.openEmployeeProcessInRightStage(
+                        {
+                          taskId: `live:${code}`,
+                          agentCode: code,
+                          roleName,
+                          title: roleName,
+                          busy: false,
+                        },
+                        {
+                          sessionKey: String(selectedSessionKey || '').trim() || undefined,
+                          layout: 'wide',
+                          forceExpand: true,
+                        },
+                      )
+                    })
+                  }}
+                  sessionWorkflowTaskId={String(sidebarActiveTaskId || '').trim()}
+                  onPickWorkflow={(opt) => {
+                    const tid = String(opt?.taskId || '').trim()
+                    if (!tid) return
+                    void import('../../../lib/right-stage/open-collab-workflow-stage.js').then((m) => {
+                      m.openCollabWorkflowInRightStage(
+                        {
+                          mainTaskId: tid,
+                          leadThreadId: String(opt.leadThreadId || chatThreadIdForSidebar || '').trim(),
+                          title: String(opt.title || '工作流').trim() || '工作流',
+                        },
+                        {
+                          sessionKey: String(selectedSessionKey || '').trim() || undefined,
+                          forceExpand: true,
+                        },
+                      )
+                    })
+                  }}
+                  onPickAgentApp={(appId) => {
+                    const id = String(appId || '').trim()
+                    if (!id) return
+                    if (typeof openUiExtensionInStage !== 'function') {
+                      console.error('[chat-app-view] openUiExtensionInStage 未注入')
+                      return
+                    }
+                    openUiExtensionInStage(id)
+                  }}
+                  renderContent={renderRightStageBody}
+                />
+              }
+            />
           </div>
         </div>
         </section>
@@ -1884,6 +1990,7 @@ export function renderChatAppView(ctx: ChatAppViewCtx): ReactNode {
         setMoreMenuKey={setMoreMenuKey}
         onSelectSession={selectSessionFromShell}
         onPrefetchSession={prefetchSessionHistoryFromShell}
+        onOpenSplitSession={openV4SplitSession}
         onPinSession={onShellPinSession}
         onDeleteSession={onShellDeleteSession}
         onForkSession={onShellForkSession}

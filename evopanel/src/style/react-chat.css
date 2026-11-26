@@ -1156,6 +1156,201 @@ html.dark .shell-view-tab.is-active {
   white-space: nowrap;
 }
 
+/* 部门 Tab：部门头 + 子级成员（树形缩进，明确挂在部门下） */
+.shell-dept-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  margin-bottom: 6px;
+}
+
+.shell-dept-group__head {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+}
+
+.shell-dept-group__head .shell-dept-row {
+  flex: 1;
+  min-width: 0;
+  padding-left: 4px;
+}
+
+.shell-dept-group__chevron {
+  appearance: none;
+  flex-shrink: 0;
+  width: 22px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary, #64748b);
+  cursor: pointer;
+}
+
+.shell-dept-group__chevron:hover {
+  background: var(--shell-hover, #f0f2f7);
+  color: var(--shell-text, #171a2b);
+}
+
+.shell-dept-group__chevron-ic {
+  transition: transform 0.12s ease;
+  transform: rotate(-90deg);
+}
+
+.shell-dept-group__chevron-ic.is-open {
+  transform: rotate(0deg);
+}
+
+.shell-dept-row__edit {
+  appearance: none;
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary, #64748b);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s ease, background 0.12s ease, color 0.12s ease;
+}
+
+.shell-dept-row:hover .shell-dept-row__edit,
+.shell-dept-group__head:focus-within .shell-dept-row__edit,
+.shell-dept-row__edit:focus-visible {
+  opacity: 1;
+}
+
+.shell-dept-row__edit:hover {
+  background: color-mix(in srgb, var(--shell-text, #171a2b) 8%, transparent);
+  color: var(--shell-text, #171a2b);
+}
+
+.shell-dept-member-list {
+  list-style: none;
+  margin: 0;
+  /* 对齐部门行内容起点，再向右一级，树干线标父子关系 */
+  padding: 2px 0 4px 34px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  position: relative;
+}
+
+.shell-dept-member-list::before {
+  content: '';
+  position: absolute;
+  left: 18px;
+  top: 0;
+  bottom: 6px;
+  width: 1px;
+  background: color-mix(in srgb, var(--border, #d0d5dd) 85%, transparent);
+}
+
+.shell-dept-member-item {
+  min-width: 0;
+  position: relative;
+}
+
+.shell-dept-member-item::before {
+  content: '';
+  position: absolute;
+  left: -16px;
+  top: 50%;
+  width: 12px;
+  height: 1px;
+  background: color-mix(in srgb, var(--border, #d0d5dd) 85%, transparent);
+}
+
+.shell-dept-member-row {
+  appearance: none;
+  width: 100%;
+  height: 32px;
+  min-height: 32px;
+  max-height: 32px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px 0 6px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  overflow: hidden;
+  box-sizing: border-box;
+}
+
+.shell-dept-member-row:hover {
+  background: var(--shell-hover, #f0f2f7);
+}
+
+.shell-dept-member-row.active {
+  background: color-mix(in srgb, var(--accent, #6366f1) 12%, transparent);
+}
+
+.shell-dept-member-row__avatar {
+  flex-shrink: 0;
+}
+
+.shell-dept-member-row__body {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: row;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.shell-dept-member-row__title {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--shell-text, #171a2b);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shell-dept-member-row__meta {
+  flex-shrink: 0;
+  font-size: 10.5px;
+  color: var(--text-secondary, #64748b);
+}
+
+.shell-dept-member-row.is-busy .shell-dept-member-row__meta {
+  color: color-mix(in srgb, #f59e0b 80%, var(--text-secondary, #64748b));
+}
+
+.shell-dept-member-empty {
+  position: relative;
+  margin: 2px 0 4px 34px;
+  padding: 4px 8px 4px 6px;
+  font-size: 11px;
+  color: var(--text-secondary, #64748b);
+}
+
+.shell-dept-member-empty::before {
+  content: '';
+  position: absolute;
+  left: -16px;
+  top: 0;
+  bottom: 4px;
+  width: 1px;
+  background: color-mix(in srgb, var(--border, #d0d5dd) 85%, transparent);
+}
+
 /* V4 主区部门群聊：普通 IM 布局，不要指挥台卡片壳 */
 .dept-chat-main {
   display: flex;
@@ -1225,8 +1420,56 @@ html.dark .shell-view-tab.is-active {
   flex: 1;
 }
 
-.dept-im__tts-btn {
+.dept-im__avatar-btn {
+  appearance: none;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  cursor: pointer;
+  border-radius: 10px;
+  flex-shrink: 0;
+  line-height: 0;
+}
+
+.dept-im__avatar-btn:hover {
+  outline: 2px solid color-mix(in srgb, var(--accent, #4f46e5) 35%, transparent);
+  outline-offset: 1px;
+}
+
+.dept-im__head-actions {
   margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.dept-im__edit-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary, #64748b);
+  cursor: pointer;
+  flex-shrink: 0;
+  opacity: 0.72;
+}
+
+.dept-im__title-row:hover .dept-im__edit-btn,
+.dept-im__edit-btn:focus-visible {
+  opacity: 1;
+}
+
+.dept-im__edit-btn:hover {
+  background: var(--surface-hover, rgba(15, 23, 42, 0.06));
+  color: var(--text-primary, #0f172a);
+}
+
+.dept-im__tts-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -2555,6 +2798,63 @@ html[data-theme='dark'] .shell-view-action-btn:hover {
 .shell-view-action-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.shell-view-action-new {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.shell-view-action-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 40;
+  min-width: 148px;
+  padding: 4px;
+  border: 1px solid var(--shell-border, #e8eaf1);
+  border-radius: 10px;
+  background: var(--surface-control-bg, var(--bg-card, #fff));
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.12);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+/* BOT 栏「+」选人：更宽、可滚动，避免花名册一长串撑破侧栏 */
+.shell-view-action-menu--bot {
+  min-width: 220px;
+  max-width: min(280px, calc(100vw - 24px));
+  max-height: min(360px, 70vh);
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.shell-view-action-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 30px;
+  padding: 0 8px;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--shell-text, #171a2b);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+}
+
+.shell-view-action-menu-item:hover {
+  background: var(--shell-hover, rgba(0, 0, 0, 0.04));
+}
+
+.shell-view-action-menu-item svg {
+  flex-shrink: 0;
+  opacity: 0.75;
 }
 
 .react-chat-aside-history-head {
@@ -8448,6 +8748,19 @@ html.dark .react-chat-conversation-col {
   box-shadow: none !important;
 }
 
+/* 单栏稳定 composer 槽（HostStack 外）：与正文同轴承宽，切会话不跟着 sticky 飘顶 */
+.react-chat-conversation-col [data-v4-evoflow-composer-host-stable="true"] {
+  display: flex;
+  justify-content: center;
+  width: 100%;
+  padding: 0 16px 12px;
+  box-sizing: border-box;
+}
+.react-chat-conversation-col [data-v4-evoflow-composer-host-stable="true"] > .react-chat-bottom-dock {
+  width: 100%;
+  max-width: var(--chat-composer-max, 840px);
+}
+
 /* sticky dock 内容列：与正文 [data-v4-timeline-content-column] 同宽同轴 */
 .react-chat-conversation-col [data-v4-composer-dock-content="true"] {
   width: 100% !important;
@@ -10406,6 +10719,26 @@ html[data-theme='dark'] .react-chat-conversation-col .msg-turn-assistant-meta .m
   background: var(--bg-secondary, #f1f5f9);
   border-radius: 999px;
   padding: 1px 7px;
+}
+
+.react-chat-dept-pane-edit {
+  appearance: none;
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary, #64748b);
+  cursor: pointer;
+}
+
+.react-chat-dept-pane-edit:hover {
+  background: var(--surface-hover, rgba(15, 23, 42, 0.06));
+  color: var(--text-primary, #0f172a);
 }
 
 .react-chat-dept-pane-hint {
@@ -16239,6 +16572,7 @@ html[data-app-occluded='1'] * {
 }
 
 .ef-dropdown-select__menu {
+  /* Non-portal menus stay in local stacking; portal override below. */
   z-index: 40;
   box-sizing: border-box;
   min-width: 100%;
@@ -16317,6 +16651,10 @@ html[data-app-occluded='1'] * {
 
 .ef-dropdown-select__menu--portal {
   position: fixed;
+  /* Must sit above settings modal (.react-chat-modal-overlay = 1000001) and
+     generic .modal-overlay (1000020); otherwise Xiaomi ASR/TTS etc. look
+     “stuck” — click opens a menu that is invisible behind the overlay. */
+  z-index: 1000035;
 }
 
 .ef-dropdown-select__group + .ef-dropdown-select__group,
@@ -20979,6 +21317,36 @@ html.evopanel-macos-titlebar .settings-modal-error-banner {
   gap: 12px;
   min-height: 0;
   color: var(--text-tertiary, #a1a1aa);
+}
+
+/* 【self-evolution-bot · 2026-11-20 · 第89轮 · 模型:deepseek-v4.1-flash-1017】
+   改了什么：新增「面板在当前嵌入视图不可用」的终态提示样式。
+   为什么：把这类分支从「加载中…」转圈换成明确终态文案，需要配套排版，
+   否则长文案会挤成一行、按钮没有间距。 */
+.react-chat-stage-unavailable {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 0;
+  padding: 20px 16px;
+  text-align: center;
+  color: var(--text-tertiary, #a1a1aa);
+}
+
+.react-chat-stage-unavailable-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-secondary, #52525b);
+}
+
+.react-chat-stage-unavailable-desc {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  max-width: 32ch;
 }
 
 .settings-modal-root .settings-layout {
@@ -26658,6 +27026,7 @@ html.dark .evo-home-cmd__detail {
   color: var(--cmd-text-secondary);
 }
 
+.evo-home-cmd__detail-edit,
 .evo-home-cmd__detail-close {
   appearance: none;
   border: 0;
@@ -26668,6 +27037,7 @@ html.dark .evo-home-cmd__detail {
   border-radius: 8px;
 }
 
+.evo-home-cmd__detail-edit:hover,
 .evo-home-cmd__detail-close:hover {
   background: color-mix(in srgb, var(--cmd-text) 8%, transparent);
   color: var(--cmd-text);
@@ -31884,6 +32254,37 @@ html.dark .shell-tasks-row--focus {
   background: var(--bg-secondary, #f3f4f6);
   flex-shrink: 0;
   min-height: 36px;
+}
+
+.react-chat-web-embed-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+  height: 28px;
+  padding: 0 10px 0 8px;
+  border: none;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--text-primary, #111827) 6%, transparent);
+  color: var(--text-primary, #111827);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.react-chat-web-embed-back:hover {
+  background: color-mix(in srgb, var(--accent, #007aff) 14%, transparent);
+  color: var(--accent, #007aff);
+}
+
+.react-chat-web-embed-back-icon {
+  font-size: 15px;
+  line-height: 1;
+}
+
+.react-chat-web-embed-back-label {
+  letter-spacing: 0.02em;
 }
 
 .react-chat-web-embed-globe {
@@ -40682,14 +41083,37 @@ html.dark .react-chat-stage-popover {
 .react-chat-right-stage-body > .react-chat-terminal-stage,
 .react-chat-right-stage-body > .v4-collab-subtask-transcript,
 .react-chat-right-stage-body > .v4-employee-process-panel,
-.react-chat-right-stage-body > .react-chat-screenshot-panel {
+.react-chat-right-stage-body > .react-chat-screenshot-panel,
+/* 小V：与员工签同口径吃满 body，否则 V4 时间线拿不到定高 → 不能内滚 */
+.react-chat-right-stage-body > .xm-stage-pane,
+.react-chat-right-stage-body > [data-stage-kind-body='xiaomi'] {
   height: 100%;
   min-height: 0;
+  flex: 1 1 auto;
+  min-width: 0;
+  align-self: stretch;
 }
 
 /* 右栏员工对话：窄栏难悬停，消息复制按钮常显（主聊仍 hover 才出） */
 [data-v4-embedded='true'] [data-slot='message-actions'] {
   opacity: 1 !important;
+}
+
+/*
+ * 嵌入态（小V / 员工签）：不要主对话 @container 的 max-w-4xl 居中柱，
+ * 否则右栏一宽，发消息后正文+输入都缩在水平中间。
+ */
+[data-v4-embedded='true'] [data-v4-timeline-content-column='true'],
+[data-v4-embedded='true'] [data-v4-composer-dock-content='true'] {
+  width: 100% !important;
+  max-width: none !important;
+  margin-left: 0 !important;
+  margin-right: 0 !important;
+  transform: none !important;
+}
+
+[data-v4-embedded='true'] [data-v4-composer-dock='true'] {
+  justify-content: stretch !important;
 }
 
 /* 员工执行过程：底部「继续对话」composer 不在 bottom-dock 内，单独对齐深色表面 */
@@ -41323,6 +41747,172 @@ html[data-theme='dark'] .react-chat-stage-tab.is-active {
   gap: 2px;
   height: 100%;
   margin-left: 4px;
+}
+
+/* BOT 花名册：部门折叠头（人数字 + 执行中/未读徽标） */
+.react-chat-session-bot-dept {
+  list-style: none;
+  margin: 6px 0 4px;
+  padding: 0;
+}
+
+.react-chat-session-bot-dept-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  min-height: 28px;
+  padding: 0 2px 0 0;
+  border-radius: 8px;
+  color: var(--shell-text-muted, #6b7280);
+}
+
+.react-chat-session-bot-dept-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+  min-height: 28px;
+  padding: 2px 6px 2px 4px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  text-align: left;
+  cursor: pointer;
+  outline: none;
+  transition: background-color var(--dur-fast, 120ms) ease-out, color var(--dur-fast, 120ms) ease-out;
+}
+
+.react-chat-session-bot-dept-toggle:hover {
+  background: var(--shell-hover, rgba(0, 0, 0, 0.04));
+  color: var(--shell-text, #171a2b);
+}
+
+.react-chat-session-bot-dept-toggle:focus-visible {
+  outline: 2px solid var(--shell-focus, rgba(59, 130, 246, 0.5));
+  outline-offset: -1px;
+}
+
+.react-chat-session-bot-dept-enter {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--shell-text-muted, #6b7280);
+  cursor: pointer;
+  outline: none;
+  transition: background-color var(--dur-fast, 120ms) ease-out, color var(--dur-fast, 120ms) ease-out;
+}
+
+.react-chat-session-bot-dept-head:hover .react-chat-session-bot-dept-enter,
+.react-chat-session-bot-dept-head:focus-within .react-chat-session-bot-dept-enter {
+  display: inline-flex;
+}
+
+.react-chat-session-bot-dept-enter:hover {
+  background: var(--shell-hover, rgba(0, 0, 0, 0.06));
+  color: var(--shell-text, #171a2b);
+}
+
+.react-chat-session-bot-dept-enter:focus-visible {
+  display: inline-flex;
+  outline: 2px solid var(--shell-focus, rgba(59, 130, 246, 0.5));
+  outline-offset: -1px;
+}
+
+/* ChevronRight：收起朝右 ›，展开朝下 ∨（与值班折叠一致） */
+.react-chat-session-bot-dept-chevron {
+  flex-shrink: 0;
+  opacity: 0.7;
+  transition: transform var(--dur-fast, 120ms) ease-out;
+  transform: rotate(0deg);
+}
+
+.react-chat-session-bot-dept-chevron.is-open {
+  transform: rotate(90deg);
+}
+
+.react-chat-session-bot-dept-avatar,
+.react-chat-session-bot-dept-avatar-fallback {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.react-chat-session-bot-dept-avatar img {
+  display: block;
+  width: 18px;
+  height: 18px;
+  object-fit: cover;
+  border-radius: 6px;
+}
+
+.react-chat-session-bot-dept-label {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--shell-text-body, #42475a);
+}
+
+.react-chat-session-bot-dept-badge {
+  flex-shrink: 0;
+  min-width: 1.15rem;
+  padding: 0 5px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.4;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.react-chat-session-bot-dept-badge.is-running {
+  background: color-mix(in srgb, var(--shell-brand, #4f46e5) 18%, transparent);
+  color: var(--shell-brand, #4f46e5);
+}
+
+.react-chat-session-bot-dept-badge.is-unread {
+  background: color-mix(in srgb, #ef4444 16%, transparent);
+  color: #dc2626;
+}
+
+.react-chat-session-bot-dept-list {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 2px 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+/* 员工组头旁的「负责人」角标（挂在名字右侧，不另起一行） */
+.react-chat-session-bot-dept-head-tag {
+  flex-shrink: 0;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--shell-border, #e8eaf1) 70%, transparent);
+  color: var(--shell-text-muted, #6b7280);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.5;
+  white-space: nowrap;
 }
 
 /* ── V4 侧栏工作区分组树（对齐 ZCode WorkspaceSidebar ghost-button 头 + 折叠列表）── */

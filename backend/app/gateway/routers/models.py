@@ -1,4 +1,6 @@
+import asyncio
 import logging
+import os
 import re
 from typing import Any
 from urllib.parse import urlparse
@@ -217,7 +219,7 @@ async def set_primary_model(http_request: Request, request: SetPrimaryModelReque
             raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
 
         config.primary_model = model_name
-        cfg_repo.set_app_setting("primary_model", model_name)
+        await asyncio.to_thread(cfg_repo.set_app_setting, "primary_model", model_name)
         logger.info("Primary model set to: %s", model_name)
 
         return {
@@ -535,9 +537,9 @@ async def clear_model_unavailable_status(request: Request, model_name: str) -> M
     name = str(model_name or "").strip()
     if not name:
         raise HTTPException(status_code=422, detail="model_name required")
-    if not cfg_repo.get_model(name):
+    if not await asyncio.to_thread(cfg_repo.get_model, name):
         raise HTTPException(status_code=404, detail=f"Model '{name}' not found")
-    cfg_repo.clear_model_unavailable(name)
+    await asyncio.to_thread(cfg_repo.clear_model_unavailable, name)
     reload_models_from_db()
     cfg = get_app_config()
     mc = cfg.get_model_config(name)
@@ -580,28 +582,84 @@ class EmbeddingProbeRequest(BaseModel):
     model_name: str = Field(..., description="Configured model name (evoflow_models.name)")
 
 
+def _embedding_probe_timeout_s() -> float:
+    """Wall clock for UI probe — first local load can be slow; never hang forever."""
+    raw = (os.getenv("EVOFLOW_EMBEDDING_PROBE_TIMEOUT_SEC") or "12").strip()
+    try:
+        return max(3.0, min(60.0, float(raw)))
+    except ValueError:
+        return 12.0
+
+
 @router.post(
     "/models/embedding-probe",
     summary="Probe Embedding Model",
     description="Run a lightweight embedding call to verify the model is ready.",
 )
 async def probe_embedding_model(http_request: Request, request: EmbeddingProbeRequest) -> dict:
-    """Return whether the named embedding model is usable."""
+    """Return whether the named embedding model is usable.
+
+    Bound by ``EVOFLOW_EMBEDDING_PROBE_TIMEOUT_SEC`` (default 12s) and classified
+    as best-effort traffic so a cold local-model import cannot wedge CONTROL.
+    """
     require_org_admin(http_request)
     from evoflow.config import get_app_config
-    from evoflow.knowledge.embedding import get_embedding
 
     config = get_app_config()
     mc = config.get_model_config(request.model_name.strip())
     if mc is None:
         raise HTTPException(status_code=404, detail=f"Model '{request.model_name}' not found")
+
+    # Local models on Windows go through embed_worker (subprocess) — never import
+    # ST in Gateway. Give the first cold load more time than cloud probes.
+    vendor = str(getattr(mc, "vendor", "") or "").strip().lower()
+    timeout_s = _embedding_probe_timeout_s()
+    if vendor == "local":
+        timeout_s = max(timeout_s, 45.0)
+
+    async def _probe() -> list[float]:
+        # Import inside the task so first-hit registry/torch cost is cancellable
+        # with the wait_for budget (module import of embedding pulls heavy deps).
+        from evoflow.knowledge.embedding import get_embedding
+
+        return await get_embedding("probe", mc, purpose="probe")
+
+    slot = None
     try:
-        vec = await get_embedding("probe", mc, purpose="probe")
+        from app.gateway.traffic_lanes import best_effort_lane_slot
+
+        slot = best_effort_lane_slot()
+        await asyncio.wait_for(slot.acquire(), timeout=2.0)
+    except TimeoutError:
+        return {
+            "ok": False,
+            "message": "Gateway 正忙，向量探测已暂缓（稍后重试）",
+        }
+    except Exception:
+        slot = None
+
+    try:
+        try:
+            vec = await asyncio.wait_for(_probe(), timeout=timeout_s)
+        except TimeoutError:
+            return {
+                "ok": False,
+                "message": (
+                    f"探测超时（{timeout_s:.0f}s）。本地向量模型首次加载可能仍在后台进行，"
+                    "请稍后再试；知识库可先用关键词检索。"
+                ),
+            }
+        except Exception as exc:
+            return {"ok": False, "message": str(exc)}
         if vec and len(vec) > 0:
             return {"ok": True}
         return {"ok": False, "message": "返回向量为空"}
-    except Exception as exc:
-        return {"ok": False, "message": str(exc)}
+    finally:
+        if slot is not None:
+            try:
+                slot.release()
+            except Exception:
+                pass
 
 
 class LocalEmbeddingHubRequest(BaseModel):
@@ -844,7 +902,7 @@ async def test_model_connection(http_request: Request, request: TestModelRequest
                         from evoflow.config import reload_models_from_db
                         from evoflow.persistence import config_repositories as cfg_repo
 
-                        if cfg_repo.clear_model_unavailable(config_name):
+                        if await asyncio.to_thread(cfg_repo.clear_model_unavailable, config_name):
                             reload_models_from_db()
                     except Exception:
                         logger.debug(
@@ -1092,7 +1150,7 @@ async def list_model_connections(request: Request) -> ModelConnectionsListRespon
     require_org_admin(request)
     from evoflow.persistence import model_connections as conn_repo
 
-    rows = conn_repo.list_model_connections()
+    rows = await asyncio.to_thread(conn_repo.list_model_connections)
     return ModelConnectionsListResponse(
         connections=[_connection_to_response(r) for r in rows.values()],
     )
@@ -1110,9 +1168,11 @@ async def sync_model_connections(http_request: Request, request: ModelConnection
     from evoflow.persistence import model_connections as conn_repo
 
     payload = [c.model_dump(exclude_none=True) for c in request.connections]
-    rows = conn_repo.sync_model_connections(payload)
+    # 写事务 + reload + plan binding 网络同步是秒级同步活，offload 到 worker
+    # 线程——loop 上直调会在写锁竞争时冻住事件循环或 0.5s 快败报错。
+    rows = await asyncio.to_thread(conn_repo.sync_model_connections, payload)
     # Connection api_key/base_url are mirrored onto evoflow_models; refresh process cache.
-    reload_models_from_db()
+    await asyncio.to_thread(reload_models_from_db)
     return ModelConnectionsListResponse(
         connections=[_connection_to_response(r) for r in rows.values()],
     )
@@ -1128,11 +1188,11 @@ async def delete_model_connection(request: Request, key: str) -> dict:
     from evoflow.config import reload_models_from_db
     from evoflow.persistence import model_connections as conn_repo
 
-    conn = conn_repo.get_model_connection(key)
+    conn = await asyncio.to_thread(conn_repo.get_model_connection, key)
     if conn is None:
         raise HTTPException(status_code=404, detail=f"Connection '{key}' not found")
 
-    deleted_models = conn_repo.delete_model_connection(key)
+    deleted_models = await asyncio.to_thread(conn_repo.delete_model_connection, key)
     reload_models_from_db()
     return {
         "ok": True,

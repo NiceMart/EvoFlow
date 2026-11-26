@@ -54,10 +54,14 @@ import type { CodeViewerSource } from "@zcode/ui/lib/codeViewer.js";
 import type { MessageFileLinkTarget } from "@zcode/ui/components/ai-elements/message.js";
 import { DEFAULT_CODE_PREVIEW_SETTINGS } from "@zcode/ui/lib/codePreviewSettings.js";
 import { getPathLeaf } from "@zcode/ui/lib/path.js";
+import { buildChatSessionScrollMemoryKey } from "@zcode/ui/lib/chatSessionScrollMemory.js";
 import { logStreamCompareV4PanelDisplay } from "../lib/stream-compare-file-log.js";
 import type { IServiceAccessor } from "@zcode/services";
 import { packWorkspaceFileEntries } from "@zcode/shared/workspaceFileEntriesCodec";
-import type { V4TimelinePayload } from "./V4StreamRowsBridge.js";
+import {
+  getSharedV4SessionDataLayer,
+  type V4TimelinePayload,
+} from "./V4StreamRowsBridge.js";
 import type { ConversationRowRenderContext } from "@zcode/ui/v4/conversationRowContext.js";
 import {
   buildWorkflowRunByRunId,
@@ -1153,6 +1157,8 @@ export function V4ZCodeTimeline(props: {
    * 保持挂在 ConversationTimeline，避免切老面板闪历史。
    */
   optimisticUserText?: string | null;
+  /** 在途发送的稳定消息 id（entityId 精确认领，对齐 ZCode sourceCommandId 语义）。 */
+  optimisticUserMessageId?: string | null;
   /**
    * EvoFlow 底部输入区：作为 ConversationTimeline sticky bottomDock 挂进同一滚动视口
    * （对齐 ZCode SessionPane），避免 messages 区单独滚动、下方空出「留给输入框」的空白。
@@ -1220,6 +1226,16 @@ export function V4ZCodeTimeline(props: {
    */
   sessionBusy?: boolean;
   /**
+   * 前台可见（对齐 ZCode SessionPane focused）。
+   * KeepAlive 隐藏 host 传 false：不自动弹 pptx/产物预览。
+   */
+  focused?: boolean;
+  /**
+   * KeepAlive 布局可见（主栏或分屏副栏）。与 focused 分离：副栏可见但不抢焦点。
+   * 传给 ConversationTimeline.layoutActive，隐藏→显示时重测 virtualizer。
+   */
+  hostVisible?: boolean;
+  /**
    * 对话区顶部提示条（长会话压缩提醒等）。主聊挂 ConversationCompactTipBanner；
    * 嵌入态（小V/侧栏）一般不传。
    */
@@ -1236,6 +1252,7 @@ export function V4ZCodeTimeline(props: {
     embedded = false,
     draftEmpty = false,
     optimisticUserText = null,
+    optimisticUserMessageId = null,
     onOpenCodeViewer,
     onOpenFileLink: onOpenFileLinkProp,
     onOpenBrowserUrl,
@@ -1248,6 +1265,8 @@ export function V4ZCodeTimeline(props: {
     surface = "default",
     onEdit,
     sessionBusy = false,
+    focused = true,
+    hostVisible = focused,
   } = props;
 
   // 桥接主题：本组件自挂 .zcode-bridge-root，但不走 StoreProvider。
@@ -1284,12 +1303,29 @@ export function V4ZCodeTimeline(props: {
   const sessionId = payload?.sessionId ?? "";
   const snapshot: ConversationSnapshot | null = payload?.snapshot ?? null;
 
-  // 切会话时 ConversationTimeline 会清测高缓存再 measure：首帧行高估偏小，
-  // 历史会先挤成「字墙」再撑开。遮一罩等两帧 layout，避免闪一下。
-  // 主聊也优先 evoflowSessionKey：payload 瞬时空时勿塌成 "draft"（会清遮罩露出空白）。
+  // 切会话：ConversationTimeline 会清测高缓存再 measure，首帧易「字墙」。
+  // 拆两层对齐 ZCode 体感——
+  // measureHold：有行也要 invisible 两帧（不盖「加载中…」），消字墙；
+  // contentHold：无行时才盖「加载中…」，避免整片空白。
+  // 主聊也优先 evoflowSessionKey：payload 瞬时空时勿塌成 "draft"。
   const timelineSessionKey =
     String(evoflowSessionKey || sessionId || "draft").trim() || "draft";
-  const [sessionSwitchHold, setSessionSwitchHold] = useState(false);
+  // 对齐 ZCode SessionPane：跨 KeepAlive 驱逐/重挂仍能恢复滚动位置。
+  const scrollMemoryKey = useMemo(
+    () =>
+      draftEmpty || timelineSessionKey === "draft"
+        ? null
+        : buildChatSessionScrollMemoryKey({
+            workspacePath: String(workspacePath || "evoflow").trim() || "evoflow",
+            paneId: embedded ? "embedded" : "main",
+            sessionId: timelineSessionKey,
+            taskId: null,
+          }),
+    [draftEmpty, timelineSessionKey, workspacePath, embedded],
+  );
+  const [sessionSwitchMeasureHold, setSessionSwitchMeasureHold] = useState(false);
+  const [sessionSwitchContentHold, setSessionSwitchContentHold] = useState(false);
+  const sessionSwitchHold = sessionSwitchMeasureHold || sessionSwitchContentHold;
   const timelineKeyRef = useRef(timelineSessionKey);
   const switchHoldStartedAtRef = useRef(0);
   useLayoutEffect(() => {
@@ -1297,44 +1333,75 @@ export function V4ZCodeTimeline(props: {
     const prevKey = timelineKeyRef.current;
     timelineKeyRef.current = timelineSessionKey;
     if (!timelineSessionKey || timelineSessionKey === "draft") {
-      setSessionSwitchHold((h) => (h ? false : h));
+      setSessionSwitchMeasureHold((h) => (h ? false : h));
+      setSessionSwitchContentHold((h) => (h ? false : h));
       return;
     }
-    // 仅当「本会话 props 已带窗口行」才跳过遮罩。layer peek 有行但 Bridge 尚未
-    // 交付 payload 时跳过 → 空白一帧（三路并跑切换高频复现）。
     const propRows = payload?.sessionId
       ? payload.snapshot?.rows?.window?.length ?? 0
       : 0;
-    if (propRows > 0) {
-      setSessionSwitchHold((h) => (h ? false : h));
-      logV4Life({
-        event: "switch_hold_skip",
-        threadId: sessionId,
-        zh: `会话切换：本会话 props 已有投影 ${propRows} 行，跳过遮罩（${String(prevKey || "∅").slice(-30)} → ${timelineSessionKey.slice(-30)}）`,
-        detail: { from: prevKey, to: timelineSessionKey, propRows },
-        skipDedupe: true,
-      });
-      return;
+    let peekRows = 0;
+    const peekTid = String(payload?.sessionId || sessionId || "").trim();
+    if (propRows <= 0 && peekTid) {
+      try {
+        const peeked = getSharedV4SessionDataLayer().peekStore(peekTid)?.getState();
+        peekRows = peeked?.snapshot?.rows?.window?.length ?? 0;
+      } catch {
+        peekRows = 0;
+      }
     }
+    const hasRows = propRows > 0 || peekRows > 0;
     switchHoldStartedAtRef.current = Date.now();
-    setSessionSwitchHold((h) => (h ? h : true));
-    // 空白开诊断：hold 从此刻开始盖住时间线，release 行给出持有时长与释放原因。
+    // 有投影：只 measureHold（invisible，无加载文案）；无投影：contentHold。
+    setSessionSwitchMeasureHold(true);
+    setSessionSwitchContentHold(!hasRows);
     logV4Life({
-      event: "switch_hold",
+      event: hasRows ? "switch_hold_measure" : "switch_hold",
       threadId: sessionId,
-      zh: `会话切换：时间线遮罩起（${String(prevKey || "∅").slice(-30)} → ${timelineSessionKey.slice(-30)}）`,
-      detail: { from: prevKey, to: timelineSessionKey },
+      zh: hasRows
+        ? `会话切换：有投影 props=${propRows} peek=${peekRows}，仅测高遮罩两帧（${String(prevKey || "∅").slice(-30)} → ${timelineSessionKey.slice(-30)}）`
+        : `会话切换：无投影，内容遮罩起（${String(prevKey || "∅").slice(-30)} → ${timelineSessionKey.slice(-30)}）`,
+      detail: {
+        from: prevKey,
+        to: timelineSessionKey,
+        propRows,
+        peekRows,
+        measureHold: true,
+        contentHold: !hasRows,
+      },
       skipDedupe: true,
     });
   }, [timelineSessionKey, sessionId, evoflowSessionKey, payload?.sessionId, payload?.snapshot?.rows?.window?.length]);
+  // measureHold：固定两帧后释放（有行时消字墙）。
   useLayoutEffect(() => {
-    if (!sessionSwitchHold) return;
+    if (!sessionSwitchMeasureHold) return;
+    let raf2 = 0;
+    const raf1 = requestAnimationFrame(() => {
+      raf2 = requestAnimationFrame(() => {
+        setSessionSwitchMeasureHold((h) => (h ? false : h));
+        logV4Life({
+          event: "switch_hold_measure_release",
+          threadId: sessionId,
+          zh: `会话切换：测高遮罩释放（持有 ${Date.now() - switchHoldStartedAtRef.current}ms）`,
+          detail: { heldMs: Date.now() - switchHoldStartedAtRef.current },
+          skipDedupe: true,
+        });
+      });
+    });
+    return () => {
+      cancelAnimationFrame(raf1);
+      if (raf2) cancelAnimationFrame(raf2);
+    };
+  }, [sessionSwitchMeasureHold, sessionId]);
+  // contentHold：等到有行或 connecting 超时。
+  useLayoutEffect(() => {
+    if (!sessionSwitchContentHold) return;
     const releaseHold = (why: string) => {
-      setSessionSwitchHold((h) => (h ? false : h));
+      setSessionSwitchContentHold((h) => (h ? false : h));
       logV4Life({
         event: "switch_hold_release",
         threadId: sessionId,
-        zh: `会话切换：遮罩释放（持有 ${Date.now() - switchHoldStartedAtRef.current}ms，窗口行=${snapshot?.rows.window?.length ?? 0}；${why}）`,
+        zh: `会话切换：内容遮罩释放（持有 ${Date.now() - switchHoldStartedAtRef.current}ms，窗口行=${snapshot?.rows.window?.length ?? 0}；${why}）`,
         detail: {
           heldMs: Date.now() - switchHoldStartedAtRef.current,
           windowRows: snapshot?.rows.window?.length ?? 0,
@@ -1344,17 +1411,20 @@ export function V4ZCodeTimeline(props: {
         skipDedupe: true,
       });
     };
-    // 仍在等租约：底下本就是「加载中…」。多会话并发时 subscribe 可能卡数十秒，
-    // 遮罩绝不能一直盖着——最多 1.5s 后放开，露出 connecting 空态 / 迟到首帧。
-    if (connecting && !(snapshot?.rows.window?.length)) {
+    if (snapshot?.rows.window?.length) {
+      releaseHold("rows_ready");
+      return;
+    }
+    // 仍在等租约：最多 1.5s，避免 subscribe 卡数十秒时一直盖着。
+    if (connecting) {
       const maxHoldMs = 1_500;
       const warnT = window.setTimeout(() => {
-        if (!sessionSwitchHold) return;
+        if (!sessionSwitchContentHold) return;
         logV4Life({
           event: "switch_hold_wait",
           level: "warn",
           threadId: sessionId,
-          zh: `切会话遮罩已持有 ${Date.now() - switchHoldStartedAtRef.current}ms 仍无窗口行（connecting）——将按时释放遮罩，避免空白开。`,
+          zh: `切会话内容遮罩已持有 ${Date.now() - switchHoldStartedAtRef.current}ms 仍无窗口行（connecting）——将按时释放。`,
           detail: {
             heldMs: Date.now() - switchHoldStartedAtRef.current,
             connecting,
@@ -1365,7 +1435,7 @@ export function V4ZCodeTimeline(props: {
         });
       }, 800);
       const releaseT = window.setTimeout(() => {
-        if (!sessionSwitchHold) return;
+        if (!sessionSwitchContentHold) return;
         releaseHold("connecting_max_hold");
       }, maxHoldMs);
       return () => {
@@ -1373,18 +1443,10 @@ export function V4ZCodeTimeline(props: {
         window.clearTimeout(releaseT);
       };
     }
-    let raf2 = 0;
-    const raf1 = requestAnimationFrame(() => {
-      raf2 = requestAnimationFrame(() => {
-        releaseHold("rows_ready");
-      });
-    });
-    return () => {
-      cancelAnimationFrame(raf1);
-      if (raf2) cancelAnimationFrame(raf2);
-    };
+    releaseHold("not_connecting_empty");
+    return;
   }, [
-    sessionSwitchHold,
+    sessionSwitchContentHold,
     connecting,
     snapshot?.seq,
     snapshot?.rows.totalCount,
@@ -1407,8 +1469,8 @@ export function V4ZCodeTimeline(props: {
   // ConversationTimeline 依赖 rows 的 layout effect 空转（叠侧栏开合易触发 #185）。
   const authoritativeRows = snapshot?.rows.window ?? EMPTY_V4_ROWS;
   const rows = useMemo(
-    () => mergeOptimisticUserInputRow(authoritativeRows, optimisticUserText),
-    [authoritativeRows, optimisticUserText],
+    () => mergeOptimisticUserInputRow(authoritativeRows, optimisticUserText, optimisticUserMessageId),
+    [authoritativeRows, optimisticUserText, optimisticUserMessageId],
   );
   // 历史/直播统一：rowId/时间回退时按协议重排再渲染，避免「新消息上面却是旧结语」。
   const displayRows = useMemo(() => repairConversationRowsOrder(rows).rows, [rows]);
@@ -1495,34 +1557,10 @@ export function V4ZCodeTimeline(props: {
     sessionBusy,
   ]);
 
-  // 快照自动补拉（对齐 ZCode SessionPane 冷快照自动补拉）：
-  // fresh subscribe / resync / recovery 后 rows.window 只有服务端尾窗（~60 行，
-  // 巨型工具行曾把字节预算压到 20 行）——「前面轮次 / 最新用户消息看不到」的主因。
-  // 触发：① 窗口首行所在轮缺 turnHeader（leading turn 被截断）；
-  //       ② 直播中（canStop）窗口里没有任何 realUser 行（被长回合挤出尾窗）。
-  // 有界：store.autoBackfillForRestore 逐页补拉，条件满足/到顶/页数上限即停。
-  const autoBackfillSigRef = useRef("");
-  useEffect(() => {
-    const snapshotRef = snapshot;
-    if (!snapshotRef || !sessionId) return;
-    if (payload?.loadingOlder) return;
-    if (!hasOlderRows(snapshotRef)) return;
-    const window = snapshotRef.rows.window;
-    if (!Array.isArray(window) || window.length === 0) return;
-    const leadingIncomplete = !window.some(
-      (r) => r.turnId === window[0]?.turnId && r.kind === "turnHeader",
-    );
-    const turnLive = snapshotRef.control?.canStop === true;
-    const hasRealUserInWindow = window.some(
-      (r) => r.kind === "userInput" && r.origin === "realUser",
-    );
-    const need = leadingIncomplete || (turnLive && !hasRealUserInWindow);
-    if (!need) return;
-    const sig = `${sessionId}|${window[0]?.rowId ?? 0}`;
-    if (autoBackfillSigRef.current === sig) return;
-    autoBackfillSigRef.current = sig;
-    void Promise.resolve(payload?.onAutoBackfill?.()).catch(() => {});
-  }, [snapshot, sessionId, payload?.loadingOlder, payload?.onAutoBackfill]);
+  // 冷快照首 turn 缺 header：ZCode 只走 SessionPane `loadOlder`（有界逐页）。
+  // EvoFlow 曾另开 autoBackfillForRestore，会在宽屏 `loadAllOlder` 全量合并前
+  // 再撑一次窗高 → 左侧目录/右侧滚动条抖两回。对齐 ZCode：这里不再预拉；
+  // 不完整首轮由 SessionPane effect 处理，宽屏目录由 Timeline loadAllOlder 一次合并。
 
   type PendingApprovalItem = {
     toolCallId: string;
@@ -1558,7 +1596,10 @@ export function V4ZCodeTimeline(props: {
   const onAutoOpenCodeViewersRef = useRef(onAutoOpenCodeViewers);
   onAutoOpenCodeViewersRef.current = onAutoOpenCodeViewers;
   useEffect(() => {
-    const enabled = Boolean(onAutoOpenCodeViewers && sessionId && snapshot);
+    // 后台 KeepAlive host（focused=false）不自动开产物，对齐 ZCode focused 门控。
+    const enabled = Boolean(
+      focused && onAutoOpenCodeViewers && sessionId && snapshot,
+    );
     const result = advanceAssistantPreviewPptxAutoOpenGate(pptxAutoOpenGateRef.current, {
       enabled,
       scopeKey: resolvedScopeKey || sessionId || "draft",
@@ -1571,6 +1612,7 @@ export function V4ZCodeTimeline(props: {
       setAssistantPreviewPptxAutoOpenTarget(result.target);
     }
   }, [
+    focused,
     onAutoOpenCodeViewers,
     resolvedScopeKey,
     sessionId,
@@ -2183,6 +2225,10 @@ export function V4ZCodeTimeline(props: {
       theme: hostTheme,
       codePreviewSettings: DEFAULT_CODE_PREVIEW_SETTINGS,
       sessionId: sessionId || null,
+      // 对齐 SessionPane：`messageStreamShowReasoning ?? true`。
+      // 此前这里不传 → undefined → isConversationReasoningRowVisible 只放行 firstReasoningRowId，
+      // 表现就是「只有第一次思考，而且只剩一行摘要；后续思考全丢」。
+      messageStreamShowReasoning: true,
       onOpenCodeViewer,
       // 与 onOpenCodeViewer 一并注入：正文 Markdown 路径 pill / Preview Card 共用右栏。
       onOpenFileLink: onOpenCodeViewer || onOpenFileLinkProp ? onOpenFileLink : undefined,
@@ -2273,6 +2319,7 @@ export function V4ZCodeTimeline(props: {
           },
           {
             sessionKey: evoflowSessionKey ? String(evoflowSessionKey) : undefined,
+            forceExpand: true,
           },
         );
       },
@@ -2364,21 +2411,30 @@ export function V4ZCodeTimeline(props: {
               totalCount={displayTotalCount}
               // 嵌入态用 evoflowSessionKey，避免 threadId 晚到时 sessionKey 从 draft→uuid 整树 remount
               sessionKey={timelineSessionKey}
+              scrollMemoryKey={scrollMemoryKey}
               rowContext={rowContext}
               canLoadOlder={snapshot ? hasOlderRows(snapshot) : false}
               loadingOlder={payload?.loadingOlder ?? false}
               onLoadOlder={payload?.onLoadOlder}
+              onLoadAllOlder={payload?.onLoadAllOlder}
+              turnNavigatorDirectoryRevision={
+                payload?.turnNavigatorDirectoryRevision ?? 0
+              }
+              onFollowingTip={payload?.onFollowingTip}
               onEdit={onEdit}
               bottomDock={dockWithQueue}
               sessionBusy={sessionBusy}
               sessionPhase={snapshot?.control?.phase}
+              layoutActive={hostVisible && !sessionSwitchHold}
               // 小V 窄栏：隐藏左侧轮次导航，把宽度留给正文（主对话不变）
               hideTurnNavigator={embedded}
-              // 嵌入态 composer 在面板外：空态不要跟不存在的 dock 居中，否则发消息瞬间整栏跳布局。
-              // 仅真正的草稿空态（draftEmpty）才居中——对齐 ZCode SessionPane 的 isDraft。
-              // 切勿用 rows.length===0：打开有历史会话时 connecting/hydration 期间也会 0 行，
-              // 会把输入框误抬到中间，看起来像「空会话」。
-              centerEmptyStateWithDock={embedded ? false : draftEmpty}
+              // 草稿空态：问候 + bottomDock 成组排布（主对话同款）。
+              // 嵌入态也走 compact 贴底——否则 flex-1 空壳把问候顶到上方、输入贴底，中间一大块白。
+              // 仅 draftEmpty：connecting/hydration 的 0 行勿居中，否则像空会话。
+              centerEmptyStateWithDock={draftEmpty}
+              compactEmptyStateWithDock={embedded && draftEmpty}
+              // 嵌入多轮短回复：消息贴输入上方，勿顶栏顶留大块空白。
+              stickShortThreadAboveDock={embedded}
               emptyState={
                 draftEmpty ? (
                   <div data-testid="v4-draft-empty" className="w-full">
@@ -2422,7 +2478,7 @@ export function V4ZCodeTimeline(props: {
               }
             />
           </div>
-          {sessionSwitchHold ? (
+          {sessionSwitchContentHold ? (
             <div
               data-testid="v4-session-switch-hold"
               className="absolute inset-0 z-[1] flex items-center justify-center bg-card text-ui-base text-foreground-subtlest"
