@@ -338,8 +338,8 @@ export function ShellSessionList({
   employeeRoles = null,
   runningSessionMap = {},
   resolveLiveStreamActivityForSession,
-  globalHasMore = false,
-  globalLoading = false,
+  globalHasMore: _globalHasMore = false,
+  globalLoading: _globalLoading = false,
   onSelectSession,
   onPrefetchSession,
   onOpenSplitSession,
@@ -636,18 +636,50 @@ export function ShellSessionList({
   }, [displaySelectedKey])
 
   /**
-   * 冷启动 / 切到员工会话：若员工筛选与当前选中会话岗位不一致，清到「全部员工」，
-   * 避免右侧已打开某员工会话、左侧因筛选隐藏该行。运行时点选会话不改写筛选（见下方注释）。
+   * 冷启动：刷新/重启后已恢复员工会话时，左侧 BOT 筛选对齐到该岗位。
+   * 旧逻辑在不一致时清成「全部员工」，展开侧栏会落到花名册第一个，与当前对话对不上。
+   * 仅同步一次；之后「全部员工」/点选会话仍不强制改写（见 openNewEmployeeChat / 右键「只看此人」）。
+   */
+  const employeeFocusColdSyncedRef = useRef(false)
+  useEffect(() => {
+    if (employeeFocusColdSyncedRef.current) return
+    if (!displaySelectedKey) return
+    if (
+      !isProactiveSessionKey(displaySelectedKey) ||
+      isDeptChatSessionKey(displaySelectedKey)
+    ) {
+      employeeFocusColdSyncedRef.current = true
+      return
+    }
+    const code = String(proactiveAgentCodeFromSessionKey(displaySelectedKey) || '').trim()
+    if (!code) {
+      employeeFocusColdSyncedRef.current = true
+      return
+    }
+    employeeFocusColdSyncedRef.current = true
+    const focused = String(focusedEmployeeCodeRef.current || '').trim()
+    if (focused && focused.toLowerCase() === code.toLowerCase()) return
+    setFocusedEmployeeCode(code)
+    saveFocusedEmployeeCode(code)
+    setFocusedBotDeptKey(null)
+    saveFocusedBotDeptKey(null)
+  }, [displaySelectedKey])
+
+  /**
+   * 运行中：若已锁定「只看某人」但与当前员工会话岗位不一致，对齐到会话岗位
+   * （不清成全部，避免侧栏又回到花名册第一个）。
+   * focused 为空表示用户刻意看全部，不改写。
    */
   useEffect(() => {
     if (!displaySelectedKey || !isProactiveSessionKey(displaySelectedKey)) return
-    const focused = focusedEmployeeCodeRef.current
+    if (isDeptChatSessionKey(displaySelectedKey)) return
+    const focused = String(focusedEmployeeCodeRef.current || '').trim()
     if (!focused) return
-    const code = proactiveAgentCodeFromSessionKey(displaySelectedKey)
+    const code = String(proactiveAgentCodeFromSessionKey(displaySelectedKey) || '').trim()
     if (!code) return
     if (focused.toLowerCase() === code.toLowerCase()) return
-    setFocusedEmployeeCode(null)
-    saveFocusedEmployeeCode(null)
+    setFocusedEmployeeCode(code)
+    saveFocusedEmployeeCode(code)
   }, [displaySelectedKey])
 
   /** 进入员工 Tab：已有数据则静默补拉，避免再亮一次底部 loading */
@@ -1089,8 +1121,9 @@ export function ShellSessionList({
       const g = focusedGroup
       return g?.hasMoreSessions ? [g.workspaceKey] : []
     }
-    return globalHasMore ? ['__global__'] : []
-  }, [isEmployeesTab, focusedWorkspaceKey, focusedGroup, globalHasMore, groups])
+    // 工作空间分组树：按组分页，不在文件夹同级挂全局「加载更多」
+    return groups.filter((g) => !!g.hasMoreSessions).map((g) => g.workspaceKey)
+  }, [isEmployeesTab, focusedWorkspaceKey, focusedGroup, groups])
 
   const loadMoreKeysSig = loadMoreKeys.join('\n')
 
@@ -1164,7 +1197,7 @@ export function ShellSessionList({
     [toppedRankMap],
   )
 
-  // 「只看此人」只跟右键菜单手动选择走：点进某会话不改写筛选。
+  // 「只看此人」：右键菜单 / 开新员工对话会写入；点进某会话不改写（冷启动对齐见上方 effect）。
 
   useEffect(() => {
     if (!botDeptMenuOpen) return
@@ -1195,11 +1228,19 @@ export function ShellSessionList({
     (agentCode: string) => {
       const code = String(agentCode || '').trim()
       if (!code) return
+      // 与会话一并锁定左侧，刷新后冷启动才能对上人（不只依赖右键「只看此人」）
+      setFocusedEmployeeCode(code)
+      saveFocusedEmployeeCode(code)
+      setFocusedBotDeptKey(null)
+      saveFocusedBotDeptKey(null)
       const stamp = new Date().toISOString().replace(/[:/\\]/g, '-')
       const sk = `proactive:${code}:chat:${stamp}`
       clearPendingShellSession()
       try {
         sessionStorage.setItem(SS_PENDING_SHELL_SESSION, sk)
+        // 提前写下员工面，避免进聊前 refresh 先把主区填成部门群聊
+        localStorage.setItem('evopanel_last_employee_session', sk)
+        localStorage.setItem('evopanel_last_chat_surface', 'employee')
       } catch {
         /* ignore */
       }
@@ -1213,7 +1254,7 @@ export function ShellSessionList({
   const openDeptGroupChat = useCallback(
     (dept: DeptChatMeta) => {
       try {
-        rememberDeptChatMeta(dept)
+        rememberDeptChatMeta(dept, { focus: true })
       } catch {
         /* ignore */
       }
@@ -1682,6 +1723,20 @@ export function ShellSessionList({
   const showBotDeptTree =
     isEmployeesTab && !focusedEmployeeCode && botDeptRenderTree.length > 0
 
+  // 分组树里已展开且有会话的工作空间：按需拉目录分页（有上限），组内才能出现「加载更多会话」
+  useEffect(() => {
+    if (isEmployeesTab || !groupedRecentSections?.length) return
+    let n = 0
+    for (const section of groupedRecentSections) {
+      if (n >= 4) break
+      const key = String(section.key || '').trim()
+      if (!key || collapsedGroupKeys.has(key)) continue
+      if (!section.rows.length) continue
+      onWorkspaceExpand?.(key)
+      n += 1
+    }
+  }, [isEmployeesTab, groupedRecentSections, collapsedGroupKeys, onWorkspaceExpand])
+
   // 顶栏选了某部门时强制展开该组，避免筛完还要再点一次折叠头
   useEffect(() => {
     const key = String(focusedBotDeptKey || '').trim()
@@ -1770,16 +1825,17 @@ export function ShellSessionList({
     )
   }
 
+  /** 扁平会话列表底部的「加载更多」（已选中某工作空间 / BOT 分页）；分组树里改挂到各组内部 */
   const flatHasMore = isEmployeesTab
     ? !!groups.find((g) => g.workspaceKey === WORKSPACE_GROUP_PROACTIVE)?.hasMoreSessions
     : focusedWorkspaceKey
       ? !!focusedGroup?.hasMoreSessions
-      : globalHasMore
+      : false
   const flatLoading = isEmployeesTab
     ? !!groups.find((g) => g.workspaceKey === WORKSPACE_GROUP_PROACTIVE)?.loadingSessions
     : focusedWorkspaceKey
       ? !!focusedGroup?.loadingSessions
-      : globalLoading
+      : false
 
   /**
    * BOT Tab：有更多 `__proactive__` 页时主动翻页（不靠滚动）。
@@ -2000,7 +2056,19 @@ export function ShellSessionList({
           data-ws-group-head={section.key}
           onClick={() => {
             if (focusedBot) return
+            const wasCollapsed = collapsedGroupKeys.has(section.key)
             toggleGroupCollapsed(section.key)
+            // 展开工作空间组时按需拉该目录分页，便于组内出现「加载更多会话」
+            if (wasCollapsed && !isEmployeesTab) {
+              setExpandedWorkspaces((prev) => {
+                if (prev.has(section.key)) return prev
+                const next = new Set(prev)
+                next.add(section.key)
+                saveExpandedWorkspaceKeys(next)
+                return next
+              })
+              onWorkspaceExpand?.(section.key)
+            }
           }}
           onPointerDown={(e) => handleWorkspaceGroupHeadPointerDown(section.key, e)}
         >
@@ -2191,6 +2259,36 @@ export function ShellSessionList({
                       ))
                     : null}
                 </>
+              )
+            })()}
+            {(() => {
+              if (isEmployeesTab) return null
+              const grp = groups.find((g) => g.workspaceKey === section.key)
+              if (!grp?.hasMoreSessions) return null
+              const loading = !!grp.loadingSessions
+              return (
+                <li
+                  className="react-chat-session-workspace-load-more"
+                  key={`load-more-${section.key}`}
+                  data-load-more-sentinel=""
+                  data-workspace-key={section.key}
+                >
+                  <button
+                    type="button"
+                    className="react-chat-session-workspace-load-more-btn"
+                    disabled={loading}
+                    onClick={() => triggerLoadMore(section.key)}
+                  >
+                    {loading ? (
+                      <>
+                        <span className="react-chat-session-workspace-load-spinner" />
+                        <span>加载中…</span>
+                      </>
+                    ) : (
+                      <span>加载更多会话</span>
+                    )}
+                  </button>
+                </li>
               )
             })()}
           </ul>
@@ -2781,7 +2879,7 @@ export function ShellSessionList({
                     加载中…
                   </li>
                 ) : null}
-                {/* 可见「加载更多」：改造后曾只留 height:0 sentinel，分组树里还一度没挂 → 用户看不到入口 */}
+                {/* 扁平列表（已选中某工作空间 / BOT）底部「加载更多」；工作空间分组树改挂各组内部 */}
                 {flatHasMore ? (
                   <li
                     className="react-chat-session-workspace-load-more"
@@ -2801,7 +2899,7 @@ export function ShellSessionList({
                           <span>加载中…</span>
                         </>
                       ) : (
-                        <span>加载更多对话</span>
+                        <span>加载更多会话</span>
                       )}
                     </button>
                   </li>
