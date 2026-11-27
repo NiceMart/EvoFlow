@@ -6,6 +6,63 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.3.56] - 2026-11-26
+
+相对 **1.3.55**：右栏持久化；观测缓存命中；V4 视口诊断；用户文档更新。
+GitHub Release 说明见 scripts/maintainer/windows/release-notes/PRODUCT-NOTES-1.3.56.md；升级横幅见 scripts/maintainer/update/latest.json。
+
+### Added
+
+- **右栏表持久化**：功能页右栏状态可落库
+- **观测缓存命中**：请求详情展示缓存命中诊断
+
+### Fixed
+
+- **V4 视口异常**：检测与调试浮层更准
+- **看过的图并发**：并发 reducer 更稳
+- **用户可见错误**：部分失败文案更清楚
+
+### Changed
+
+- **用户文档**：员工/知识库/资产中心等说明更新；部门群聊天指南
+
+
+## [1.3.55] - 2026-11-26
+
+相对 **1.3.54**：冻结 EXE 内代码索引/本地向量 worker 可启动；拒绝 LFS 指针当模型权重（#118）。
+GitHub Release 说明见 scripts/maintainer/windows/release-notes/PRODUCT-NOTES-1.3.55.md；升级横幅见 scripts/maintainer/update/latest.json。
+
+### Fixed
+
+- **冻结 EXE 子进程**：索引/嵌入 worker 用内部 --mode 分发，不再静默失败
+- **LFS 指针当权重**：打包与运行前识别 safetensors LFS 指针
+- **构建失败可查**：worker 非零退出打 ERROR 日志
+
+### Changed
+
+- **本机一键入口**：start-evoflow.bat / uild-windows.bat
+
+
+## [1.3.54] - 2026-11-25
+
+相对 **1.3.53**：侧栏 BOT 部门编组；右栏不串台；观测/用量库清理与 VACUUM 更稳。
+GitHub Release 说明见 scripts/maintainer/windows/release-notes/PRODUCT-NOTES-1.3.54.md；升级横幅见 scripts/maintainer/update/latest.json。
+
+### Added
+
+- **BOT 部门编组**：花名册按部门筛选/折叠，无会话岗位也占位
+
+### Fixed
+
+- **右栏不串台**：后台 expand 不盖到当前前台侧边
+- **观测库回收**：VACUUM INTO / 待应用重建在文件占用时重试
+- **用量事件清理**：按天裁剪并压缩过重 meta
+
+### Changed
+
+- **部门群正文**：群气泡正文格式更稳
+
+
 ## [1.3.53] - 2026-11-24
 
 相对 **1.3.52**：阿里云/火山 Coding Plan；员工页布局；右栏路径愈合；预览面包屑；待发送队列按会话隔离。
